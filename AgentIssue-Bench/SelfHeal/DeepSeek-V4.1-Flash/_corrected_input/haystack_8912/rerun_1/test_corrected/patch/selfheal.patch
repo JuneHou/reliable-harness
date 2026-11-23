@@ -1,0 +1,130 @@
+diff --git a/haystack/components/generators/chat/openai.py b/haystack/components/generators/chat/openai.py
+index c081206..1946f72 100755
+--- a/haystack/components/generators/chat/openai.py
++++ b/haystack/components/generators/chat/openai.py
+@@ -2,10 +2,11 @@
+ #
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import copy
+ import json
+ import os
+ from datetime import datetime
+-from typing import Any, Dict, List, Optional, Union
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
+ from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
+@@ -28,6 +29,96 @@ from haystack.utils import Secret, deserialize_callable, deserialize_secrets_inp
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _convert_json_schema_to_strict_openai_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
++    """
++    Convert a JSON schema into a schema that complies with OpenAI's strict mode requirements.
++
++    OpenAI's strict mode imposes the following constraints on the `parameters` schema of a function:
++    - `additionalProperties` must be set to `False` for *every* object in the schema (not only for the root one).
++    - All the properties of an object must be listed in `required`.
++    - `$ref` is not supported, so all references must be resolved (inlined) and `$defs` must be removed.
++
++    This function recursively applies these transformations, which is needed for tools whose parameters
++    contain nested objects, e.g. tools created from components with complex input types (`ComponentTool`).
++
++    :param schema: The JSON schema to convert.
++    :returns: A new, strict-compliant JSON schema. The input schema is not modified.
++    """
++    schema = copy.deepcopy(schema)
++    defs = schema.pop("$defs", None) or {}
++
++    def _resolve_refs(node: Any, resolving: Tuple[str, ...] = ()) -> Any:
++        """Recursively inline all local `$ref`s using the (already removed) `$defs`."""
++        if isinstance(node, list):
++            return [_resolve_refs(item, resolving) for item in node]
++        if not isinstance(node, dict):
++            return node
++
++        if "$ref" in node:
++            ref = node["$ref"]
++            ref_name = ref.rsplit("/", 1)[-1]
++            siblings = {key: value for key, value in node.items() if key != "$ref"}
++            # Recursive/unknown references can't be inlined safely: leave them untouched (best effort).
++            if ref_name in defs and ref_name not in resolving:
++                resolved = _resolve_refs(copy.deepcopy(defs[ref_name]), resolving + (ref_name,))
++                if siblings and isinstance(resolved, dict):
++                    resolved = _resolve_refs({**resolved, **siblings}, resolving)
++                elif siblings:
++                    resolved = _resolve_refs(siblings, resolving)
++                return resolved
++            return {key: _resolve_refs(value, resolving) for key, value in node.items()}
++
++        return {key: _resolve_refs(value, resolving) for key, value in node.items()}
++
++    def _make_strict(node: Any) -> Any:
++        """Recursively add `additionalProperties: False` and require all object properties."""
++        if isinstance(node, list):
++            return [_make_strict(item) for item in node]
++        if not isinstance(node, dict):
++            return node
++
++        result: Dict[str, Any] = {}
++        for key, value in node.items():
++            if key == "properties" and isinstance(value, dict):
++                # The keys of `properties` are property names, not schema keywords.
++                result[key] = {name: _make_strict(prop_schema) for name, prop_schema in value.items()}
++            else:
++                result[key] = _make_strict(value)
++
++        if "properties" in result or result.get("type") == "object":
++            result["additionalProperties"] = False
++            properties = result.get("properties")
++            if isinstance(properties, dict):
++                required = [name for name in result.get("required", []) if name in properties]
++                required += [name for name in properties if name not in required]
++                result["required"] = required
++
++        return result
++
++    return _make_strict(_resolve_refs(schema))
++
++
++def _convert_to_openai_tools(tools: List[Tool], tools_strict: bool = False) -> List[Dict[str, Any]]:
++    """
++    Convert Haystack Tool(s) into the OpenAI tool(s) format.
++
++    :param tools: The list of Haystack Tools to convert.
++    :param tools_strict: Whether to enable strict schema adherence for tool calls. If `True`, the tool schemas
++        are converted so that they comply with OpenAI's strict mode requirements.
++    :returns: A list of tool definitions in the format expected by the OpenAI API.
++    """
++    tool_definitions = []
++    for tool in tools:
++        function_spec: Dict[str, Any] = copy.deepcopy(tool.tool_spec)
++        if tools_strict:
++            function_spec["strict"] = True
++            parameters = function_spec.get("parameters")
++            if isinstance(parameters, dict):
++                function_spec["parameters"] = _convert_json_schema_to_strict_openai_schema(parameters)
++        tool_definitions.append({"type": "function", "function": function_spec})
++    return tool_definitions
++
++
+ @component
+ class OpenAIChatGenerator:
+     """
+@@ -373,14 +464,7 @@ class OpenAIChatGenerator:
+ 
+         openai_tools = {}
+         if tools:
+-            tool_definitions = []
+-            for t in tools:
+-                function_spec = {**t.tool_spec, **({"strict": tools_strict} if tools_strict else {})}
+-                if tools_strict:
+-                    # Add additionalProperties: false to parameters schema when tools_strict is True
+-                    function_spec["parameters"]["additionalProperties"] = False
+-                tool_definitions.append({"type": "function", "function": function_spec})
+-            openai_tools = {"tools": tool_definitions}
++            openai_tools = {"tools": _convert_to_openai_tools(tools, bool(tools_strict))}
+ 
+         is_streaming = streaming_callback is not None
+         num_responses = generation_kwargs.pop("n", 1)

@@ -1,0 +1,780 @@
+Case ID: 78235199
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 20:04:35
+End Time: 2026-11-05 20:13:46
+Total Duration: 551.38 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Generate OpenAI fine-tuning data with LlamaIndex-style callbacks.
+
+Why the original snippet always produced an EMPTY file + "Wrote 0 examples":
+
+1. ``OpenAIFineTuningHandler.save_finetuning_events()`` opened the target file
+   with mode ``"w"`` (truncating it), wrote an empty string, and then printed a
+   *hard-coded* ``0``.  It never inspected the events the handler had
+   collected, so the reported number could never be anything but zero.
+
+2. The handler was never wired into the object that really performs the LLM
+   calls.  ``VectorStoreIndex.from_documents(...)`` / ``as_query_engine(...)``
+   use their *own* callback manager; poking ``callback_manager`` onto a
+   throw-away object (``type("LLM", (), {...})()``) does not propagate it, so
+   no ``CBEventType.LLM`` start/end pair was ever dispatched to the handler and
+   its internal example list stayed empty.
+
+3. The index was built from an *empty* document list and the response returned
+   by ``query()`` was thrown away, so even if events had fired there would be
+   no prompt/response pair worth writing.
+
+The corrected version below keeps the same public surface but:
+
+* dispatches genuine LLM start/end events through a shared callback manager,
+* propagates that callback manager to the LLM, the index and the query engine,
+* serialises the collected events as one OpenAI chat-JSONL record per line and
+  prints the *real* number of examples written.
+"""
+
+import json
+import os
+import uuid
+
+
+# --------------------------------------------------------------------------- #
+# Event plumbing (mirrors llama_index.core.callbacks)
+# --------------------------------------------------------------------------- #
+class CBEventType:
+    LLM = "llm"
+    EMBEDDING = "embedding"
+    RETRIEVAL = "retrieval"
+    SYNTHESIZE = "synthesize"
+
+
+class EventPayload:
+    PROMPT = "prompt"
+    MESSAGES = "messages"
+    RESPONSE = "response"
+    COMPLETION = "completion"
+
+
+class OpenAIFineTuningHandler:
+    """Callback handler that collects LLM interactions as fine-tuning examples.
+
+    Each ``CBEventType.LLM`` start/end pair becomes one OpenAI chat example:
+    ``{"messages": [{"role": "user", ...}, {"role": "assistant", ...}]}``.
+    """
+
+    def __init__(self, event_starts_to_ignore=(), event_ends_to_ignore=(), **kwargs):
+        self.event_starts_to_ignore = tuple(event_starts_to_ignore or ())
+        self.event_ends_to_ignore = tuple(event_ends_to_ignore or ())
+        # event_id -> collected payload, plus insertion order for stable output
+        self._events = {}
+        self._event_order = []
+
+    # ---- callback interface ------------------------------------------------
+    def on_event_start(self, event_type, payload=None, event_id="", parent_id="", **kwargs):
+        if event_type == CBEventType.LLM and event_type not in self.event_starts_to_ignore:
+            event_id = event_id or str(uuid.uuid4())
+            if event_id not in self._events:
+                self._events[event_id] = dict(payload or {})
+                self._event_order.append(event_id)
+        return event_id
+
+    def on_event_end(self, event_type, payload=None, event_id="", parent_id="", **kwargs):
+        if event_type == CBEventType.LLM and event_type not in self.event_ends_to_ignore:
+            stored = self._events.get(event_id)
+            if stored is not None:
+                stored.update(payload or {})
+        return event_id
+
+    # ---- collected data ----------------------------------------------------
+    @property
+    def events(self):
+        """All collected LLM events, in the order they started."""
+        return [self._events[event_id] for event_id in self._event_order]
+
+    @staticmethod
+    def _to_openai_example(event):
+        messages = list(event.get(EventPayload.MESSAGES) or [])
+        if not messages:
+            prompt = event.get(EventPayload.PROMPT)
+            if prompt:
+                messages = [{"role": "user", "content": str(prompt)}]
+
+        response = event.get(EventPayload.RESPONSE)
+        if response in (None, ""):
+            response = event.get(EventPayload.COMPLETION)
+
+        # A fine-tuning example is only valid with both an input and an output.
+        if not messages or response in (None, ""):
+            return None
+
+        messages.append({"role": "assistant", "content": str(response)})
+        return {"messages": messages}
+
+    def save_finetuning_events(self, path):
+        """Write the collected events as JSONL and report the true count."""
+        examples = []
+        for event in self.events:
+            example = self._to_openai_example(event)
+            if example is not None:
+                examples.append(example)
+
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        # NOTE: we used to open the file with "w" just to write "" - that threw
+        # away every collected event.  Now the events are actually serialised.
+        with open(path, "w", encoding="utf-8") as f:
+            for example in examples:
+                f.write(json.dumps(example, ensure_ascii=False) + "\n")
+
+        print(f"Wrote {len(examples)} examples to {path}")
+        return len(examples)
+
+
+class CallbackManager:
+    """Fan-out of start/end events to every registered handler."""
+
+    def __init__(self, handlers=None, event_starts_to_ignore=(), event_ends_to_ignore=()):
+        self.handlers = list(handlers or [])
+        self.event_starts_to_ignore = tuple(event_starts_to_ignore or ())
+        self.event_ends_to_ignore = tuple(event_ends_to_ignore or ())
+        self._event_id_stack = []
+
+    def on_event_start(self, event_type, payload=None, event_id="", parent_id=None, **kwargs):
+        event_id = event_id or str(uuid.uuid4())
+        self._event_id_stack.append(event_id)
+        if event_type not in self.event_starts_to_ignore:
+            for handler in self.handlers:
+                handler.on_event_start(
+                    event_type,
+                    payload or {},
+                    event_id,
+                    parent_id=parent_id,
+                    **kwargs,
+                )
+        return event_id
+
+    def on_event_end(self, event_type, payload=None, event_id="", parent_id=None, **kwargs):
+        if event_type not in self.event_ends_to_ignore:
+            for handler in self.handlers:
+                handler.on_event_end(
+                    event_type,
+                    payload or {},
+                    event_id,
+                    parent_id=parent_id,
+                    **kwargs,
+                )
+        if self._event_id_stack and self._event_id_stack[-1] == event_id:
+            self._event_id_stack.pop()
+        return event_id
+
+
+# --------------------------------------------------------------------------- #
+# LLM / index / query engine
+# --------------------------------------------------------------------------- #
+class LLM:
+    """Minimal LLM wrapper that dispatches LlamaIndex-style callback events.
+
+    In a real project this is ``from llama_index.llms.openai import OpenAI``;
+    the important part is that the *same* callback manager is used both by the
+    LLM and by the query engine, otherwise the handler never sees an event.
+    """
+
+    def __init__(self, callback_manager=None, model="gpt-3.5-turbo", generate=None):
+        self._callback_manager = callback_manager or CallbackManager([])
+        self.model = model
+        self._generate = generate or self._default_generate
+
+    @property
+    def callback_manager(self):
+        return self._callback_manager
+
+    @callback_manager.setter
+    def callback_manager(self, value):
+        self._callback_manager = value if value is not None else CallbackManager([])
+
+    @staticmethod
+    def _default_generate(prompt):
+        # Placeholder for a real OpenAI call; keeps the example runnable.
+        question = prompt.rsplit("Question:", 1)[-1].split("Answer:")[0].strip()
+        return f"Answer: {question} (answered from the retrieved context)"
+
+    def complete(self, prompt):
+        return self.query(prompt)
+
+    def query(self, prompt):
+        cm = self.callback_manager
+        prompt = str(prompt)
+        event_id = cm.on_event_start(
+            CBEventType.LLM,
+            {
+                EventPayload.PROMPT: prompt,
+                EventPayload.MESSAGES: [{"role": "user", "content": prompt}],
+            },
+        )
+        response = ""
+        try:
+            response = self._generate(prompt)
+            return response
+        finally:
+            # Always close the event so the handler records the response.
+            cm.on_event_end(
+                CBEventType.LLM,
+                {EventPayload.RESPONSE: response, EventPayload.COMPLETION: response},
+                event_id,
+            )
+
+
+def _document_text(document):
+    if hasattr(document, "get_content"):
+        return document.get_content()
+    return getattr(document, "text", str(document))
+
+
+class VectorStoreIndex:
+    def __init__(self, documents=None, callback_manager=None):
+        self.documents = list(documents or [])
+        self.callback_manager = callback_manager or CallbackManager([])
+
+    @classmethod
+    def from_documents(cls, docs, callback_manager=None, **kwargs):
+        return cls(documents=docs, callback_manager=callback_manager)
+
+    def as_query_engine(self, similarity_top_k=2, llm=None, callback_manager=None):
+        return QueryEngine(
+            index=self,
+            similarity_top_k=similarity_top_k,
+            llm=llm,
+            callback_manager=callback_manager,
+        )
+
+
+class QueryEngine:
+    def __init__(self, index, similarity_top_k=2, llm=None, callback_manager=None):
+        self.index = index
+        self.similarity_top_k = similarity_top_k
+        self.llm = llm if llm is not None else LLM(callback_manager=callback_manager)
+        # KEY FIX: the LLM, the index and the query engine must share ONE
+        # callback manager, otherwise the fine-tuning handler stays empty.
+        shared = callback_manager or index.callback_manager or self.llm.callback_manager
+        self.callback_manager = shared
+        self.llm.callback_manager = shared
+        index.callback_manager = shared
+
+    def _retrieve(self, question):
+        words = {w for w in question.lower().split() if w}
+        texts = [(doc, _document_text(doc)) for doc in self.index.documents]
+
+        def score(item):
+            return sum(1 for word in words if word in item[1].lower())
+
+        ranked = sorted(texts, key=score, reverse=True)
+        return [text for _, text in ranked[: self.similarity_top_k]]
+
+    def query(self, question):
+        question = (question or "").strip()
+        if not question:
+            return None
+
+        context = "\n\n".join(self._retrieve(question))
+        prompt = (
+            "Context information is below.\n"
+            "---------------------\n"
+            f"{context}\n"
+            "---------------------\n"
+            f"Question: {question}\n"
+            "Answer:"
+        )
+        return self.llm.query(prompt)
+
+
+# --------------------------------------------------------------------------- #
+# Driver
+# --------------------------------------------------------------------------- #
+class FineTuningExample:
+
+    def __init__(self, dataset_path, documents):
+        self.dataset_path = dataset_path or "."
+        self.documents = list(documents or [])
+        self.llm = None
+
+    def jsonl_generation(self):
+        """Generate a JSONL file of fine-tuning events."""
+        os.makedirs(self.dataset_path, exist_ok=True)
+
+        finetuning_handler = OpenAIFineTuningHandler()
+        callback_manager = CallbackManager([finetuning_handler])
+        # The callback manager is attached to the very object that emits the
+        # LLM events, and propagated down to the index/query engine.
+        self.llm = LLM(callback_manager=callback_manager)
+
+        questions_path = os.path.join(self.dataset_path, "train_questions.txt")
+        questions = []
+        if os.path.exists(questions_path):
+            with open(questions_path, "r", encoding="utf-8") as f:
+                questions = [line.strip() for line in f if line.strip()]
+
+        output_path = os.path.join(self.dataset_path, "finetuning_events.jsonl")
+        error = None
+        try:
+            index = VectorStoreIndex.from_documents(
+                self.documents, callback_manager=callback_manager
+            )
+            query_engine = index.as_query_engine(
+                similarity_top_k=2, llm=self.llm, callback_manager=callback_manager
+            )
+            for question in questions:
+                response = query_engine.query(question)
+                if response is None:
+                    print(f"No response generated for question: {question}")
+        except Exception as e:  # noqa: BLE001 - report, still persist what we have
+            error = e
+            print(f"An error occurred: {e}")
+        finally:
+            # Persist whatever was captured; this now writes real records.
+            written = finetuning_handler.save_finetuning_events(output_path)
+
+        if error is not None:
+            raise error
+        return written
+
+
+def prepare_test_data(questions_path):
+    directory = os.path.dirname(questions_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(questions_path, "w", encoding="utf-8") as f:
+        f.write("Question 1\nQuestion 2\n")
+
+
+def sample_documents():
+    """Non-empty corpus - an empty index gives the LLM nothing to answer from."""
+    return [
+        "Question 1 is about how LlamaIndex builds an index over documents.",
+        "Question 2 is about how the query engine retrieves and synthesises.",
+        "The callback manager dispatches LLM start/end events to every handler.",
+    ]
+
+
+def run_agent(questions_path):
+    dataset_path = os.path.dirname(questions_path) or "."
+    ft = FineTuningExample(dataset_path=dataset_path, documents=sample_documents())
+    return ft.jsonl_generation()
+
+
+if __name__ == "__main__":
+    questions_path = "./dataset_data/train_questions.txt"
+    prepare_test_data(questions_path)
+    run_agent(questions_path)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 20:13:46
+Duration: 551.37 seconds
+Verdict: ## Evaluation Report — case 78235199
+
+### 1. Diff analysis
+The fix addresses the *root cause* rather than the symptom. The buggy code had three compounding defects, and the diff fixes all three:
+
+| Original defect | Fix |
+|---|---|
+| `save_finetuning_events` opened with `"w"`, wrote `""`, and printed a **hard-coded** `0` | Handler now stores events (`on_event_start`/`on_event_end`), serializes each into an OpenAI chat record `{"messages": [...]}` with `json.dumps(...)`, and prints `len(examples)` |
+| Handler never wired to the object emitting LLM calls — `type("LLM", (), {...})()` was a throw-away object, so no `CBEventType.LLM` events ever dispatched | New `LLM` class emits real start/end events via a shared `CallbackManager`; `QueryEngine.__init__` propagates one `shared` callback manager to the LLM, the index and itself |
+| Empty document list and discarded `query()` response | `sample_documents()` provides a corpus, `QueryEngine.query` builds a real retrieval prompt and returns the LLM answer, which is captured as `EventPayload.RESPONSE` |
+
+### 2. Control-flow trace (test expectations)
+- `prepare_test_data` → creates `./dataset_data/train_questions.txt` with 2 questions.
+- `run_agent` → `FineTuningExample(dataset_path="./dataset_data", documents=sample_documents())` (3 docs, non-empty).
+- `jsonl_generation` → handler registered in `CallbackManager([handler])`, passed to `LLM(callback_manager=...)`, then to `from_documents(..., callback_manager=...)` and `as_query_engine(..., callback_manager=...)`. `QueryEngine` shares the same manager, so `LLM.query` accumulates events.
+- 2 questions are read (`line.strip()` with empty-line filter) → 2 well-formed examples (input + non-empty completion) → written as 2 JSONL lines.
+- Assertions `os.path.exists(output_file)` and `len(lines) > 0` both hold. Return value `written=2` is defined in `finally`, so no `UnboundLocalError` on the exception path.
+
+### 3. API verification
+- `CallbackManager.on_event_start(event_type, payload, event_id, parent_id)` — matches LlamaIndex's documented callback-manager signature (traces an event stack, fans out to handlers). The custom implementation is a compatible stand-in, not misuse.
+- `json.dumps` usage in append-mode-per-line is the correct JSONL pattern; `ensure_ascii=False` is valid.
+- `os.makedirs(..., exist_ok=True)` and the guarded `if directory:` / `if os.path.exists(questions_path)` checks avoid the common `FileNotFoundError`/`TypeError` edge cases (e.g. dirname `""`).
+- `load`/`readlines` in the test requires newline-terminated records — the writer appends `"\n"` per example. ✔
+
+### 4. Correctness / determinism notes
+- `_to_openai_example` copies the messages list (`list(...)`) before appending the assistant turn, so the stored payload is not mutated — serialization is idempotent.
+- `_default_generate` uses `rsplit("Question:", 1)`; the retrieval context (which also contains "Question 1 …") precedes the template's `Question:` line, so the *last* occurrence correctly resolves to the real question.
+- `LLM.query` closes the event in a `finally`, guaranteeing a response is recorded even if generation raises.
+- No remaining hard-coded counts, no silent `except`, and errors are surfaced (`raise error` after persistence).
+
+### Verdict
+The fix is a genuine root-cause correction: events are actually collected, the callback manager is propagated to the real event emitter, records are serialized to JSONL, and the reported count is truthful. `validate_fixed_code` reports the structure/output format is correct, and the traced execution satisfies both test assertions.
+
+**ACCEPT**
+--------------------------------------------------------------------------------
+"""Generate OpenAI fine-tuning data with LlamaIndex-style callbacks.
+
+Why the original snippet always produced an EMPTY file + "Wrote 0 examples":
+
+1. ``OpenAIFineTuningHandler.save_finetuning_events()`` opened the target file
+   with mode ``"w"`` (truncating it), wrote an empty string, and then printed a
+   *hard-coded* ``0``.  It never inspected the events the handler had
+   collected, so the reported number could never be anything but zero.
+
+2. The handler was never wired into the object that really performs the LLM
+   calls.  ``VectorStoreIndex.from_documents(...)`` / ``as_query_engine(...)``
+   use their *own* callback manager; poking ``callback_manager`` onto a
+   throw-away object (``type("LLM", (), {...})()``) does not propagate it, so
+   no ``CBEventType.LLM`` start/end pair was ever dispatched to the handler and
+   its internal example list stayed empty.
+
+3. The index was built from an *empty* document list and the response returned
+   by ``query()`` was thrown away, so even if events had fired there would be
+   no prompt/response pair worth writing.
+
+The corrected version below keeps the same public surface but:
+
+* dispatches genuine LLM start/end events through a shared callback manager,
+* propagates that callback manager to the LLM, the index and the query engine,
+* serialises the collected events as one OpenAI chat-JSONL record per line and
+  prints the *real* number of examples written.
+"""
+
+import json
+import os
+import uuid
+
+
+# --------------------------------------------------------------------------- #
+# Event plumbing (mirrors llama_index.core.callbacks)
+# --------------------------------------------------------------------------- #
+class CBEventType:
+    LLM = "llm"
+    EMBEDDING = "embedding"
+    RETRIEVAL = "retrieval"
+    SYNTHESIZE = "synthesize"
+
+
+class EventPayload:
+    PROMPT = "prompt"
+    MESSAGES = "messages"
+    RESPONSE = "response"
+    COMPLETION = "completion"
+
+
+class OpenAIFineTuningHandler:
+    """Callback handler that collects LLM interactions as fine-tuning examples.
+
+    Each ``CBEventType.LLM`` start/end pair becomes one OpenAI chat example:
+    ``{"messages": [{"role": "user", ...}, {"role": "assistant", ...}]}``.
+    """
+
+    def __init__(self, event_starts_to_ignore=(), event_ends_to_ignore=(), **kwargs):
+        self.event_starts_to_ignore = tuple(event_starts_to_ignore or ())
+        self.event_ends_to_ignore = tuple(event_ends_to_ignore or ())
+        # event_id -> collected payload, plus insertion order for stable output
+        self._events = {}
+        self._event_order = []
+
+    # ---- callback interface ------------------------------------------------
+    def on_event_start(self, event_type, payload=None, event_id="", parent_id="", **kwargs):
+        if event_type == CBEventType.LLM and event_type not in self.event_starts_to_ignore:
+            event_id = event_id or str(uuid.uuid4())
+            if event_id not in self._events:
+                self._events[event_id] = dict(payload or {})
+                self._event_order.append(event_id)
+        return event_id
+
+    def on_event_end(self, event_type, payload=None, event_id="", parent_id="", **kwargs):
+        if event_type == CBEventType.LLM and event_type not in self.event_ends_to_ignore:
+            stored = self._events.get(event_id)
+            if stored is not None:
+                stored.update(payload or {})
+        return event_id
+
+    # ---- collected data ----------------------------------------------------
+    @property
+    def events(self):
+        """All collected LLM events, in the order they started."""
+        return [self._events[event_id] for event_id in self._event_order]
+
+    @staticmethod
+    def _to_openai_example(event):
+        messages = list(event.get(EventPayload.MESSAGES) or [])
+        if not messages:
+            prompt = event.get(EventPayload.PROMPT)
+            if prompt:
+                messages = [{"role": "user", "content": str(prompt)}]
+
+        response = event.get(EventPayload.RESPONSE)
+        if response in (None, ""):
+            response = event.get(EventPayload.COMPLETION)
+
+        # A fine-tuning example is only valid with both an input and an output.
+        if not messages or response in (None, ""):
+            return None
+
+        messages.append({"role": "assistant", "content": str(response)})
+        return {"messages": messages}
+
+    def save_finetuning_events(self, path):
+        """Write the collected events as JSONL and report the true count."""
+        examples = []
+        for event in self.events:
+            example = self._to_openai_example(event)
+            if example is not None:
+                examples.append(example)
+
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        # NOTE: we used to open the file with "w" just to write "" - that threw
+        # away every collected event.  Now the events are actually serialised.
+        with open(path, "w", encoding="utf-8") as f:
+            for example in examples:
+                f.write(json.dumps(example, ensure_ascii=False) + "\n")
+
+        print(f"Wrote {len(examples)} examples to {path}")
+        return len(examples)
+
+
+class CallbackManager:
+    """Fan-out of start/end events to every registered handler."""
+
+    def __init__(self, handlers=None, event_starts_to_ignore=(), event_ends_to_ignore=()):
+        self.handlers = list(handlers or [])
+        self.event_starts_to_ignore = tuple(event_starts_to_ignore or ())
+        self.event_ends_to_ignore = tuple(event_ends_to_ignore or ())
+        self._event_id_stack = []
+
+    def on_event_start(self, event_type, payload=None, event_id="", parent_id=None, **kwargs):
+        event_id = event_id or str(uuid.uuid4())
+        self._event_id_stack.append(event_id)
+        if event_type not in self.event_starts_to_ignore:
+            for handler in self.handlers:
+                handler.on_event_start(
+                    event_type,
+                    payload or {},
+                    event_id,
+                    parent_id=parent_id,
+                    **kwargs,
+                )
+        return event_id
+
+    def on_event_end(self, event_type, payload=None, event_id="", parent_id=None, **kwargs):
+        if event_type not in self.event_ends_to_ignore:
+            for handler in self.handlers:
+                handler.on_event_end(
+                    event_type,
+                    payload or {},
+                    event_id,
+                    parent_id=parent_id,
+                    **kwargs,
+                )
+        if self._event_id_stack and self._event_id_stack[-1] == event_id:
+            self._event_id_stack.pop()
+        return event_id
+
+
+# --------------------------------------------------------------------------- #
+# LLM / index / query engine
+# --------------------------------------------------------------------------- #
+class LLM:
+    """Minimal LLM wrapper that dispatches LlamaIndex-style callback events.
+
+    In a real project this is ``from llama_index.llms.openai import OpenAI``;
+    the important part is that the *same* callback manager is used both by the
+    LLM and by the query engine, otherwise the handler never sees an event.
+    """
+
+    def __init__(self, callback_manager=None, model="gpt-3.5-turbo", generate=None):
+        self._callback_manager = callback_manager or CallbackManager([])
+        self.model = model
+        self._generate = generate or self._default_generate
+
+    @property
+    def callback_manager(self):
+        return self._callback_manager
+
+    @callback_manager.setter
+    def callback_manager(self, value):
+        self._callback_manager = value if value is not None else CallbackManager([])
+
+    @staticmethod
+    def _default_generate(prompt):
+        # Placeholder for a real OpenAI call; keeps the example runnable.
+        question = prompt.rsplit("Question:", 1)[-1].split("Answer:")[0].strip()
+        return f"Answer: {question} (answered from the retrieved context)"
+
+    def complete(self, prompt):
+        return self.query(prompt)
+
+    def query(self, prompt):
+        cm = self.callback_manager
+        prompt = str(prompt)
+        event_id = cm.on_event_start(
+            CBEventType.LLM,
+            {
+                EventPayload.PROMPT: prompt,
+                EventPayload.MESSAGES: [{"role": "user", "content": prompt}],
+            },
+        )
+        response = ""
+        try:
+            response = self._generate(prompt)
+            return response
+        finally:
+            # Always close the event so the handler records the response.
+            cm.on_event_end(
+                CBEventType.LLM,
+                {EventPayload.RESPONSE: response, EventPayload.COMPLETION: response},
+                event_id,
+            )
+
+
+def _document_text(document):
+    if hasattr(document, "get_content"):
+        return document.get_content()
+    return getattr(document, "text", str(document))
+
+
+class VectorStoreIndex:
+    def __init__(self, documents=None, callback_manager=None):
+        self.documents = list(documents or [])
+        self.callback_manager = callback_manager or CallbackManager([])
+
+    @classmethod
+    def from_documents(cls, docs, callback_manager=None, **kwargs):
+        return cls(documents=docs, callback_manager=callback_manager)
+
+    def as_query_engine(self, similarity_top_k=2, llm=None, callback_manager=None):
+        return QueryEngine(
+            index=self,
+            similarity_top_k=similarity_top_k,
+            llm=llm,
+            callback_manager=callback_manager,
+        )
+
+
+class QueryEngine:
+    def __init__(self, index, similarity_top_k=2, llm=None, callback_manager=None):
+        self.index = index
+        self.similarity_top_k = similarity_top_k
+        self.llm = llm if llm is not None else LLM(callback_manager=callback_manager)
+        # KEY FIX: the LLM, the index and the query engine must share ONE
+        # callback manager, otherwise the fine-tuning handler stays empty.
+        shared = callback_manager or index.callback_manager or self.llm.callback_manager
+        self.callback_manager = shared
+        self.llm.callback_manager = shared
+        index.callback_manager = shared
+
+    def _retrieve(self, question):
+        words = {w for w in question.lower().split() if w}
+        texts = [(doc, _document_text(doc)) for doc in self.index.documents]
+
+        def score(item):
+            return sum(1 for word in words if word in item[1].lower())
+
+        ranked = sorted(texts, key=score, reverse=True)
+        return [text for _, text in ranked[: self.similarity_top_k]]
+
+    def query(self, question):
+        question = (question or "").strip()
+        if not question:
+            return None
+
+        context = "\n\n".join(self._retrieve(question))
+        prompt = (
+            "Context information is below.\n"
+            "---------------------\n"
+            f"{context}\n"
+            "---------------------\n"
+            f"Question: {question}\n"
+            "Answer:"
+        )
+        return self.llm.query(prompt)
+
+
+# --------------------------------------------------------------------------- #
+# Driver
+# --------------------------------------------------------------------------- #
+class FineTuningExample:
+
+    def __init__(self, dataset_path, documents):
+        self.dataset_path = dataset_path or "."
+        self.documents = list(documents or [])
+        self.llm = None
+
+    def jsonl_generation(self):
+        """Generate a JSONL file of fine-tuning events."""
+        os.makedirs(self.dataset_path, exist_ok=True)
+
+        finetuning_handler = OpenAIFineTuningHandler()
+        callback_manager = CallbackManager([finetuning_handler])
+        # The callback manager is attached to the very object that emits the
+        # LLM events, and propagated down to the index/query engine.
+        self.llm = LLM(callback_manager=callback_manager)
+
+        questions_path = os.path.join(self.dataset_path, "train_questions.txt")
+        questions = []
+        if os.path.exists(questions_path):
+            with open(questions_path, "r", encoding="utf-8") as f:
+                questions = [line.strip() for line in f if line.strip()]
+
+        output_path = os.path.join(self.dataset_path, "finetuning_events.jsonl")
+        error = None
+        try:
+            index = VectorStoreIndex.from_documents(
+                self.documents, callback_manager=callback_manager
+            )
+            query_engine = index.as_query_engine(
+                similarity_top_k=2, llm=self.llm, callback_manager=callback_manager
+            )
+            for question in questions:
+                response = query_engine.query(question)
+                if response is None:
+                    print(f"No response generated for question: {question}")
+        except Exception as e:  # noqa: BLE001 - report, still persist what we have
+            error = e
+            print(f"An error occurred: {e}")
+        finally:
+            # Persist whatever was captured; this now writes real records.
+            written = finetuning_handler.save_finetuning_events(output_path)
+
+        if error is not None:
+            raise error
+        return written
+
+
+def prepare_test_data(questions_path):
+    directory = os.path.dirname(questions_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(questions_path, "w", encoding="utf-8") as f:
+        f.write("Question 1\nQuestion 2\n")
+
+
+def sample_documents():
+    """Non-empty corpus - an empty index gives the LLM nothing to answer from."""
+    return [
+        "Question 1 is about how LlamaIndex builds an index over documents.",
+        "Question 2 is about how the query engine retrieves and synthesises.",
+        "The callback manager dispatches LLM start/end events to every handler.",
+    ]
+
+
+def run_agent(questions_path):
+    dataset_path = os.path.dirname(questions_path) or "."
+    ft = FineTuningExample(dataset_path=dataset_path, documents=sample_documents())
+    return ft.jsonl_generation()
+
+
+if __name__ == "__main__":
+    questions_path = "./dataset_data/train_questions.txt"
+    prepare_test_data(questions_path)
+    run_agent(questions_path)
+
+--------------------------------------------------------------------------------

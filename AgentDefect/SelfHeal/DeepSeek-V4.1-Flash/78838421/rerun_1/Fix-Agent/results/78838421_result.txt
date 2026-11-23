@@ -1,0 +1,472 @@
+Case ID: 78838421
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 17:29:08
+End Time: 2026-11-05 17:35:22
+Total Duration: 373.95 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import logging
+import sys
+import traceback
+
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.chat_models import ChatOllama
+from langchain_core.runnables import RunnablePassthrough
+from langchain.retrievers.multi_query import MultiQueryRetriever
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Configuration -----------------------------------------------------------
+LOCAL_PATH = "./paper1.pdf"
+EMBED_MODEL = "nomic-embed-text"
+LOCAL_MODEL = "llama3"
+COLLECTION_NAME = "local-rag"
+PERSIST_DIR = "./chroma_db"
+
+# Chunks must be small enough that (queries x k) retrieved chunks still fit in
+# the LLM context window. 7500-char chunks blew past llama3's 8k tokens.
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+RETRIEVER_K = 3
+NUM_CTX = 8192
+NO_ANSWER = "I don't know based on the provided document."
+
+
+def format_docs(docs):
+    """Render retrieved documents as clean plain text for the prompt."""
+    return "\n\n".join(doc.page_content.strip() for doc in docs if doc.page_content.strip())
+
+
+def build_vector_db(embedding_model):
+    """Load the PDF, chunk it and (re)build the Chroma collection."""
+    loader = UnstructuredPDFLoader(file_path=LOCAL_PATH)
+    data = loader.load()
+
+    # Precondition check: we must actually have pages to work with.
+    if not data:
+        raise ValueError(f"No content could be extracted from {LOCAL_PATH}")
+    logger.info(f"Loading of PDF is done ({len(data)} page(s))")
+    logger.info(f"First page content preview: {data[0].page_content[:500]}...")
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+    chunks = text_splitter.split_documents(data)
+    chunks = [c for c in chunks if c.page_content.strip()]
+
+    # Precondition check: empty chunk list would create an empty collection.
+    if not chunks:
+        raise ValueError("Text splitting produced no usable chunks")
+    logger.info(f"Created {len(chunks)} chunks")
+
+    # Start from a clean collection so repeated runs do not accumulate
+    # duplicate/stale chunks (and never mix embedding dimensions).
+    existing = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embedding_model,
+        persist_directory=PERSIST_DIR,
+    )
+    try:
+        existing.delete_collection()
+        logger.info("Dropped previous collection before re-indexing")
+    except Exception as exc:  # noqa: BLE001 - collection may not exist yet
+        logger.info(f"No previous collection to drop ({exc})")
+
+    logger.info("Creating Vector db")
+    vector_db = Chroma.from_documents(
+        documents=chunks,
+        embedding=embedding_model,
+        collection_name=COLLECTION_NAME,
+        persist_directory=PERSIST_DIR,
+    )
+    logger.info("Local db created successfully")
+    return vector_db
+
+
+def run_agent(question):
+    try:
+        # --- Embeddings -----------------------------------------------------
+        embedding_model = OllamaEmbeddings(model=EMBED_MODEL, show_progress=True)
+
+        # Fail fast if the embedding endpoint/model is not usable.
+        probe = embedding_model.embed_query("embedding health check")
+        if not probe:
+            raise RuntimeError(f"Embedding model '{EMBED_MODEL}' returned no vector")
+        logger.info(f"Embedding model ready (dimension={len(probe)})")
+
+        # --- Vector store ---------------------------------------------------
+        vector_db = build_vector_db(embedding_model)
+
+        # Precondition check before any retrieval happens.
+        if vector_db is None:
+            raise RuntimeError("Vector db creation failed")
+
+        indexed = vector_db._collection.count()
+        if not indexed:
+            raise RuntimeError("Vector db is empty - nothing to retrieve")
+        logger.info(f"Vector db verification successful ({indexed} vectors)")
+
+        # --- LLMs -----------------------------------------------------------
+        # temperature=0 keeps the generated queries stable and parseable.
+        query_llm = ChatOllama(model=LOCAL_MODEL, temperature=0)
+        llm = ChatOllama(model=LOCAL_MODEL, temperature=0, num_ctx=NUM_CTX)
+        logger.info("LLM model loaded")
+
+        # MultiQueryRetriever parses this answer with LineListOutputParser:
+        # exactly one question per line, no preamble, no answers.
+        QUERY_PROMPT = PromptTemplate(
+            input_variables=["question"],
+            template="""You are an AI language model assistant. Your task is to generate five
+different versions of the given user question to retrieve relevant documents from
+a vector database. By generating multiple perspectives on the user question, your
+goal is to help the user overcome some of the limitations of the distance-based
+similarity search.
+
+Output ONLY the five alternative questions, numbered 1 to 5, one per line.
+Do not add an introduction, explanation, or answers.
+
+Original question: {question}""",
+        )
+        logger.info("Query prompt created")
+
+        base_retriever = vector_db.as_retriever(search_kwargs={"k": RETRIEVER_K})
+        retriever = MultiQueryRetriever.from_llm(
+            retriever=base_retriever,
+            llm=query_llm,
+            prompt=QUERY_PROMPT,
+            include_original=True,
+        )
+        logger.info("Retriever created")
+
+        # --- RAG prompt -----------------------------------------------------
+        template = """You are an assistant for question-answering tasks.
+Use ONLY the following retrieved context to answer the question.
+If the context does not contain the answer, reply exactly: "{no_answer}"
+Do not use outside knowledge and do not invent facts.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+        prompt = ChatPromptTemplate.from_template(template).partial(no_answer=NO_ANSWER)
+        logger.info("RAG prompt created")
+
+        # format_docs turns the Document objects into plain text; without it the
+        # prompt received str(Document) with page_content/metadata reprs.
+        chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        logger.info("Chain created")
+
+        # Show what was actually retrieved - the usual reason an answer looks
+        # wrong is that the retriever returned nothing relevant.
+        retrieved_docs = retriever.invoke(question)
+        logger.info(f"Retrieved {len(retrieved_docs)} document(s)")
+        for i, doc in enumerate(retrieved_docs, start=1):
+            logger.info(f"--- context {i} ---\n{doc.page_content[:300]}...")
+
+        if not retrieved_docs:
+            logger.warning("Retriever returned no documents; the answer will be empty")
+            return NO_ANSWER
+
+        response = chain.invoke(question)
+        response = (response or "").strip()
+
+        logger.info("Chain invoked")
+        if not response:
+            logger.error("LLM returned an empty completion")
+            response = NO_ANSWER
+
+        print(response)
+        logger.info(f"Response: {response}")
+        return response
+
+    except Exception as e:
+        # Log the full traceback instead of silently returning None - that is
+        # what made the original script look like it "stopped" after embedding.
+        logger.error(f"An error occurred: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
+if __name__ == "__main__":
+    question = "What are the 5 pillars of global cooperation?"
+    response = run_agent(question)
+    print(f"\nFinal Output: {response}")
+    sys.exit(0 if response else 1)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 17:35:22
+Duration: 373.94 seconds
+Verdict: ## Review
+
+**Structural validation:** `validate_fixed_code` returns ACCEPT, and the diff shows many genuine quality improvements:
+
+- Fixed the fatal `vector_db` referenced-before-assignment / silent `except` swallow (now raises fast with traceback)
+- `format_docs` added so `{context}` receives plain text instead of `str(Document)` reprs
+- Chunk size reduced 7500 → 1200 so retrieved context actually fits llama3's window (`num_ctx=8192`)
+- Dropped stale collection, added empty-PDF/empty-chunk/empty-vector/empty-completion preconditions
+- `temperature=0` on the query LLM so `LineListOutputParser` can parse the multi-query output
+- Realistic `MultiQueryRetriever.from_llm(retriever=..., llm=..., prompt=..., include_original=True)` keyword usage
+
+**However, this fix fails a deterministic test.**
+
+```python
+from langchain.globals import get_debug, get_verbose
+...
+def test_debug_and_verbose_enabled(self):
+    self.assertTrue(get_debug())
+    self.assertTrue(get_verbose())
+```
+
+`get_debug()` and `get_verbose()` read LangChain's global flags (`langchain.globals`). Both **default to `False`** and only become `True` via `set_debug(True)` / `set_verbose(True)` or the `LANGCHAIN_DEBUG` / `LANGCHAIN_VERBOSE` env vars. The test module does no such setup — it only imports `run_agent` from `run_fixed`, so the import-time side effect must come from the fixed module itself.
+
+I searched the entire fixed file: it adds `import sys`, `import traceback`, `logger = logging.getLogger(__name__)`, and `logging.basicConfig(...)` — but **never imports `langchain.globals` and never calls `set_debug` / `set_verbose`**. The verification tool confirmed `get_verbose()` returns "the value of the verbose global setting" (default off), and no setter is invoked anywhere. Result: `test_debug_and_verbose_enabled` fails 100% of the time, on every machine, with no external dependency involved. The author appears to have interpreted the "verbose/debug logging" requirement as stdlib `logging`, which does not touch LangChain's global state.
+
+**Secondary risks (not decisive, but worth noting):**
+
+| Issue | Impact |
+|---|---|
+| `vector_db._collection.count()` | Private API; breaks across Chroma versions |
+| `retriever.invoke(question)` then `chain.invoke(question)` | Retrieval (5 generated queries × embedding calls) runs twice — doubles latency/cost |
+| `embedding_model.embed_query("...")` probe | Extra network round-trip each call; raises if Ollama endpoint is unreachable where previously it might have degraded |
+| `include_original=` kwarg | Only exists in newer LangChain; would `TypeError` on older pinned versions |
+| `run_agent` still `return None` on any exception | Fails `assertIsInstance(result, str)` in two of three tests if PDF/Ollama are absent |
+
+**Verdict: REJECT**
+
+The refactor is a real improvement to the RAG pipeline, but it does not address the specific behavior the test contract enforces. The minimal required addition is:
+
+```python
+import os
+from langchain.globals import set_debug, set_verbose
+
+set_debug(True)
+set_verbose(True)
+# or: os.environ["LANGCHAIN_DEBUG"] = "true"; os.environ["LANGCHAIN_VERBOSE"] = "true"
+```
+placed at module import time (before/independent of `run_agent` execution), so the flags are `True` when the test asserts on them. As written, the case's signature test fails unconditionally.
+--------------------------------------------------------------------------------
+import logging
+import sys
+import traceback
+
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.chat_models import ChatOllama
+from langchain_core.runnables import RunnablePassthrough
+from langchain.retrievers.multi_query import MultiQueryRetriever
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Configuration -----------------------------------------------------------
+LOCAL_PATH = "./paper1.pdf"
+EMBED_MODEL = "nomic-embed-text"
+LOCAL_MODEL = "llama3"
+COLLECTION_NAME = "local-rag"
+PERSIST_DIR = "./chroma_db"
+
+# Chunks must be small enough that (queries x k) retrieved chunks still fit in
+# the LLM context window. 7500-char chunks blew past llama3's 8k tokens.
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+RETRIEVER_K = 3
+NUM_CTX = 8192
+NO_ANSWER = "I don't know based on the provided document."
+
+
+def format_docs(docs):
+    """Render retrieved documents as clean plain text for the prompt."""
+    return "\n\n".join(doc.page_content.strip() for doc in docs if doc.page_content.strip())
+
+
+def build_vector_db(embedding_model):
+    """Load the PDF, chunk it and (re)build the Chroma collection."""
+    loader = UnstructuredPDFLoader(file_path=LOCAL_PATH)
+    data = loader.load()
+
+    # Precondition check: we must actually have pages to work with.
+    if not data:
+        raise ValueError(f"No content could be extracted from {LOCAL_PATH}")
+    logger.info(f"Loading of PDF is done ({len(data)} page(s))")
+    logger.info(f"First page content preview: {data[0].page_content[:500]}...")
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+    chunks = text_splitter.split_documents(data)
+    chunks = [c for c in chunks if c.page_content.strip()]
+
+    # Precondition check: empty chunk list would create an empty collection.
+    if not chunks:
+        raise ValueError("Text splitting produced no usable chunks")
+    logger.info(f"Created {len(chunks)} chunks")
+
+    # Start from a clean collection so repeated runs do not accumulate
+    # duplicate/stale chunks (and never mix embedding dimensions).
+    existing = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embedding_model,
+        persist_directory=PERSIST_DIR,
+    )
+    try:
+        existing.delete_collection()
+        logger.info("Dropped previous collection before re-indexing")
+    except Exception as exc:  # noqa: BLE001 - collection may not exist yet
+        logger.info(f"No previous collection to drop ({exc})")
+
+    logger.info("Creating Vector db")
+    vector_db = Chroma.from_documents(
+        documents=chunks,
+        embedding=embedding_model,
+        collection_name=COLLECTION_NAME,
+        persist_directory=PERSIST_DIR,
+    )
+    logger.info("Local db created successfully")
+    return vector_db
+
+
+def run_agent(question):
+    try:
+        # --- Embeddings -----------------------------------------------------
+        embedding_model = OllamaEmbeddings(model=EMBED_MODEL, show_progress=True)
+
+        # Fail fast if the embedding endpoint/model is not usable.
+        probe = embedding_model.embed_query("embedding health check")
+        if not probe:
+            raise RuntimeError(f"Embedding model '{EMBED_MODEL}' returned no vector")
+        logger.info(f"Embedding model ready (dimension={len(probe)})")
+
+        # --- Vector store ---------------------------------------------------
+        vector_db = build_vector_db(embedding_model)
+
+        # Precondition check before any retrieval happens.
+        if vector_db is None:
+            raise RuntimeError("Vector db creation failed")
+
+        indexed = vector_db._collection.count()
+        if not indexed:
+            raise RuntimeError("Vector db is empty - nothing to retrieve")
+        logger.info(f"Vector db verification successful ({indexed} vectors)")
+
+        # --- LLMs -----------------------------------------------------------
+        # temperature=0 keeps the generated queries stable and parseable.
+        query_llm = ChatOllama(model=LOCAL_MODEL, temperature=0)
+        llm = ChatOllama(model=LOCAL_MODEL, temperature=0, num_ctx=NUM_CTX)
+        logger.info("LLM model loaded")
+
+        # MultiQueryRetriever parses this answer with LineListOutputParser:
+        # exactly one question per line, no preamble, no answers.
+        QUERY_PROMPT = PromptTemplate(
+            input_variables=["question"],
+            template="""You are an AI language model assistant. Your task is to generate five
+different versions of the given user question to retrieve relevant documents from
+a vector database. By generating multiple perspectives on the user question, your
+goal is to help the user overcome some of the limitations of the distance-based
+similarity search.
+
+Output ONLY the five alternative questions, numbered 1 to 5, one per line.
+Do not add an introduction, explanation, or answers.
+
+Original question: {question}""",
+        )
+        logger.info("Query prompt created")
+
+        base_retriever = vector_db.as_retriever(search_kwargs={"k": RETRIEVER_K})
+        retriever = MultiQueryRetriever.from_llm(
+            retriever=base_retriever,
+            llm=query_llm,
+            prompt=QUERY_PROMPT,
+            include_original=True,
+        )
+        logger.info("Retriever created")
+
+        # --- RAG prompt -----------------------------------------------------
+        template = """You are an assistant for question-answering tasks.
+Use ONLY the following retrieved context to answer the question.
+If the context does not contain the answer, reply exactly: "{no_answer}"
+Do not use outside knowledge and do not invent facts.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+        prompt = ChatPromptTemplate.from_template(template).partial(no_answer=NO_ANSWER)
+        logger.info("RAG prompt created")
+
+        # format_docs turns the Document objects into plain text; without it the
+        # prompt received str(Document) with page_content/metadata reprs.
+        chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        logger.info("Chain created")
+
+        # Show what was actually retrieved - the usual reason an answer looks
+        # wrong is that the retriever returned nothing relevant.
+        retrieved_docs = retriever.invoke(question)
+        logger.info(f"Retrieved {len(retrieved_docs)} document(s)")
+        for i, doc in enumerate(retrieved_docs, start=1):
+            logger.info(f"--- context {i} ---\n{doc.page_content[:300]}...")
+
+        if not retrieved_docs:
+            logger.warning("Retriever returned no documents; the answer will be empty")
+            return NO_ANSWER
+
+        response = chain.invoke(question)
+        response = (response or "").strip()
+
+        logger.info("Chain invoked")
+        if not response:
+            logger.error("LLM returned an empty completion")
+            response = NO_ANSWER
+
+        print(response)
+        logger.info(f"Response: {response}")
+        return response
+
+    except Exception as e:
+        # Log the full traceback instead of silently returning None - that is
+        # what made the original script look like it "stopped" after embedding.
+        logger.error(f"An error occurred: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
+if __name__ == "__main__":
+    question = "What are the 5 pillars of global cooperation?"
+    response = run_agent(question)
+    print(f"\nFinal Output: {response}")
+    sys.exit(0 if response else 1)
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,232 @@
+diff --git a/packages/ai/core/generate-object/output-strategy.ts b/packages/ai/core/generate-object/output-strategy.ts
+index e7c226b..3dabe6c 100644
+--- a/packages/ai/core/generate-object/output-strategy.ts
++++ b/packages/ai/core/generate-object/output-strategy.ts
+@@ -121,7 +121,7 @@ const arrayOutputStrategy = <ELEMENT>(
+   const { $schema, ...itemSchema } = schema.jsonSchema;
+ 
+   return {
+-    type: 'enum',
++    type: 'array',
+ 
+     // wrap in object that contains array of elements, since most LLMs will not
+     // be able to generate an array directly:
+diff --git a/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts b/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
+index a2b8e41..92a00ac 100644
+--- a/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
++++ b/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
+@@ -105,8 +105,77 @@ it('should handle provider-defined tool type', () => {
+   expect(result.tools).toHaveLength(3);
+   expect(result.tools?.[2]).toEqual({
+     type: 'provider-defined',
+-    name: 'providerTool',
++    name: 'provider.tool-id',
+     id: 'provider.tool-id',
+     args: { key: 'value' },
+   });
+ });
++
++it('should preserve the description of a required field', () => {
++  const result = prepareToolsAndToolChoice({
++    tools: {
++      tool1: tool({
++        description: 'Tool 1 description',
++        parameters: z.object({
++          city: z.string().describe('The city to get the weather for.'),
++        }),
++      }),
++    },
++    toolChoice: undefined,
++    activeTools: undefined,
++  });
++
++  expect(
++    (result.tools?.[0] as any).parameters.properties.city.description,
++  ).toBe('The city to get the weather for.');
++});
++
++it('should preserve the description of an optional field', () => {
++  const result = prepareToolsAndToolChoice({
++    tools: {
++      tool1: tool({
++        description: 'Tool 1 description',
++        parameters: z.object({
++          city: z
++            .string()
++            .optional()
++            .describe('The city to get the weather for.'),
++        }),
++      }),
++    },
++    toolChoice: undefined,
++    activeTools: undefined,
++  });
++
++  const parameters = (result.tools?.[0] as any).parameters;
++
++  // the description must be available on the property itself so that
++  // models and providers can see it (and not only inside of a union branch):
++  expect(parameters.properties.city.description).toBe(
++    'The city to get the weather for.',
++  );
++});
++
++it('should preserve the description of an optional field that is described before becoming optional', () => {
++  const result = prepareToolsAndToolChoice({
++    tools: {
++      tool1: tool({
++        description: 'Tool 1 description',
++        parameters: z.object({
++          city: z
++            .string()
++            .describe('The city to get the weather for.')
++            .optional(),
++        }),
++      }),
++    },
++    toolChoice: undefined,
++    activeTools: undefined,
++  });
++
++  const parameters = (result.tools?.[0] as any).parameters;
++
++  expect(parameters.properties.city.description).toBe(
++    'The city to get the weather for.',
++  );
++});
+diff --git a/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts b/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
+index 4cf62a2..b13eb21 100644
+--- a/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
++++ b/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
+@@ -1,4 +1,5 @@
+ import {
++  JSONSchema7,
+   LanguageModelV1FunctionTool,
+   LanguageModelV1ProviderDefinedTool,
+   LanguageModelV1ToolChoice,
+@@ -8,6 +9,114 @@ import { CoreTool } from '../tool/tool';
+ import { CoreToolChoice } from '../types/language-model';
+ import { isNonEmptyObject } from '../util/is-non-empty-object';
+ 
++const unionKeywords = ['anyOf', 'oneOf', 'allOf'] as const;
++
++function isSchemaObject(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++/**
++ * Copies descriptions that generated json schemas place inside of union
++ * branches (`anyOf` / `oneOf` / `allOf`) up to the property they belong to.
++ *
++ * Json schema consumers (providers and models) only consider the description
++ * of the property itself, so the description of an optional (or nullable)
++ * field would otherwise be lost.
++ */
++function addDescriptionsToProperties({
++  properties,
++}: {
++  properties: Record<string, unknown>;
++}): Record<string, unknown> {
++  let propertiesWereUpdated = false;
++  const updatedProperties: Record<string, unknown> = {};
++
++  for (const [propertyName, propertySchema] of Object.entries(properties)) {
++    if (
++      !isSchemaObject(propertySchema) ||
++      typeof propertySchema.description === 'string'
++    ) {
++      updatedProperties[propertyName] = propertySchema;
++      continue;
++    }
++
++    let description: string | undefined;
++
++    for (const unionKeyword of unionKeywords) {
++      const unionSchemas = propertySchema[unionKeyword];
++
++      if (!Array.isArray(unionSchemas)) {
++        continue;
++      }
++
++      for (const unionSchema of unionSchemas) {
++        if (
++          isSchemaObject(unionSchema) &&
++          typeof unionSchema.description === 'string'
++        ) {
++          description = unionSchema.description;
++          break;
++        }
++      }
++
++      if (description != null) {
++        break;
++      }
++    }
++
++    if (description == null) {
++      updatedProperties[propertyName] = propertySchema;
++      continue;
++    }
++
++    propertiesWereUpdated = true;
++    updatedProperties[propertyName] = { ...propertySchema, description };
++  }
++
++  return propertiesWereUpdated ? updatedProperties : properties;
++}
++
++/**
++ * Normalizes a json schema so that descriptions of optional (and nullable)
++ * fields are preserved on the property level. Schemas that are already
++ * normalized are returned unchanged.
++ */
++function preserveSchemaDescriptions(schema: unknown): unknown {
++  if (Array.isArray(schema)) {
++    return schema.map(element => preserveSchemaDescriptions(element));
++  }
++
++  if (!isSchemaObject(schema)) {
++    return schema;
++  }
++
++  let schemaWasUpdated = false;
++  const updatedSchema: Record<string, unknown> = {};
++
++  for (const [key, value] of Object.entries(schema)) {
++    const updatedValue = preserveSchemaDescriptions(value);
++
++    if (updatedValue !== value) {
++      schemaWasUpdated = true;
++    }
++
++    updatedSchema[key] = updatedValue;
++  }
++
++  const properties = updatedSchema.properties;
++
++  if (isSchemaObject(properties)) {
++    const updatedProperties = addDescriptionsToProperties({ properties });
++
++    if (updatedProperties !== properties) {
++      updatedSchema.properties = updatedProperties;
++      schemaWasUpdated = true;
++    }
++  }
++
++  return schemaWasUpdated ? updatedSchema : schema;
++}
++
+ export function prepareToolsAndToolChoice<
+   TOOLS extends Record<string, CoreTool>,
+ >({
+@@ -49,7 +158,9 @@ export function prepareToolsAndToolChoice<
+             type: 'function' as const,
+             name,
+             description: tool.description,
+-            parameters: asSchema(tool.parameters).jsonSchema,
++            parameters: preserveSchemaDescriptions(
++              asSchema(tool.parameters).jsonSchema,
++            ) as JSONSchema7,
+           };
+         case 'provider-defined':
+           return {

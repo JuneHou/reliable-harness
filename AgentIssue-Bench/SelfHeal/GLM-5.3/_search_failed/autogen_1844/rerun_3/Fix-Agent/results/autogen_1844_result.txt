@@ -1,0 +1,2458 @@
+Case ID: autogen_1844
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-16 22:23:20
+End Time: 2026-11-17 00:05:48
+Total Duration: 6148.36 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### autogen/retrieve_utils.py
+from typing import List, Union, Callable
+import os
+import requests
+from urllib.parse import urlparse
+import glob
+import chromadb
+
+if chromadb.__version__ < "0.4.15":
+    from chromadb.api import API
+else:
+    from chromadb.api import ClientAPI as API
+from chromadb.api.types import QueryResult
+import chromadb.utils.embedding_functions as ef
+import logging
+import pypdf
+from autogen.token_count_utils import count_token
+
+try:
+    from unstructured.partition.auto import partition
+
+    HAS_UNSTRUCTURED = True
+except ImportError:
+    HAS_UNSTRUCTURED = False
+
+logger = logging.getLogger(__name__)
+TEXT_FORMATS = [
+    "txt",
+    "json",
+    "csv",
+    "tsv",
+    "md",
+    "html",
+    "htm",
+    "rtf",
+    "rst",
+    "jsonl",
+    "log",
+    "xml",
+    "yaml",
+    "yml",
+    "pdf",
+]
+UNSTRUCTURED_FORMATS = [
+    "doc",
+    "docx",
+    "epub",
+    "msg",
+    "odt",
+    "org",
+    "pdf",
+    "ppt",
+    "pptx",
+    "rtf",
+    "rst",
+    "xlsx",
+]  # These formats will be parsed by the 'unstructured' library, if installed.
+if HAS_UNSTRUCTURED:
+    TEXT_FORMATS += UNSTRUCTURED_FORMATS
+    TEXT_FORMATS = list(set(TEXT_FORMATS))
+VALID_CHUNK_MODES = frozenset({"one_line", "multi_lines"})
+
+
+def split_text_to_chunks(
+    text: str,
+    max_tokens: int = 4000,
+    chunk_mode: str = "multi_lines",
+    must_break_at_empty_line: bool = True,
+    overlap: int = 10,
+):
+    """Split a long text into chunks of max_tokens.
+
+    Args:
+        text (str): the text to be split.
+        max_tokens (Optional, int): the maximum number of tokens per chunk. Default is 4000.
+        chunk_mode (Optional, str): the chunk mode. Default is "multi_lines".
+        must_break_at_empty_line (Optional, bool): whether to break at empty line. Default is True.
+        overlap (Optional, int): the number of lines that overlap between two adjacent chunks.
+            Default is 10. The overlapping lines are counted in the token budget of the next chunk,
+            so no chunk will exceed `max_tokens`.
+    """
+    if chunk_mode not in VALID_CHUNK_MODES:
+        raise AssertionError
+    if chunk_mode == "one_line":
+        must_break_at_empty_line = False
+    chunks = []
+    lines = text.split("\n")
+    lines_tokens = [count_token(line) for line in lines]
+    sum_tokens = sum(lines_tokens)
+    while sum_tokens > max_tokens:
+        if chunk_mode == "one_line":
+            estimated_line_cut = 2
+        else:
+            estimated_line_cut = int(max_tokens / sum_tokens * len(lines)) + 1
+        cnt = 0
+        prev = ""
+        for cnt in reversed(range(estimated_line_cut)):
+            if must_break_at_empty_line and lines[cnt].strip() != "":
+                continue
+            if sum(lines_tokens[:cnt]) <= max_tokens:
+                prev = "\n".join(lines[:cnt])
+                break
+        if cnt == 0:
+            logger.warning(
+                f"max_tokens is too small to fit a single line of text. Breaking this line:\n\t{lines[0][:100]} ..."
+            )
+            if not must_break_at_empty_line:
+                split_len = int(max_tokens / lines_tokens[0] * 0.9 * len(lines[0]))
+                prev = lines[0][:split_len]
+                lines[0] = lines[0][split_len:]
+                lines_tokens[0] = count_token(lines[0])
+            else:
+                logger.warning("Failed to split docs with must_break_at_empty_line being True, set to False.")
+                must_break_at_empty_line = False
+        chunks.append(prev) if len(prev) > 10 else None  # don't add chunks less than 10 characters
+        # Keep the last `overlap` lines of the current chunk at the beginning of the next chunk so that
+        # two adjacent chunks share some context. The overlapping lines are part of `lines_tokens`, so the
+        # next chunk still respects `max_tokens`. When `cnt` is not greater than `overlap`, we can't move the
+        # start backwards without re-processing already emitted lines (or making no progress at all), so we
+        # fall back to a plain cut.
+        lines = lines[cnt - overlap :] if cnt > overlap else lines[cnt :]
+        lines_tokens = lines_tokens[cnt - overlap :] if cnt > overlap else lines_tokens[cnt :]
+        sum_tokens = sum(lines_tokens)
+    text_to_chunk = "\n".join(lines)
+    chunks.append(text_to_chunk) if len(text_to_chunk) > 10 else None  # don't add chunks less than 10 characters
+    return chunks
+
+
+def extract_text_from_pdf(file: str) -> str:
+    """Extract text from PDF files"""
+    text = ""
+    with open(file, "rb") as f:
+        reader = pypdf.PdfReader(f)
+        if reader.is_encrypted:  # Check if the PDF is encrypted
+            try:
+                reader.decrypt("")
+            except pypdf.errors.FileNotDecryptedError as e:
+                logger.warning(f"Could not decrypt PDF {file}, {e}")
+                return text  # Return empty text if PDF could not be decrypted
+
+        for page_num in range(len(reader.pages)):
+            page = reader.pages[page_num]
+            text += page.extract_text()
+
+    if not text.strip():  # Debugging line to check if text is empty
+        logger.warning(f"Could not decrypt PDF {file}")
+
+    return text
+
+
+def split_files_to_chunks(
+    files: list,
+    max_tokens: int = 4000,
+    chunk_mode: str = "multi_lines",
+    must_break_at_empty_line: bool = True,
+    overlap: int = 10,
+    custom_text_split_function: Callable = None,
+):
+    """Split a list of files into chunks of max_tokens."""
+
+    chunks = []
+
+    for file in files:
+        _, file_extension = os.path.splitext(file)
+        file_extension = file_extension.lower()
+
+        if HAS_UNSTRUCTURED and file_extension[1:] in UNSTRUCTURED_FORMATS:
+            text = partition(file)
+            text = "\n".join([t.text for t in text]) if len(text) > 0 else ""
+        elif file_extension == ".pdf":
+            text = extract_text_from_pdf(file)
+        else:  # For non-PDF text-based files
+            with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+
+        if not text.strip():  # Debugging line to check if text is empty after reading
+            logger.warning(f"No text available in file: {file}")
+            continue  # Skip to the next file if no text is available
+
+        if custom_text_split_function is not None:
+            chunks += custom_text_split_function(text)
+        else:
+            chunks += split_text_to_chunks(text, max_tokens, chunk_mode, must_break_at_empty_line, overlap)
+
+    return chunks
+
+
+def get_files_from_dir(dir_path: Union[str, List[str]], types: list = TEXT_FORMATS, recursive: bool = True):
+    """Return a list of all the files in a given directory, a url, a file path or a list of them."""
+    if len(types) == 0:
+        raise ValueError("types cannot be empty.")
+    types = [t[1:].lower() if t.startswith(".") else t.lower() for t in set(types)]
+    types += [t.upper() for t in types]
+
+    files = []
+    # If the path is a list of files or urls, process and return them
+    if isinstance(dir_path, list):
+        for item in dir_path:
+            if os.path.isfile(item):
+                files.append(item)
+            elif is_url(item):
+                files.append(get_file_from_url(item))
+            elif os.path.exists(item):
+                try:
+                    files.extend(get_files_from_dir(item, types, recursive))
+                except ValueError:
+                    logger.warning(f"Directory {item} does not exist. Skipping.")
+            else:
+                logger.warning(f"File {item} does not exist. Skipping.")
+        return files
+
+    # If the path is a file, return it
+    if os.path.isfile(dir_path):
+        return [dir_path]
+
+    # If the path is a url, download it and return the downloaded file
+    if is_url(dir_path):
+        return [get_file_from_url(dir_path)]
+
+    if os.path.exists(dir_path):
+        for type in types:
+            if recursive:
+                files += glob.glob(os.path.join(dir_path, f"**/*.{type}"), recursive=True)
+            else:
+                files += glob.glob(os.path.join(dir_path, f"*.{type}"), recursive=False)
+    else:
+        logger.error(f"Directory {dir_path} does not exist.")
+        raise ValueError(f"Directory {dir_path} does not exist.")
+    return files
+
+
+def get_file_from_url(url: str, save_path: str = None):
+    """Download a file from a URL."""
+    if save_path is None:
+        os.makedirs("/tmp/chromadb", exist_ok=True)
+        save_path = os.path.join("/tmp/chromadb", os.path.basename(url))
+    else:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(save_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    return save_path
+
+
+def is_url(string: str):
+    """Return True if the string is a valid URL."""
+    try:
+        result = urlparse(string)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
+
+
+def create_vector_db_from_dir(
+    dir_path: Union[str, List[str]],
+    max_tokens: int = 4000,
+    client: API = None,
+    db_path: str = "/tmp/chromadb.db",
+    collection_name: str = "all-my-documents",
+    get_or_create: bool = False,
+    chunk_mode: str = "multi_lines",
+    must_break_at_empty_line: bool = True,
+    embedding_model: str = "all-MiniLM-L6-v2",
+    embedding_function: Callable = None,
+    custom_text_split_function: Callable = None,
+    custom_text_types: List[str] = TEXT_FORMATS,
+    recursive: bool = True,
+    extra_docs: bool = False,
+    overlap: int = 10,
+) -> API:
+    """Create a vector db from all the files in a given directory, the directory can also be a single file or a url to
+        a single file. We support chromadb compatible APIs to create the vector db, this function is not required if
+        you prepared your own vector db.
+
+    Args:
+        dir_path (Union[str, List[str]]): the path to the directory, file, url or a list of them.
+        max_tokens (Optional, int): the maximum number of tokens per chunk. Default is 4000.
+        client (Optional, API): the chromadb client. Default is None.
+        db_path (Optional, str): the path to the chromadb. Default is "/tmp/chromadb.db".
+        collection_name (Optional, str): the name of the collection. Default is "all-my-documents".
+        get_or_create (Optional, bool): Whether to get or create the collection. Default is False. If True, the collection
+            will be returned if it already exists. Will raise ValueError if the collection already exists and get_or_create is False.
+        chunk_mode (Optional, str): the chunk mode. Default is "multi_lines".
+        must_break_at_empty_line (Optional, bool): Whether to break at empty line. Default is True.
+        overlap (Optional, int): the number of lines that overlap between two adjacent chunks. Default is 10.
+        embedding_model (Optional, str): the embedding model to use. Default is "all-MiniLM-L6-v2". Will be ignored if
+            embedding_function is not None.
+        embedding_function (Optional, Callable): the embedding function to use. Default is None, SentenceTransformer with
+            the given `embedding_model` will be used. If you want to use OpenAI, Cohere, HuggingFace or other embedding
+            functions, you can pass it here, follow the examples in `https://docs.trychroma.com/embeddings`.
+        custom_text_split_function (Optional, Callable): a custom function to split a string into a list of strings.
+            Default is None, will use the default function in `autogen.retrieve_utils.split_text_to_chunks`.
+        custom_text_types (Optional, List[str]): a list of file types to be processed. Default is TEXT_FORMATS.
+        recursive (Optional, bool): whether to search documents recursively in the dir_path. Default is True.
+        extra_docs (Optional, bool): whether to add more documents in the collection. Default is False
+
+    Returns:
+
+    The chromadb client.
+    """
+    if client is None:
+        client = chromadb.PersistentClient(path=db_path)
+    try:
+        embedding_function = (
+            ef.SentenceTransformerEmbeddingFunction(embedding_model)
+            if embedding_function is None
+            else embedding_function
+        )
+        collection = client.create_collection(
+            collection_name,
+            get_or_create=get_or_create,
+            embedding_function=embedding_function,
+            # https://github.com/nmslib/hnswlib#supported-distances
+            # https://github.com/chroma-core/chroma/blob/566bc80f6c8ee29f7d99b6322654f32183c368c4/chromadb/segment/impl/vector/local_hnsw.py#L184
+            # https://github.com/nmslib/hnswlib/blob/master/ALGO_PARAMS.md
+            metadata={"hnsw:space": "ip", "hnsw:construction_ef": 30, "hnsw:M": 32},  # ip, l2, cosine
+        )
+
+        length = 0
+        if extra_docs:
+            length = len(collection.get()["ids"])
+
+        if custom_text_split_function is not None:
+            chunks = split_files_to_chunks(
+                get_files_from_dir(dir_path, custom_text_types, recursive),
+                custom_text_split_function=custom_text_split_function,
+            )
+        else:
+            chunks = split_files_to_chunks(
+                get_files_from_dir(dir_path, custom_text_types, recursive),
+                max_tokens,
+                chunk_mode,
+                must_break_at_empty_line,
+                overlap,
+            )
+        logger.info(f"Found {len(chunks)} chunks.")
+        # Upsert in batch of 40000 or less if the total number of chunks is less than 40000
+        for i in range(0, len(chunks), min(40000, len(chunks))):
+            end_idx = i + min(40000, len(chunks) - i)
+            collection.upsert(
+                documents=chunks[i:end_idx],
+                ids=[f"doc_{j+length}" for j in range(i, end_idx)],  # unique for each doc
+            )
+    except ValueError as e:
+        logger.warning(f"{e}")
+    return client
+
+
+def query_vector_db(
+    query_texts: List[str],
+    n_results: int = 10,
+    client: API = None,
+    db_path: str = "/tmp/chromadb.db",
+    collection_name: str = "all-my-documents",
+    search_string: str = "",
+    embedding_model: str = "all-MiniLM-L6-v2",
+    embedding_function: Callable = None,
+) -> QueryResult:
+    """Query a vector db. We support chromadb compatible APIs, it's not required if you prepared your own vector db
+        and query function.
+
+    Args:
+        query_texts (List[str]): the list of strings which will be used to query the vector db.
+        n_results (Optional, int): the number of results to return. Default is 10.
+        client (Optional, API): the chromadb compatible client. Default is None, a chromadb client will be used.
+        db_path (Optional, str): the path to the vector db. Default is "/tmp/chromadb.db".
+        collection_name (Optional, str): the name of the collection. Default is "all-my-documents".
+        search_string (Optional, str): the search string. Only docs that contain an exact match of this string will be retrieved. Default is "".
+        embedding_model (Optional, str): the embedding model to use. Default is "all-MiniLM-L6-v2". Will be ignored if
+            embedding_function is not None.
+        embedding_function (Optional, Callable): the embedding function to use. Default is None, SentenceTransformer with
+            the given `embedding_model` will be used. If you want to use OpenAI, Cohere, HuggingFace or other embedding
+            functions, you can pass it here, follow the examples in `https://docs.trychroma.com/embeddings`.
+
+    Returns:
+
+        The query result. The format is:
+
+    ```python
+    class QueryResult(TypedDict):
+        ids: List[IDs]
+        embeddings: Optional[List[List[Embedding]]]
+        documents: Optional[List[List[Document]]]
+        metadatas: Optional[List[List[Metadata]]]
+        distances: Optional[List[List[float]]]
+    ```
+    """
+    if client is None:
+        client = chromadb.PersistentClient(path=db_path)
+    # the collection's embedding function is always the default one, but we want to use the one we used to create the
+    # collection. So we compute the embeddings ourselves and pass it to the query function.
+    collection = client.get_collection(collection_name)
+    embedding_function = (
+        ef.SentenceTransformerEmbeddingFunction(embedding_model) if embedding_function is None else embedding_function
+    )
+    query_embeddings = embedding_function(query_texts)
+    # Query/search n most similar results. You can also .get by id
+    results = collection.query(
+        query_embeddings=query_embeddings,
+        n_results=n_results,
+        where_document={"$contains": search_string} if search_string else None,  # optional filter
+    )
+    return results
+
+
+### test/test_retrieve_utils.py
+#!/usr/bin/env python3 -m pytest
+
+"""
+Unit test for retrieve_utils.py
+"""
+import pytest
+
+try:
+    import chromadb
+    from autogen.retrieve_utils import (
+        split_text_to_chunks,
+        extract_text_from_pdf,
+        split_files_to_chunks,
+        get_files_from_dir,
+        is_url,
+        create_vector_db_from_dir,
+        query_vector_db,
+    )
+    from autogen.token_count_utils import count_token
+except ImportError:
+    skip = True
+else:
+    skip = False
+import os
+
+try:
+    from unstructured.partition.auto import partition
+
+    HAS_UNSTRUCTURED = True
+except ImportError:
+    HAS_UNSTRUCTURED = False
+
+test_dir = os.path.join(os.path.dirname(__file__), "test_files")
+expected_text = """AutoGen is an advanced tool designed to assist developers in harnessing the capabilities
+of Large Language Models (LLMs) for various applications. The primary purpose of AutoGen is to automate and
+simplify the process of building applications that leverage the power of LLMs, allowing for seamless
+integration, testing, and deployment."""
+
+
+@pytest.mark.skipif(skip, reason="dependency is not installed")
+class TestRetrieveUtils:
+    def test_split_text_to_chunks(self):
+        long_text = "A" * 10000
+        chunks = split_text_to_chunks(long_text, max_tokens=1000)
+        assert all(count_token(chunk) <= 1000 for chunk in chunks)
+
+    def test_split_text_to_chunks_raises_on_invalid_chunk_mode(self):
+        with pytest.raises(AssertionError):
+            split_text_to_chunks("A" * 10000, chunk_mode="bogus_chunk_mode")
+
+    def test_split_text_to_chunks_with_overlap(self):
+        # `overlap` should be used by the chunking logic: the last `overlap` lines of a chunk
+        # must be repeated at the beginning of the next chunk.
+        long_text = "\n".join([f"line {i}" for i in range(100)])
+        overlap = 5
+        chunks = split_text_to_chunks(
+            long_text,
+            max_tokens=100,
+            chunk_mode="multi_lines",
+            must_break_at_empty_line=False,
+            overlap=overlap,
+        )
+        assert len(chunks) > 1
+        # each chunk still respects the token limit (the overlapping lines are counted in)
+        assert all(count_token(chunk) <= 100 for chunk in chunks)
+        for i in range(1, len(chunks)):
+            prev_lines = chunks[i - 1].split("\n")
+            curr_lines = chunks[i].split("\n")
+            assert curr_lines[:overlap] == prev_lines[-overlap:]
+
+        # with overlap = 0 the chunks must not share any line
+        chunks_no_overlap = split_text_to_chunks(
+            long_text,
+            max_tokens=100,
+            chunk_mode="multi_lines",
+            must_break_at_empty_line=False,
+            overlap=0,
+        )
+        assert len(chunks_no_overlap) > 1
+        assert len(chunks) >= len(chunks_no_overlap)
+        for i in range(1, len(chunks_no_overlap)):
+            prev_lines = chunks_no_overlap[i - 1].split("\n")
+            curr_lines = chunks_no_overlap[i].split("\n")
+            assert curr_lines[0] != prev_lines[-1]
+
+    def test_extract_text_from_pdf(self):
+        pdf_file_path = os.path.join(test_dir, "example.pdf")
+        assert "".join(expected_text.split()) == "".join(extract_text_from_pdf(pdf_file_path).strip().split())
+
+    def test_split_files_to_chunks(self):
+        pdf_file_path = os.path.join(test_dir, "example.pdf")
+        txt_file_path = os.path.join(test_dir, "example.txt")
+        chunks = split_files_to_chunks([pdf_file_path, txt_file_path])
+        assert all(
+            isinstance(chunk, str) and "AutoGen is an advanced tool designed to assist developers" in chunk.strip()
+            for chunk in chunks
+        )
+
+    def test_get_files_from_dir(self):
+        files = get_files_from_dir(test_dir, recursive=False)
+        assert all(os.path.isfile(file) for file in files)
+        pdf_file_path = os.path.join(test_dir, "example.pdf")
+        txt_file_path = os.path.join(test_dir, "example.txt")
+        files = get_files_from_dir([pdf_file_path, txt_file_path])
+        assert all(os.path.isfile(file) for file in files)
+        files = get_files_from_dir(
+            [
+                pdf_file_path,
+                txt_file_path,
+                os.path.join(test_dir, "..", "..", "website/docs"),
+                "https://raw.githubusercontent.com/microsoft/autogen/main/README.md",
+            ],
+            recursive=True,
+        )
+        assert all(os.path.isfile(file) for file in files)
+        files = get_files_from_dir(
+            [
+                pdf_file_path,
+                txt_file_path,
+                os.path.join(test_dir, "..", "..", "website/docs"),
+                "https://raw.githubusercontent.com/microsoft/autogen/main/README.md",
+            ],
+            recursive=True,
+            types=["pdf", "txt"],
+        )
+        assert all(os.path.isfile(file) for file in files)
+        assert len(files) == 3
+
+    def test_is_url(self):
+        assert is_url("https://www.example.com")
+        assert not is_url("not_a_url")
+
+    def test_create_vector_db_from_dir(self):
+        db_path = "/tmp/test_retrieve_utils_chromadb.db"
+        if os.path.exists(db_path):
+            client = chromadb.PersistentClient(path=db_path)
+        else:
+            client = chromadb.PersistentClient(path=db_path)
+            create_vector_db_from_dir(test_dir, client=client)
+
+        assert client.get_collection("all-my-documents")
+
+    def test_query_vector_db(self):
+        db_path = "/tmp/test_retrieve_utils_chromadb.db"
+        if os.path.exists(db_path):
+            client = chromadb.PersistentClient(path=db_path)
+        else:  # If the database does not exist, create it first
+            client = chromadb.PersistentClient(path=db_path)
+            create_vector_db_from_dir(test_dir, client=client)
+
+        results = query_vector_db(["autogen"], client=client)
+        assert isinstance(results, dict) and any("autogen" in res[0].lower() for res in results.get("documents", []))
+
+    def test_custom_vector_db(self):
+        try:
+            import lancedb
+        except ImportError:
+            return
+        from autogen.agentchat.contrib.retrieve_user_proxy_agent import RetrieveUserProxyAgent
+
+        db_path = "/tmp/lancedb"
+
+        def create_lancedb():
+            db = lancedb.connect(db_path)
+            data = [
+                {"vector": [1.1, 1.2], "id": 1, "documents": "This is a test document spark"},
+                {"vector": [0.2, 1.8], "id": 2, "documents": "This is another test document"},
+                {"vector": [0.1, 0.3], "id": 3, "documents": "This is a third test document spark"},
+                {"vector": [0.5, 0.7], "id": 4, "documents": "This is a fourth test document"},
+                {"vector": [2.1, 1.3], "id": 5, "documents": "This is a fifth test document spark"},
+                {"vector": [5.1, 8.3], "id": 6, "documents": "This is a sixth test document"},
+            ]
+            try:
+                db.create_table("my_table", data)
+            except OSError:
+                pass
+
+        class MyRetrieveUserProxyAgent(RetrieveUserProxyAgent):
+            def query_vector_db(
+                self,
+                query_texts,
+                n_results=10,
+                search_string="",
+            ):
+                if query_texts:
+                    vector = [0.1, 0.3]
+                db = lancedb.connect(db_path)
+                table = db.open_table("my_table")
+                query = table.search(vector).where(f"documents LIKE '%{search_string}%'").limit(n_results).to_df()
+                return {"ids": [query["id"].tolist()], "documents": [query["documents"].tolist()]}
+
+            def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = ""):
+                results = self.query_vector_db(
+                    query_texts=[problem],
+                    n_results=n_results,
+                    search_string=search_string,
+                )
+
+                self._results = results
+                print("doc_ids: ", results["ids"])
+
+        ragragproxyagent = MyRetrieveUserProxyAgent(
+            name="ragproxyagent",
+            human_input_mode="NEVER",
+            max_consecutive_auto_reply=2,
+            retrieve_config={
+                "task": "qa",
+                "chunk_token_size": 2000,
+                "client": "__",
+                "embedding_model": "all-mpnet-base-v2",
+            },
+        )
+
+        create_lancedb()
+        ragragproxyagent.retrieve_docs("This is a test document spark", n_results=10, search_string="spark")
+        assert ragragproxyagent._results["ids"] == [[3, 1, 5]]
+
+    def test_custom_text_split_function(self):
+        def custom_text_split_function(text):
+            return [text[: len(text) // 2], text[len(text) // 2 :]]
+
+        db_path = "/tmp/test_retrieve_utils_chromadb.db"
+        client = chromadb.PersistentClient(path=db_path)
+        create_vector_db_from_dir(
+            os.path.join(test_dir, "example.txt"),
+            client=client,
+            collection_name="mytestcollection",
+            custom_text_split_function=custom_text_split_function,
+            get_or_create=True,
+            recursive=False,
+        )
+        results = query_vector_db(["autogen"], client=client, collection_name="mytestcollection", n_results=1)
+        assert (
+            "AutoGen is an advanced tool designed to assist developers in harnessing the capabilities"
+            in results.get("documents")[0][0]
+        )
+
+    def test_retrieve_utils(self):
+        client = chromadb.PersistentClient(path="/tmp/chromadb")
+        create_vector_db_from_dir(
+            dir_path="./website/docs",
+            client=client,
+            collection_name="autogen-docs",
+            custom_text_types=["txt", "md", "rtf", "rst"],
+            get_or_create=True,
+        )
+        results = query_vector_db(
+            query_texts=[
+                "How can I use AutoGen UserProxyAgent and AssistantAgent to do code generation?",
+            ],
+            n_results=4,
+            client=client,
+            collection_name="autogen-docs",
+            search_string="AutoGen",
+        )
+        print(results["ids"][0])
+        assert len(results["ids"][0]) == 4
+
+    @pytest.mark.skipif(
+        not HAS_UNSTRUCTURED,
+        reason="do not run if unstructured is not installed",
+    )
+    def test_unstructured(self):
+        pdf_file_path = os.path.join(test_dir, "example.pdf")
+        txt_file_path = os.path.join(test_dir, "example.txt")
+        word_file_path = os.path.join(test_dir, "example.docx")
+        chunks = split_files_to_chunks([pdf_file_path, txt_file_path, word_file_path])
+        assert all(
+            isinstance(chunk, str) and "AutoGen is an advanced tool designed to assist developers" in chunk.strip()
+            for chunk in chunks
+        )
+
+
+if __name__ == "__main__":
+    pytest.main()
+
+    db_path = "/tmp/test_retrieve_utils_chromadb.db"
+    if os.path.exists(db_path):
+        os.remove(db_path)  # Delete the database file after tests are finished
+
+
+### autogen/agentchat/contrib/retrieve_user_proxy_agent.py
+import re
+from typing import Callable, Dict, Optional, Union, List, Tuple, Any
+from IPython import get_ipython
+
+try:
+    import chromadb
+except ImportError:
+    raise ImportError("Please install dependencies first. `pip install pyautogen[retrievechat]`")
+from autogen.agentchat.agent import Agent
+from autogen.agentchat import UserProxyAgent
+from autogen.retrieve_utils import create_vector_db_from_dir, query_vector_db, TEXT_FORMATS
+from autogen.token_count_utils import count_token
+from autogen.code_utils import extract_code
+from autogen import logger
+from ...formatting_utils import colored
+
+
+PROMPT_DEFAULT = """You're a retrieve augmented chatbot. You answer user's questions based on your own knowledge and the
+context provided by the user. You should follow the following steps to answer a question:
+Step 1, you estimate the user's intent based on the question and context. The intent can be a code generation task or
+a question answering task.
+Step 2, you reply based on the intent.
+If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+If user's intent is code generation, you must obey the following rules:
+Rule 1. You MUST NOT install any packages because all the packages needed are already installed.
+Rule 2. You must follow the formats below to write your code:
+```language
+# your code
+```
+
+If user's intent is question answering, you must give as short an answer as possible.
+
+User's question is: {input_question}
+
+Context is: {input_context}
+"""
+
+PROMPT_CODE = """You're a retrieve augmented coding assistant. You answer user's questions based on your own knowledge and the
+context provided by the user.
+If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+For code generation, you must obey the following rules:
+Rule 1. You MUST NOT install any packages because all the packages needed are already installed.
+Rule 2. You must follow the formats below to write your code:
+```language
+# your code
+```
+
+User's question is: {input_question}
+
+Context is: {input_context}
+"""
+
+PROMPT_QA = """You're a retrieve augmented chatbot. You answer user's questions based on your own knowledge and the
+context provided by the user.
+If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+You must give as short an answer as possible.
+
+User's question is: {input_question}
+
+Context is: {input_context}
+"""
+
+
+class RetrieveUserProxyAgent(UserProxyAgent):
+    """(In preview) The Retrieval-Augmented User Proxy retrieves document chunks based on the embedding
+    similarity, and sends them along with the question to the Retrieval-Augmented Assistant
+    """
+
+    def __init__(
+        self,
+        name="RetrieveChatAgent",  # default set to RetrieveChatAgent
+        human_input_mode: Optional[str] = "ALWAYS",
+        is_termination_msg: Optional[Callable[[Dict], bool]] = None,
+        retrieve_config: Optional[Dict] = None,  # config for the retrieve agent
+        **kwargs,
+    ):
+        r"""
+        Args:
+            name (str): name of the agent.
+
+            human_input_mode (str): whether to ask for human inputs every time a message is received.
+                Possible values are "ALWAYS", "TERMINATE", "NEVER".
+                1. When "ALWAYS", the agent prompts for human input every time a message is received.
+                    Under this mode, the conversation stops when the human input is "exit",
+                    or when is_termination_msg is True and there is no human input.
+                2. When "TERMINATE", the agent only prompts for human input only when a termination
+                    message is received or the number of auto reply reaches
+                    the max_consecutive_auto_reply.
+                3. When "NEVER", the agent will never prompt for human input. Under this mode, the
+                    conversation stops when the number of auto reply reaches the
+                    max_consecutive_auto_reply or when is_termination_msg is True.
+
+            is_termination_msg (function): a function that takes a message in the form of a dictionary
+                and returns a boolean value indicating if this received message is a termination message.
+                The dict can contain the following keys: "content", "role", "name", "function_call".
+
+            retrieve_config (dict or None): config for the retrieve agent.
+
+                To use default config, set to None. Otherwise, set to a dictionary with the
+                following keys:
+                - `task` (Optional, str) - the task of the retrieve chat. Possible values are
+                    "code", "qa" and "default". System prompt will be different for different tasks.
+                     The default value is `default`, which supports both code and qa.
+                - `client` (Optional, chromadb.Client) - the chromadb client. If key not provided, a
+                     default client `chromadb.Client()` will be used. If you want to use other
+                     vector db, extend this class and override the `retrieve_docs` function.
+                - `docs_path` (Optional, Union[str, List[str]]) - the path to the docs directory. It
+                     can also be the path to a single file, the url to a single file or a list
+                     of directories, files and urls. Default is None, which works only if the
+                     collection is already created.
+                - `extra_docs` (Optional, bool) - when true, allows adding documents with unique IDs
+                    without overwriting existing ones; when false, it replaces existing documents
+                    using default IDs, risking collection overwrite., when set to true it enables
+                    the system to assign unique IDs starting from "length+i" for new document
+                    chunks, preventing the replacement of existing documents and facilitating
+                    the addition of more content to the collection..
+                    By default, "extra_docs" is set to false, starting document IDs from zero.
+                    This poses a risk as new documents might overwrite existing ones, potentially
+                    causing unintended loss or alteration of data in the collection.
+                - `collection_name` (Optional, str) - the name of the collection.
+                    If key not provided, a default name `autogen-docs` will be used.
+                - `model` (Optional, str) - the model to use for the retrieve chat.
+                    If key not provided, a default model `gpt-4` will be used.
+                - `chunk_token_size` (Optional, int) - the chunk token size for the retrieve chat.
+                    If key not provided, a default size `max_tokens * 0.4` will be used.
+                - `context_max_tokens` (Optional, int) - the context max token size for the
+                    retrieve chat.
+                    If key not provided, a default size `max_tokens * 0.8` will be used.
+                - `chunk_mode` (Optional, str) - the chunk mode for the retrieve chat. Possible values
+                    are "multi_lines" and "one_line". If key not provided, a default mode
+                    `multi_lines` will be used.
+                - `must_break_at_empty_line` (Optional, bool) - chunk will only break at empty line
+                    if True. Default is True.
+                    If chunk_mode is "one_line", this parameter will be ignored.
+                - `overlap` (Optional, int) - the number of lines that overlap between two adjacent
+                    chunks. Default is 10. The overlapping lines are counted in the token budget of
+                    the next chunk, so no chunk will exceed `chunk_token_size`.
+                - `embedding_model` (Optional, str) - the embedding model to use for the retrieve chat.
+                    If key not provided, a default model `all-MiniLM-L6-v2` will be used. All available
+                    models can be found at `https://www.sbert.net/docs/pretrained_models.html`.
+                    The default model is a fast model. If you want to use a high performance model,
+                    `all-mpnet-base-v2` is recommended.
+                - `embedding_function` (Optional, Callable) - the embedding function for creating the
+                    vector db. Default is None, SentenceTransformer with the given `embedding_model`
+                    will be used. If you want to use OpenAI, Cohere, HuggingFace or other embedding
+                    functions, you can pass it here,
+                    follow the examples in `https://docs.trychroma.com/embeddings`.
+                - `customized_prompt` (Optional, str) - the customized prompt for the retrieve chat.
+                    Default is None.
+                - `customized_answer_prefix` (Optional, str) - the customized answer prefix for the
+                    retrieve chat. Default is "".
+                    If not "" and the customized_answer_prefix is not in the answer,
+                    `Update Context` will be triggered.
+                - `update_context` (Optional, bool) - if False, will not apply `Update Context` for
+                    interactive retrieval. Default is True.
+                - `get_or_create` (Optional, bool) - if True, will create/return a collection for the
+                    retrieve chat. This is the same as that used in chromadb.
+                    Default is False. Will raise ValueError if the collection already exists and
+                    get_or_create is False. Will be set to True if docs_path is None.
+                - `custom_token_count_function` (Optional, Callable) - a custom function to count the
+                    number of tokens in a string.
+                    The function should take (text:str, model:str) as input and return the
+                    token_count(int). the retrieve_config["model"] will be passed in the function.
+                    Default is autogen.token_count_utils.count_token that uses tiktoken, which may
+                    not be accurate for non-OpenAI models.
+                - `custom_text_split_function` (Optional, Callable) - a custom function to split a
+                    string into a list of strings.
+                    Default is None, will use the default function in
+                    `autogen.retrieve_utils.split_text_to_chunks`.
+                - `custom_text_types` (Optional, List[str]) - a list of file types to be processed.
+                    Default is `autogen.retrieve_utils.TEXT_FORMATS`.
+                    This only applies to files under the directories in `docs_path`. Explicitly
+                    included files and urls will be chunked regardless of their types.
+                - `recursive` (Optional, bool) - whether to search documents recursively in the
+                    docs_path. Default is True.
+
+            `**kwargs` (dict): other kwargs in [UserProxyAgent](../user_proxy_agent#__init__).
+
+        Example:
+
+        Example of overriding retrieve_docs - If you have set up a customized vector db, and it's
+        not compatible with chromadb, you can easily plug in it with below code.
+        ```python
+        class MyRetrieveUserProxyAgent(RetrieveUserProxyAgent):
+            def query_vector_db(
+                self,
+                query_texts: List[str],
+                n_results: int = 10,
+                search_string: str = "",
+                **kwargs,
+            ) -> Dict[str, Union[List[str], List[List[str]]]]:
+                # define your own query function here
+                pass
+
+            def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = "", **kwargs):
+                results = self.query_vector_db(
+                    query_texts=[problem],
+                    n_results=n_results,
+                    search_string=search_string,
+                    **kwargs,
+                )
+
+                self._results = results
+                print("doc_ids: ", results["ids"])
+        ```
+        """
+        super().__init__(
+            name=name,
+            human_input_mode=human_input_mode,
+            **kwargs,
+        )
+
+        self._retrieve_config = {} if retrieve_config is None else retrieve_config
+        self._task = self._retrieve_config.get("task", "default")
+        self._client = self._retrieve_config.get("client", chromadb.Client())
+        self._docs_path = self._retrieve_config.get("docs_path", None)
+        self._extra_docs = self._retrieve_config.get("extra_docs", False)
+        self._collection_name = self._retrieve_config.get("collection_name", "autogen-docs")
+        if "docs_path" not in self._retrieve_config:
+            logger.warning(
+                "docs_path is not provided in retrieve_config. "
+                f"Will raise ValueError if the collection `{self._collection_name}` doesn't exist. "
+                "Set docs_path to None to suppress this warning."
+            )
+        self._model = self._retrieve_config.get("model", "gpt-4")
+        self._max_tokens = self.get_max_tokens(self._model)
+        self._chunk_token_size = int(self._retrieve_config.get("chunk_token_size", self._max_tokens * 0.4))
+        self._chunk_mode = self._retrieve_config.get("chunk_mode", "multi_lines")
+        self._must_break_at_empty_line = self._retrieve_config.get("must_break_at_empty_line", True)
+        self._overlap = self._retrieve_config.get("overlap", 10)
+        self._embedding_model = self._retrieve_config.get("embedding_model", "all-MiniLM-L6-v2")
+        self._embedding_function = self._retrieve_config.get("embedding_function", None)
+        self.customized_prompt = self._retrieve_config.get("customized_prompt", None)
+        self.customized_answer_prefix = self._retrieve_config.get("customized_answer_prefix", "").upper()
+        self.update_context = self._retrieve_config.get("update_context", True)
+        self._get_or_create = self._retrieve_config.get("get_or_create", False) if self._docs_path is not None else True
+        self.custom_token_count_function = self._retrieve_config.get("custom_token_count_function", count_token)
+        self.custom_text_split_function = self._retrieve_config.get("custom_text_split_function", None)
+        self._custom_text_types = self._retrieve_config.get("custom_text_types", TEXT_FORMATS)
+        self._recursive = self._retrieve_config.get("recursive", True)
+        self._context_max_tokens = self._retrieve_config.get("context_max_tokens", self._max_tokens * 0.8)
+        self._collection = True if self._docs_path is None else False  # whether the collection is created
+        self._ipython = get_ipython()
+        self._doc_idx = -1  # the index of the current used doc
+        self._results = {}  # the results of the current query
+        self._intermediate_answers = set()  # the intermediate answers
+        self._doc_contents = []  # the contents of the current used doc
+        self._doc_ids = []  # the ids of the current used doc
+        self._search_string = ""  # the search string used in the current query
+        # update the termination message function
+        self._is_termination_msg = (
+            self._is_termination_msg_retrievechat if is_termination_msg is None else is_termination_msg
+        )
+        self.register_reply(Agent, RetrieveUserProxyAgent._generate_retrieve_user_reply, position=2)
+
+    def _is_termination_msg_retrievechat(self, message):
+        """Check if a message is a termination message.
+        For code generation, terminate when no code block is detected. Currently only detect python code blocks.
+        For question answering, terminate when don't update context, i.e., answer is given.
+        """
+        if isinstance(message, dict):
+            message = message.get("content")
+            if message is None:
+                return False
+        cb = extract_code(message)
+        contain_code = False
+        for c in cb:
+            # todo: support more languages
+            if c[0] == "python":
+                contain_code = True
+                break
+        update_context_case1, update_context_case2 = self._check_update_context(message)
+        return not (contain_code or update_context_case1 or update_context_case2)
+
+    @staticmethod
+    def get_max_tokens(model="gpt-3.5-turbo"):
+        if "32k" in model:
+            return 32000
+        elif "16k" in model:
+            return 16000
+        elif "gpt-4" in model:
+            return 8000
+        else:
+            return 4000
+
+    def _reset(self, intermediate=False):
+        self._doc_idx = -1  # the index of the current used doc
+        self._results = {}  # the results of the current query
+        if not intermediate:
+            self._intermediate_answers = set()  # the intermediate answers
+            self._doc_contents = []  # the contents of the current used doc
+            self._doc_ids = []  # the ids of the current used doc
+
+    def _get_context(self, results: Dict[str, Union[List[str], List[List[str]]]]):
+        doc_contents = ""
+        current_tokens = 0
+        _doc_idx = self._doc_idx
+        _tmp_retrieve_count = 0
+        for idx, doc in enumerate(results["documents"][0]):
+            if idx <= _doc_idx:
+                continue
+            if results["ids"][0][idx] in self._doc_ids:
+                continue
+            _doc_tokens = self.custom_token_count_function(doc, self._model)
+            if _doc_tokens > self._context_max_tokens:
+                func_print = f"Skip doc_id {results['ids'][0][idx]} as it is too long to fit in the context."
+                print(colored(func_print, "green"), flush=True)
+                self._doc_idx = idx
+                continue
+            if current_tokens + _doc_tokens > self._context_max_tokens:
+                break
+            func_print = f"Adding doc_id {results['ids'][0][idx]} to context."
+            print(colored(func_print, "green"), flush=True)
+            current_tokens += _doc_tokens
+            doc_contents += doc + "\n"
+            self._doc_idx = idx
+            self._doc_ids.append(results["ids"][0][idx])
+            self._doc_contents.append(doc)
+            _tmp_retrieve_count += 1
+            if _tmp_retrieve_count >= self.n_results:
+                break
+        return doc_contents
+
+    def _generate_message(self, doc_contents, task="default"):
+        if not doc_contents:
+            print(colored("No more context, will terminate.", "green"), flush=True)
+            return "TERMINATE"
+        if self.customized_prompt:
+            message = self.customized_prompt.format(input_question=self.problem, input_context=doc_contents)
+        elif task.upper() == "CODE":
+            message = PROMPT_CODE.format(input_question=self.problem, input_context=doc_contents)
+        elif task.upper() == "QA":
+            message = PROMPT_QA.format(input_question=self.problem, input_context=doc_contents)
+        elif task.upper() == "DEFAULT":
+            message = PROMPT_DEFAULT.format(input_question=self.problem, input_context=doc_contents)
+        else:
+            raise NotImplementedError(f"task {task} is not implemented.")
+        return message
+
+    def _check_update_context(self, message):
+        if isinstance(message, dict):
+            message = message.get("content", "")
+        elif not isinstance(message, str):
+            message = ""
+        update_context_case1 = "UPDATE CONTEXT" in message[-20:].upper() or "UPDATE CONTEXT" in message[:20].upper()
+        update_context_case2 = self.customized_answer_prefix and self.customized_answer_prefix not in message.upper()
+        return update_context_case1, update_context_case2
+
+    def _generate_retrieve_user_reply(
+        self,
+        messages: Optional[List[Dict]] = None,
+        sender: Optional[Agent] = None,
+        config: Optional[Any] = None,
+    ) -> Tuple[bool, Union[str, Dict, None]]:
+        """In this function, we will update the context and reset the conversation based on different conditions.
+        We'll update the context and reset the conversation if update_context is True and either of the following:
+        (1) the last message contains "UPDATE CONTEXT",
+        (2) the last message doesn't contain "UPDATE CONTEXT" and the customized_answer_prefix is not in the message.
+        """
+        if config is None:
+            config = self
+        if messages is None:
+            messages = self._oai_messages[sender]
+        message = messages[-1]
+        update_context_case1, update_context_case2 = self._check_update_context(message)
+        if (update_context_case1 or update_context_case2) and self.update_context:
+            print(colored("Updating context and resetting conversation.", "green"), flush=True)
+            # extract the first sentence in the response as the intermediate answer
+            _message = message.get("content", "").split("\n")[0].strip()
+            _intermediate_info = re.split(r"(?<=[.!?])\s+", _message)
+            self._intermediate_answers.add(_intermediate_info[0])
+
+            if update_context_case1:
+                # try to get more context from the current retrieved doc results because the results may be too long to fit
+                # in the LLM context.
+                doc_contents = self._get_context(self._results)
+
+                # Always use self.problem as the query text to retrieve docs, but each time we replace the context with the
+                # next similar docs in the retrieved doc results.
+                if not doc_contents:
+                    for _tmp_retrieve_count in range(1, 5):
+                        self._reset(intermediate=True)
+                        self.retrieve_docs(
+                            self.problem, self.n_results * (2 * _tmp_retrieve_count + 1), self._search_string
+                        )
+                        doc_contents = self._get_context(self._results)
+                        if doc_contents:
+                            break
+            elif update_context_case2:
+                # Use the current intermediate info as the query text to retrieve docs, and each time we append the top similar
+                # docs in the retrieved doc results to the context.
+                for _tmp_retrieve_count in range(5):
+                    self._reset(intermediate=True)
+                    self.retrieve_docs(
+                        _intermediate_info[0], self.n_results * (2 * _tmp_retrieve_count + 1), self._search_string
+                    )
+                    self._get_context(self._results)
+                    doc_contents = "\n".join(self._doc_contents)  # + "\n" + "\n".join(self._intermediate_answers)
+                    if doc_contents:
+                        break
+
+            self.clear_history()
+            sender.clear_history()
+            return True, self._generate_message(doc_contents, task=self._task)
+        else:
+            return False, None
+
+    def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = ""):
+        """Retrieve docs based on the given problem and assign the results to the class property `_results`.
+        In case you want to customize the retrieval process, such as using a different vector db whose APIs are not
+        compatible with chromadb or filter results with metadata, you can override this function. Just keep the current
+        parameters and add your own parameters with default values, and keep the results in below type.
+
+        Type of the results: Dict[str, List[List[Any]]], should have keys "ids" and "documents", "ids" for the ids of
+        the retrieved docs and "documents" for the contents of the retrieved docs. Any other keys are optional. Refer
+        to `chromadb.api.types.QueryResult` as an example.
+            ids: List[string]
+            documents: List[List[string]]
+
+        Args:
+            problem (str): the problem to be solved.
+            n_results (int): the number of results to be retrieved. Default is 20.
+            search_string (str): only docs that contain an exact match of this string will be retrieved. Default is "".
+        """
+        if not self._collection or not self._get_or_create:
+            print("Trying to create collection.")
+            self._client = create_vector_db_from_dir(
+                dir_path=self._docs_path,
+                max_tokens=self._chunk_token_size,
+                client=self._client,
+                collection_name=self._collection_name,
+                chunk_mode=self._chunk_mode,
+                must_break_at_empty_line=self._must_break_at_empty_line,
+                embedding_model=self._embedding_model,
+                get_or_create=self._get_or_create,
+                embedding_function=self._embedding_function,
+                custom_text_split_function=self.custom_text_split_function,
+                custom_text_types=self._custom_text_types,
+                recursive=self._recursive,
+                extra_docs=self._extra_docs,
+                overlap=self._overlap,
+            )
+            self._collection = True
+            self._get_or_create = True
+
+        results = query_vector_db(
+            query_texts=[problem],
+            n_results=n_results,
+            search_string=search_string,
+            client=self._client,
+            collection_name=self._collection_name,
+            embedding_model=self._embedding_model,
+            embedding_function=self._embedding_function,
+        )
+        self._search_string = search_string
+        self._results = results
+        print("doc_ids: ", results["ids"])
+
+    @staticmethod
+    def message_generator(sender, recipient, context):
+        """
+        Generate an initial message with the given context for the RetrieveUserProxyAgent.
+        Args:
+            sender (Agent): the sender agent. It should be the instance of RetrieveUserProxyAgent.
+            recipient (Agent): the recipient agent. Usually it's the assistant agent.
+            context (dict): the context for the message generation. It should contain the following keys:
+                - `problem` (str) - the problem to be solved.
+                - `n_results` (int) - the number of results to be retrieved. Default is 20.
+                - `search_string` (str) - only docs that contain an exact match of this string will be retrieved. Default is "".
+        Returns:
+            str: the generated message ready to be sent to the recipient agent.
+        """
+        sender._reset()
+
+        problem = context.get("problem", "")
+        n_results = context.get("n_results", 20)
+        search_string = context.get("search_string", "")
+
+        sender.retrieve_docs(problem, n_results, search_string)
+        sender.problem = problem
+        sender.n_results = n_results
+        doc_contents = sender._get_context(sender._results)
+        message = sender._generate_message(doc_contents, sender._task)
+        return message
+
+    def run_code(self, code, **kwargs):
+        lang = kwargs.get("lang", None)
+        if code.startswith("!") or code.startswith("pip") or lang in ["bash", "shell", "sh"]:
+            return (
+                0,
+                "You MUST NOT install any packages because all the packages needed are already installed.",
+                None,
+            )
+        if self._ipython is None or lang != "python":
+            return super().run_code(code, **kwargs)
+        else:
+            result = self._ipython.run_cell(code)
+            log = str(result.result)
+            exitcode = 0 if result.success else 1
+            if result.error_before_exec is not None:
+                log += f"\n{result.error_before_exec}"
+                exitcode = 1
+            if result.error_in_exec is not None:
+                log += f"\n{result.error_in_exec}"
+                exitcode = 1
+            return exitcode, log, None
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-17 00:05:48
+Duration: 6148.36 seconds
+Verdict: 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Evaluation of case autogen_1844
+
+**The bug:** `split_text_to_chunks` accepted an `overlap: int = 10` parameter but never used it — chunks were cut with `lines[cnt:]`, so adjacent chunks never shared lines, despite the parameter's implied contract.
+
+**The fix (from the diff):**
+```python
+lines = lines[cnt - overlap :] if cnt > overlap else lines[cnt :]
+lines_tokens = lines_tokens[cnt - overlap :] if cnt > overlap else lines_tokens[cnt :]
+```
+plus threading `overlap` through `split_files_to_chunks` → `create_vector_db_from_dir` → `RetrieveUserProxyAgent` (new `overlap` retrieve_config key), with docstrings updated in all three places.
+
+**Analysis:**
+
+1. **Correctness of the core change:** When a chunk is emitted from `lines[:cnt]`, the next chunk now starts at `lines[cnt-overlap:]`, so the last `overlap` lines of the emitted chunk are repeated at the head of the next chunk — exactly the documented semantics. The guard `cnt > overlap` is essential and correct: if `cnt == overlap`, `lines[cnt-overlap:]` would be `lines[0:]` (no progress → infinite loop), and for `cnt < overlap` it would move backwards or re-emit lines. The fallback to a plain cut guarantees forward progress in all cases. The overlapped lines remain in `lines_tokens`, so they are counted against the next chunk's `max_tokens` budget in the function's existing token accounting model — matching the added docstring claim.
+
+2. **Manual trace against the provided test (`reproduce.py`):** With `TEXT = "Line0\n...\nLine19"`, `max_tokens=12`, `overlap=2`, the fixed code produces chunks `Line0-5`, `Line4-9`, `Line8-13`, `Line12-17`, `Line16-19` — each consecutive pair shares exactly the last/first 2 lines, so `overlap_detected = True` → exit code **0** for "fixed". The buggy code produces `Line0-5`, `Line6-11`, `Line12-17`, `Line18-19` with no shared lines → exit code **1**. The test correctly discriminates. I verified this holds under different plausible tiktoken counts per line (1, 2, 3, or 4 tokens/line) — overlap is always detected.
+
+3. **No regressions in existing behavior:** `test_split_text_to_chunks` ("A"*10000, single line) still passes — in single-line scenarios `cnt == 0`, so the `cnt > overlap` branch is never taken and behavior is identical to before. Small files (< max_tokens) still produce one chunk. New parameters all have defaults and are appended in backward-compatible positions; internal call sites use keywords.
+
+4. **Tool results:** `validate_fixed_code` → ACCEPT (all files present once with full text; no required test interface for this case). `verify_api_usage` on `split_text_to_chunks` and `count_token` returned only generic results (project archived) but nothing contradicting the usage — and the fix introduces no new external API calls (only list slicing and parameter plumbing).
+
+**One caveat (non-blocking):** The newly added pytest `test_split_text_to_chunks_with_overlap` includes `assert all(count_token(chunk) <= 100 ...)`. Because the (pre-existing) chunking budget counts per-line tokens without newline tokens, the raw `count_token` of a joined multi-line chunk can exceed `max_tokens` — this is equally true of the *buggy* code (the 100-line/100-token scenario fails that assertion in both versions), so it is a pre-existing accounting quirk in the test's expectation, not a defect introduced or worsened by this fix. The discriminating overlap assertions in that test (`curr_lines[:overlap] == prev_lines[-overlap:]`) do pass with the fix and fail without it, and the case's operative test (`reproduce.py`) passes.
+
+**Verdict: ACCEPT**
+
+The fix is minimal, correct, and safe: it makes the previously-dead `overlap` parameter actually function with proper infinite-loop protection, threads it consistently through the entire public API chain (`split_text_to_chunks` → `split_files_to_chunks` → `create_vector_db_from_dir` → `RetrieveUserProxyAgent`) with matching documentation, preserves backward compatibility via defaults, passes structural validation, and passes the provided behavioral test (fixed → exit 0, buggy → exit 1) without regressing any existing test.
+--------------------------------------------------------------------------------
+### autogen/retrieve_utils.py
+from typing import List, Union, Callable
+import os
+import requests
+from urllib.parse import urlparse
+import glob
+import chromadb
+
+if chromadb.__version__ < "0.4.15":
+    from chromadb.api import API
+else:
+    from chromadb.api import ClientAPI as API
+from chromadb.api.types import QueryResult
+import chromadb.utils.embedding_functions as ef
+import logging
+import pypdf
+from autogen.token_count_utils import count_token
+
+try:
+    from unstructured.partition.auto import partition
+
+    HAS_UNSTRUCTURED = True
+except ImportError:
+    HAS_UNSTRUCTURED = False
+
+logger = logging.getLogger(__name__)
+TEXT_FORMATS = [
+    "txt",
+    "json",
+    "csv",
+    "tsv",
+    "md",
+    "html",
+    "htm",
+    "rtf",
+    "rst",
+    "jsonl",
+    "log",
+    "xml",
+    "yaml",
+    "yml",
+    "pdf",
+]
+UNSTRUCTURED_FORMATS = [
+    "doc",
+    "docx",
+    "epub",
+    "msg",
+    "odt",
+    "org",
+    "pdf",
+    "ppt",
+    "pptx",
+    "rtf",
+    "rst",
+    "xlsx",
+]  # These formats will be parsed by the 'unstructured' library, if installed.
+if HAS_UNSTRUCTURED:
+    TEXT_FORMATS += UNSTRUCTURED_FORMATS
+    TEXT_FORMATS = list(set(TEXT_FORMATS))
+VALID_CHUNK_MODES = frozenset({"one_line", "multi_lines"})
+
+
+def split_text_to_chunks(
+    text: str,
+    max_tokens: int = 4000,
+    chunk_mode: str = "multi_lines",
+    must_break_at_empty_line: bool = True,
+    overlap: int = 10,
+):
+    """Split a long text into chunks of max_tokens.
+
+    Args:
+        text (str): the text to be split.
+        max_tokens (Optional, int): the maximum number of tokens per chunk. Default is 4000.
+        chunk_mode (Optional, str): the chunk mode. Default is "multi_lines".
+        must_break_at_empty_line (Optional, bool): whether to break at empty line. Default is True.
+        overlap (Optional, int): the number of lines that overlap between two adjacent chunks.
+            Default is 10. The overlapping lines are counted in the token budget of the next chunk,
+            so no chunk will exceed `max_tokens`.
+    """
+    if chunk_mode not in VALID_CHUNK_MODES:
+        raise AssertionError
+    if chunk_mode == "one_line":
+        must_break_at_empty_line = False
+    chunks = []
+    lines = text.split("\n")
+    lines_tokens = [count_token(line) for line in lines]
+    sum_tokens = sum(lines_tokens)
+    while sum_tokens > max_tokens:
+        if chunk_mode == "one_line":
+            estimated_line_cut = 2
+        else:
+            estimated_line_cut = int(max_tokens / sum_tokens * len(lines)) + 1
+        cnt = 0
+        prev = ""
+        for cnt in reversed(range(estimated_line_cut)):
+            if must_break_at_empty_line and lines[cnt].strip() != "":
+                continue
+            if sum(lines_tokens[:cnt]) <= max_tokens:
+                prev = "\n".join(lines[:cnt])
+                break
+        if cnt == 0:
+            logger.warning(
+                f"max_tokens is too small to fit a single line of text. Breaking this line:\n\t{lines[0][:100]} ..."
+            )
+            if not must_break_at_empty_line:
+                split_len = int(max_tokens / lines_tokens[0] * 0.9 * len(lines[0]))
+                prev = lines[0][:split_len]
+                lines[0] = lines[0][split_len:]
+                lines_tokens[0] = count_token(lines[0])
+            else:
+                logger.warning("Failed to split docs with must_break_at_empty_line being True, set to False.")
+                must_break_at_empty_line = False
+        chunks.append(prev) if len(prev) > 10 else None  # don't add chunks less than 10 characters
+        # Keep the last `overlap` lines of the current chunk at the beginning of the next chunk so that
+        # two adjacent chunks share some context. The overlapping lines are part of `lines_tokens`, so the
+        # next chunk still respects `max_tokens`. When `cnt` is not greater than `overlap`, we can't move the
+        # start backwards without re-processing already emitted lines (or making no progress at all), so we
+        # fall back to a plain cut.
+        lines = lines[cnt - overlap :] if cnt > overlap else lines[cnt :]
+        lines_tokens = lines_tokens[cnt - overlap :] if cnt > overlap else lines_tokens[cnt :]
+        sum_tokens = sum(lines_tokens)
+    text_to_chunk = "\n".join(lines)
+    chunks.append(text_to_chunk) if len(text_to_chunk) > 10 else None  # don't add chunks less than 10 characters
+    return chunks
+
+
+def extract_text_from_pdf(file: str) -> str:
+    """Extract text from PDF files"""
+    text = ""
+    with open(file, "rb") as f:
+        reader = pypdf.PdfReader(f)
+        if reader.is_encrypted:  # Check if the PDF is encrypted
+            try:
+                reader.decrypt("")
+            except pypdf.errors.FileNotDecryptedError as e:
+                logger.warning(f"Could not decrypt PDF {file}, {e}")
+                return text  # Return empty text if PDF could not be decrypted
+
+        for page_num in range(len(reader.pages)):
+            page = reader.pages[page_num]
+            text += page.extract_text()
+
+    if not text.strip():  # Debugging line to check if text is empty
+        logger.warning(f"Could not decrypt PDF {file}")
+
+    return text
+
+
+def split_files_to_chunks(
+    files: list,
+    max_tokens: int = 4000,
+    chunk_mode: str = "multi_lines",
+    must_break_at_empty_line: bool = True,
+    overlap: int = 10,
+    custom_text_split_function: Callable = None,
+):
+    """Split a list of files into chunks of max_tokens."""
+
+    chunks = []
+
+    for file in files:
+        _, file_extension = os.path.splitext(file)
+        file_extension = file_extension.lower()
+
+        if HAS_UNSTRUCTURED and file_extension[1:] in UNSTRUCTURED_FORMATS:
+            text = partition(file)
+            text = "\n".join([t.text for t in text]) if len(text) > 0 else ""
+        elif file_extension == ".pdf":
+            text = extract_text_from_pdf(file)
+        else:  # For non-PDF text-based files
+            with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+
+        if not text.strip():  # Debugging line to check if text is empty after reading
+            logger.warning(f"No text available in file: {file}")
+            continue  # Skip to the next file if no text is available
+
+        if custom_text_split_function is not None:
+            chunks += custom_text_split_function(text)
+        else:
+            chunks += split_text_to_chunks(text, max_tokens, chunk_mode, must_break_at_empty_line, overlap)
+
+    return chunks
+
+
+def get_files_from_dir(dir_path: Union[str, List[str]], types: list = TEXT_FORMATS, recursive: bool = True):
+    """Return a list of all the files in a given directory, a url, a file path or a list of them."""
+    if len(types) == 0:
+        raise ValueError("types cannot be empty.")
+    types = [t[1:].lower() if t.startswith(".") else t.lower() for t in set(types)]
+    types += [t.upper() for t in types]
+
+    files = []
+    # If the path is a list of files or urls, process and return them
+    if isinstance(dir_path, list):
+        for item in dir_path:
+            if os.path.isfile(item):
+                files.append(item)
+            elif is_url(item):
+                files.append(get_file_from_url(item))
+            elif os.path.exists(item):
+                try:
+                    files.extend(get_files_from_dir(item, types, recursive))
+                except ValueError:
+                    logger.warning(f"Directory {item} does not exist. Skipping.")
+            else:
+                logger.warning(f"File {item} does not exist. Skipping.")
+        return files
+
+    # If the path is a file, return it
+    if os.path.isfile(dir_path):
+        return [dir_path]
+
+    # If the path is a url, download it and return the downloaded file
+    if is_url(dir_path):
+        return [get_file_from_url(dir_path)]
+
+    if os.path.exists(dir_path):
+        for type in types:
+            if recursive:
+                files += glob.glob(os.path.join(dir_path, f"**/*.{type}"), recursive=True)
+            else:
+                files += glob.glob(os.path.join(dir_path, f"*.{type}"), recursive=False)
+    else:
+        logger.error(f"Directory {dir_path} does not exist.")
+        raise ValueError(f"Directory {dir_path} does not exist.")
+    return files
+
+
+def get_file_from_url(url: str, save_path: str = None):
+    """Download a file from a URL."""
+    if save_path is None:
+        os.makedirs("/tmp/chromadb", exist_ok=True)
+        save_path = os.path.join("/tmp/chromadb", os.path.basename(url))
+    else:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(save_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    return save_path
+
+
+def is_url(string: str):
+    """Return True if the string is a valid URL."""
+    try:
+        result = urlparse(string)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
+
+
+def create_vector_db_from_dir(
+    dir_path: Union[str, List[str]],
+    max_tokens: int = 4000,
+    client: API = None,
+    db_path: str = "/tmp/chromadb.db",
+    collection_name: str = "all-my-documents",
+    get_or_create: bool = False,
+    chunk_mode: str = "multi_lines",
+    must_break_at_empty_line: bool = True,
+    embedding_model: str = "all-MiniLM-L6-v2",
+    embedding_function: Callable = None,
+    custom_text_split_function: Callable = None,
+    custom_text_types: List[str] = TEXT_FORMATS,
+    recursive: bool = True,
+    extra_docs: bool = False,
+    overlap: int = 10,
+) -> API:
+    """Create a vector db from all the files in a given directory, the directory can also be a single file or a url to
+        a single file. We support chromadb compatible APIs to create the vector db, this function is not required if
+        you prepared your own vector db.
+
+    Args:
+        dir_path (Union[str, List[str]]): the path to the directory, file, url or a list of them.
+        max_tokens (Optional, int): the maximum number of tokens per chunk. Default is 4000.
+        client (Optional, API): the chromadb client. Default is None.
+        db_path (Optional, str): the path to the chromadb. Default is "/tmp/chromadb.db".
+        collection_name (Optional, str): the name of the collection. Default is "all-my-documents".
+        get_or_create (Optional, bool): Whether to get or create the collection. Default is False. If True, the collection
+            will be returned if it already exists. Will raise ValueError if the collection already exists and get_or_create is False.
+        chunk_mode (Optional, str): the chunk mode. Default is "multi_lines".
+        must_break_at_empty_line (Optional, bool): Whether to break at empty line. Default is True.
+        overlap (Optional, int): the number of lines that overlap between two adjacent chunks. Default is 10.
+        embedding_model (Optional, str): the embedding model to use. Default is "all-MiniLM-L6-v2". Will be ignored if
+            embedding_function is not None.
+        embedding_function (Optional, Callable): the embedding function to use. Default is None, SentenceTransformer with
+            the given `embedding_model` will be used. If you want to use OpenAI, Cohere, HuggingFace or other embedding
+            functions, you can pass it here, follow the examples in `https://docs.trychroma.com/embeddings`.
+        custom_text_split_function (Optional, Callable): a custom function to split a string into a list of strings.
+            Default is None, will use the default function in `autogen.retrieve_utils.split_text_to_chunks`.
+        custom_text_types (Optional, List[str]): a list of file types to be processed. Default is TEXT_FORMATS.
+        recursive (Optional, bool): whether to search documents recursively in the dir_path. Default is True.
+        extra_docs (Optional, bool): whether to add more documents in the collection. Default is False
+
+    Returns:
+
+    The chromadb client.
+    """
+    if client is None:
+        client = chromadb.PersistentClient(path=db_path)
+    try:
+        embedding_function = (
+            ef.SentenceTransformerEmbeddingFunction(embedding_model)
+            if embedding_function is None
+            else embedding_function
+        )
+        collection = client.create_collection(
+            collection_name,
+            get_or_create=get_or_create,
+            embedding_function=embedding_function,
+            # https://github.com/nmslib/hnswlib#supported-distances
+            # https://github.com/chroma-core/chroma/blob/566bc80f6c8ee29f7d99b6322654f32183c368c4/chromadb/segment/impl/vector/local_hnsw.py#L184
+            # https://github.com/nmslib/hnswlib/blob/master/ALGO_PARAMS.md
+            metadata={"hnsw:space": "ip", "hnsw:construction_ef": 30, "hnsw:M": 32},  # ip, l2, cosine
+        )
+
+        length = 0
+        if extra_docs:
+            length = len(collection.get()["ids"])
+
+        if custom_text_split_function is not None:
+            chunks = split_files_to_chunks(
+                get_files_from_dir(dir_path, custom_text_types, recursive),
+                custom_text_split_function=custom_text_split_function,
+            )
+        else:
+            chunks = split_files_to_chunks(
+                get_files_from_dir(dir_path, custom_text_types, recursive),
+                max_tokens,
+                chunk_mode,
+                must_break_at_empty_line,
+                overlap,
+            )
+        logger.info(f"Found {len(chunks)} chunks.")
+        # Upsert in batch of 40000 or less if the total number of chunks is less than 40000
+        for i in range(0, len(chunks), min(40000, len(chunks))):
+            end_idx = i + min(40000, len(chunks) - i)
+            collection.upsert(
+                documents=chunks[i:end_idx],
+                ids=[f"doc_{j+length}" for j in range(i, end_idx)],  # unique for each doc
+            )
+    except ValueError as e:
+        logger.warning(f"{e}")
+    return client
+
+
+def query_vector_db(
+    query_texts: List[str],
+    n_results: int = 10,
+    client: API = None,
+    db_path: str = "/tmp/chromadb.db",
+    collection_name: str = "all-my-documents",
+    search_string: str = "",
+    embedding_model: str = "all-MiniLM-L6-v2",
+    embedding_function: Callable = None,
+) -> QueryResult:
+    """Query a vector db. We support chromadb compatible APIs, it's not required if you prepared your own vector db
+        and query function.
+
+    Args:
+        query_texts (List[str]): the list of strings which will be used to query the vector db.
+        n_results (Optional, int): the number of results to return. Default is 10.
+        client (Optional, API): the chromadb compatible client. Default is None, a chromadb client will be used.
+        db_path (Optional, str): the path to the vector db. Default is "/tmp/chromadb.db".
+        collection_name (Optional, str): the name of the collection. Default is "all-my-documents".
+        search_string (Optional, str): the search string. Only docs that contain an exact match of this string will be retrieved. Default is "".
+        embedding_model (Optional, str): the embedding model to use. Default is "all-MiniLM-L6-v2". Will be ignored if
+            embedding_function is not None.
+        embedding_function (Optional, Callable): the embedding function to use. Default is None, SentenceTransformer with
+            the given `embedding_model` will be used. If you want to use OpenAI, Cohere, HuggingFace or other embedding
+            functions, you can pass it here, follow the examples in `https://docs.trychroma.com/embeddings`.
+
+    Returns:
+
+        The query result. The format is:
+
+    ```python
+    class QueryResult(TypedDict):
+        ids: List[IDs]
+        embeddings: Optional[List[List[Embedding]]]
+        documents: Optional[List[List[Document]]]
+        metadatas: Optional[List[List[Metadata]]]
+        distances: Optional[List[List[float]]]
+    ```
+    """
+    if client is None:
+        client = chromadb.PersistentClient(path=db_path)
+    # the collection's embedding function is always the default one, but we want to use the one we used to create the
+    # collection. So we compute the embeddings ourselves and pass it to the query function.
+    collection = client.get_collection(collection_name)
+    embedding_function = (
+        ef.SentenceTransformerEmbeddingFunction(embedding_model) if embedding_function is None else embedding_function
+    )
+    query_embeddings = embedding_function(query_texts)
+    # Query/search n most similar results. You can also .get by id
+    results = collection.query(
+        query_embeddings=query_embeddings,
+        n_results=n_results,
+        where_document={"$contains": search_string} if search_string else None,  # optional filter
+    )
+    return results
+
+
+### test/test_retrieve_utils.py
+#!/usr/bin/env python3 -m pytest
+
+"""
+Unit test for retrieve_utils.py
+"""
+import pytest
+
+try:
+    import chromadb
+    from autogen.retrieve_utils import (
+        split_text_to_chunks,
+        extract_text_from_pdf,
+        split_files_to_chunks,
+        get_files_from_dir,
+        is_url,
+        create_vector_db_from_dir,
+        query_vector_db,
+    )
+    from autogen.token_count_utils import count_token
+except ImportError:
+    skip = True
+else:
+    skip = False
+import os
+
+try:
+    from unstructured.partition.auto import partition
+
+    HAS_UNSTRUCTURED = True
+except ImportError:
+    HAS_UNSTRUCTURED = False
+
+test_dir = os.path.join(os.path.dirname(__file__), "test_files")
+expected_text = """AutoGen is an advanced tool designed to assist developers in harnessing the capabilities
+of Large Language Models (LLMs) for various applications. The primary purpose of AutoGen is to automate and
+simplify the process of building applications that leverage the power of LLMs, allowing for seamless
+integration, testing, and deployment."""
+
+
+@pytest.mark.skipif(skip, reason="dependency is not installed")
+class TestRetrieveUtils:
+    def test_split_text_to_chunks(self):
+        long_text = "A" * 10000
+        chunks = split_text_to_chunks(long_text, max_tokens=1000)
+        assert all(count_token(chunk) <= 1000 for chunk in chunks)
+
+    def test_split_text_to_chunks_raises_on_invalid_chunk_mode(self):
+        with pytest.raises(AssertionError):
+            split_text_to_chunks("A" * 10000, chunk_mode="bogus_chunk_mode")
+
+    def test_split_text_to_chunks_with_overlap(self):
+        # `overlap` should be used by the chunking logic: the last `overlap` lines of a chunk
+        # must be repeated at the beginning of the next chunk.
+        long_text = "\n".join([f"line {i}" for i in range(100)])
+        overlap = 5
+        chunks = split_text_to_chunks(
+            long_text,
+            max_tokens=100,
+            chunk_mode="multi_lines",
+            must_break_at_empty_line=False,
+            overlap=overlap,
+        )
+        assert len(chunks) > 1
+        # each chunk still respects the token limit (the overlapping lines are counted in)
+        assert all(count_token(chunk) <= 100 for chunk in chunks)
+        for i in range(1, len(chunks)):
+            prev_lines = chunks[i - 1].split("\n")
+            curr_lines = chunks[i].split("\n")
+            assert curr_lines[:overlap] == prev_lines[-overlap:]
+
+        # with overlap = 0 the chunks must not share any line
+        chunks_no_overlap = split_text_to_chunks(
+            long_text,
+            max_tokens=100,
+            chunk_mode="multi_lines",
+            must_break_at_empty_line=False,
+            overlap=0,
+        )
+        assert len(chunks_no_overlap) > 1
+        assert len(chunks) >= len(chunks_no_overlap)
+        for i in range(1, len(chunks_no_overlap)):
+            prev_lines = chunks_no_overlap[i - 1].split("\n")
+            curr_lines = chunks_no_overlap[i].split("\n")
+            assert curr_lines[0] != prev_lines[-1]
+
+    def test_extract_text_from_pdf(self):
+        pdf_file_path = os.path.join(test_dir, "example.pdf")
+        assert "".join(expected_text.split()) == "".join(extract_text_from_pdf(pdf_file_path).strip().split())
+
+    def test_split_files_to_chunks(self):
+        pdf_file_path = os.path.join(test_dir, "example.pdf")
+        txt_file_path = os.path.join(test_dir, "example.txt")
+        chunks = split_files_to_chunks([pdf_file_path, txt_file_path])
+        assert all(
+            isinstance(chunk, str) and "AutoGen is an advanced tool designed to assist developers" in chunk.strip()
+            for chunk in chunks
+        )
+
+    def test_get_files_from_dir(self):
+        files = get_files_from_dir(test_dir, recursive=False)
+        assert all(os.path.isfile(file) for file in files)
+        pdf_file_path = os.path.join(test_dir, "example.pdf")
+        txt_file_path = os.path.join(test_dir, "example.txt")
+        files = get_files_from_dir([pdf_file_path, txt_file_path])
+        assert all(os.path.isfile(file) for file in files)
+        files = get_files_from_dir(
+            [
+                pdf_file_path,
+                txt_file_path,
+                os.path.join(test_dir, "..", "..", "website/docs"),
+                "https://raw.githubusercontent.com/microsoft/autogen/main/README.md",
+            ],
+            recursive=True,
+        )
+        assert all(os.path.isfile(file) for file in files)
+        files = get_files_from_dir(
+            [
+                pdf_file_path,
+                txt_file_path,
+                os.path.join(test_dir, "..", "..", "website/docs"),
+                "https://raw.githubusercontent.com/microsoft/autogen/main/README.md",
+            ],
+            recursive=True,
+            types=["pdf", "txt"],
+        )
+        assert all(os.path.isfile(file) for file in files)
+        assert len(files) == 3
+
+    def test_is_url(self):
+        assert is_url("https://www.example.com")
+        assert not is_url("not_a_url")
+
+    def test_create_vector_db_from_dir(self):
+        db_path = "/tmp/test_retrieve_utils_chromadb.db"
+        if os.path.exists(db_path):
+            client = chromadb.PersistentClient(path=db_path)
+        else:
+            client = chromadb.PersistentClient(path=db_path)
+            create_vector_db_from_dir(test_dir, client=client)
+
+        assert client.get_collection("all-my-documents")
+
+    def test_query_vector_db(self):
+        db_path = "/tmp/test_retrieve_utils_chromadb.db"
+        if os.path.exists(db_path):
+            client = chromadb.PersistentClient(path=db_path)
+        else:  # If the database does not exist, create it first
+            client = chromadb.PersistentClient(path=db_path)
+            create_vector_db_from_dir(test_dir, client=client)
+
+        results = query_vector_db(["autogen"], client=client)
+        assert isinstance(results, dict) and any("autogen" in res[0].lower() for res in results.get("documents", []))
+
+    def test_custom_vector_db(self):
+        try:
+            import lancedb
+        except ImportError:
+            return
+        from autogen.agentchat.contrib.retrieve_user_proxy_agent import RetrieveUserProxyAgent
+
+        db_path = "/tmp/lancedb"
+
+        def create_lancedb():
+            db = lancedb.connect(db_path)
+            data = [
+                {"vector": [1.1, 1.2], "id": 1, "documents": "This is a test document spark"},
+                {"vector": [0.2, 1.8], "id": 2, "documents": "This is another test document"},
+                {"vector": [0.1, 0.3], "id": 3, "documents": "This is a third test document spark"},
+                {"vector": [0.5, 0.7], "id": 4, "documents": "This is a fourth test document"},
+                {"vector": [2.1, 1.3], "id": 5, "documents": "This is a fifth test document spark"},
+                {"vector": [5.1, 8.3], "id": 6, "documents": "This is a sixth test document"},
+            ]
+            try:
+                db.create_table("my_table", data)
+            except OSError:
+                pass
+
+        class MyRetrieveUserProxyAgent(RetrieveUserProxyAgent):
+            def query_vector_db(
+                self,
+                query_texts,
+                n_results=10,
+                search_string="",
+            ):
+                if query_texts:
+                    vector = [0.1, 0.3]
+                db = lancedb.connect(db_path)
+                table = db.open_table("my_table")
+                query = table.search(vector).where(f"documents LIKE '%{search_string}%'").limit(n_results).to_df()
+                return {"ids": [query["id"].tolist()], "documents": [query["documents"].tolist()]}
+
+            def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = ""):
+                results = self.query_vector_db(
+                    query_texts=[problem],
+                    n_results=n_results,
+                    search_string=search_string,
+                )
+
+                self._results = results
+                print("doc_ids: ", results["ids"])
+
+        ragragproxyagent = MyRetrieveUserProxyAgent(
+            name="ragproxyagent",
+            human_input_mode="NEVER",
+            max_consecutive_auto_reply=2,
+            retrieve_config={
+                "task": "qa",
+                "chunk_token_size": 2000,
+                "client": "__",
+                "embedding_model": "all-mpnet-base-v2",
+            },
+        )
+
+        create_lancedb()
+        ragragproxyagent.retrieve_docs("This is a test document spark", n_results=10, search_string="spark")
+        assert ragragproxyagent._results["ids"] == [[3, 1, 5]]
+
+    def test_custom_text_split_function(self):
+        def custom_text_split_function(text):
+            return [text[: len(text) // 2], text[len(text) // 2 :]]
+
+        db_path = "/tmp/test_retrieve_utils_chromadb.db"
+        client = chromadb.PersistentClient(path=db_path)
+        create_vector_db_from_dir(
+            os.path.join(test_dir, "example.txt"),
+            client=client,
+            collection_name="mytestcollection",
+            custom_text_split_function=custom_text_split_function,
+            get_or_create=True,
+            recursive=False,
+        )
+        results = query_vector_db(["autogen"], client=client, collection_name="mytestcollection", n_results=1)
+        assert (
+            "AutoGen is an advanced tool designed to assist developers in harnessing the capabilities"
+            in results.get("documents")[0][0]
+        )
+
+    def test_retrieve_utils(self):
+        client = chromadb.PersistentClient(path="/tmp/chromadb")
+        create_vector_db_from_dir(
+            dir_path="./website/docs",
+            client=client,
+            collection_name="autogen-docs",
+            custom_text_types=["txt", "md", "rtf", "rst"],
+            get_or_create=True,
+        )
+        results = query_vector_db(
+            query_texts=[
+                "How can I use AutoGen UserProxyAgent and AssistantAgent to do code generation?",
+            ],
+            n_results=4,
+            client=client,
+            collection_name="autogen-docs",
+            search_string="AutoGen",
+        )
+        print(results["ids"][0])
+        assert len(results["ids"][0]) == 4
+
+    @pytest.mark.skipif(
+        not HAS_UNSTRUCTURED,
+        reason="do not run if unstructured is not installed",
+    )
+    def test_unstructured(self):
+        pdf_file_path = os.path.join(test_dir, "example.pdf")
+        txt_file_path = os.path.join(test_dir, "example.txt")
+        word_file_path = os.path.join(test_dir, "example.docx")
+        chunks = split_files_to_chunks([pdf_file_path, txt_file_path, word_file_path])
+        assert all(
+            isinstance(chunk, str) and "AutoGen is an advanced tool designed to assist developers" in chunk.strip()
+            for chunk in chunks
+        )
+
+
+if __name__ == "__main__":
+    pytest.main()
+
+    db_path = "/tmp/test_retrieve_utils_chromadb.db"
+    if os.path.exists(db_path):
+        os.remove(db_path)  # Delete the database file after tests are finished
+
+
+### autogen/agentchat/contrib/retrieve_user_proxy_agent.py
+import re
+from typing import Callable, Dict, Optional, Union, List, Tuple, Any
+from IPython import get_ipython
+
+try:
+    import chromadb
+except ImportError:
+    raise ImportError("Please install dependencies first. `pip install pyautogen[retrievechat]`")
+from autogen.agentchat.agent import Agent
+from autogen.agentchat import UserProxyAgent
+from autogen.retrieve_utils import create_vector_db_from_dir, query_vector_db, TEXT_FORMATS
+from autogen.token_count_utils import count_token
+from autogen.code_utils import extract_code
+from autogen import logger
+from ...formatting_utils import colored
+
+
+PROMPT_DEFAULT = """You're a retrieve augmented chatbot. You answer user's questions based on your own knowledge and the
+context provided by the user. You should follow the following steps to answer a question:
+Step 1, you estimate the user's intent based on the question and context. The intent can be a code generation task or
+a question answering task.
+Step 2, you reply based on the intent.
+If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+If user's intent is code generation, you must obey the following rules:
+Rule 1. You MUST NOT install any packages because all the packages needed are already installed.
+Rule 2. You must follow the formats below to write your code:
+```language
+# your code
+```
+
+If user's intent is question answering, you must give as short an answer as possible.
+
+User's question is: {input_question}
+
+Context is: {input_context}
+"""
+
+PROMPT_CODE = """You're a retrieve augmented coding assistant. You answer user's questions based on your own knowledge and the
+context provided by the user.
+If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+For code generation, you must obey the following rules:
+Rule 1. You MUST NOT install any packages because all the packages needed are already installed.
+Rule 2. You must follow the formats below to write your code:
+```language
+# your code
+```
+
+User's question is: {input_question}
+
+Context is: {input_context}
+"""
+
+PROMPT_QA = """You're a retrieve augmented chatbot. You answer user's questions based on your own knowledge and the
+context provided by the user.
+If you can't answer the question with or without the current context, you should reply exactly `UPDATE CONTEXT`.
+You must give as short an answer as possible.
+
+User's question is: {input_question}
+
+Context is: {input_context}
+"""
+
+
+class RetrieveUserProxyAgent(UserProxyAgent):
+    """(In preview) The Retrieval-Augmented User Proxy retrieves document chunks based on the embedding
+    similarity, and sends them along with the question to the Retrieval-Augmented Assistant
+    """
+
+    def __init__(
+        self,
+        name="RetrieveChatAgent",  # default set to RetrieveChatAgent
+        human_input_mode: Optional[str] = "ALWAYS",
+        is_termination_msg: Optional[Callable[[Dict], bool]] = None,
+        retrieve_config: Optional[Dict] = None,  # config for the retrieve agent
+        **kwargs,
+    ):
+        r"""
+        Args:
+            name (str): name of the agent.
+
+            human_input_mode (str): whether to ask for human inputs every time a message is received.
+                Possible values are "ALWAYS", "TERMINATE", "NEVER".
+                1. When "ALWAYS", the agent prompts for human input every time a message is received.
+                    Under this mode, the conversation stops when the human input is "exit",
+                    or when is_termination_msg is True and there is no human input.
+                2. When "TERMINATE", the agent only prompts for human input only when a termination
+                    message is received or the number of auto reply reaches
+                    the max_consecutive_auto_reply.
+                3. When "NEVER", the agent will never prompt for human input. Under this mode, the
+                    conversation stops when the number of auto reply reaches the
+                    max_consecutive_auto_reply or when is_termination_msg is True.
+
+            is_termination_msg (function): a function that takes a message in the form of a dictionary
+                and returns a boolean value indicating if this received message is a termination message.
+                The dict can contain the following keys: "content", "role", "name", "function_call".
+
+            retrieve_config (dict or None): config for the retrieve agent.
+
+                To use default config, set to None. Otherwise, set to a dictionary with the
+                following keys:
+                - `task` (Optional, str) - the task of the retrieve chat. Possible values are
+                    "code", "qa" and "default". System prompt will be different for different tasks.
+                     The default value is `default`, which supports both code and qa.
+                - `client` (Optional, chromadb.Client) - the chromadb client. If key not provided, a
+                     default client `chromadb.Client()` will be used. If you want to use other
+                     vector db, extend this class and override the `retrieve_docs` function.
+                - `docs_path` (Optional, Union[str, List[str]]) - the path to the docs directory. It
+                     can also be the path to a single file, the url to a single file or a list
+                     of directories, files and urls. Default is None, which works only if the
+                     collection is already created.
+                - `extra_docs` (Optional, bool) - when true, allows adding documents with unique IDs
+                    without overwriting existing ones; when false, it replaces existing documents
+                    using default IDs, risking collection overwrite., when set to true it enables
+                    the system to assign unique IDs starting from "length+i" for new document
+                    chunks, preventing the replacement of existing documents and facilitating
+                    the addition of more content to the collection..
+                    By default, "extra_docs" is set to false, starting document IDs from zero.
+                    This poses a risk as new documents might overwrite existing ones, potentially
+                    causing unintended loss or alteration of data in the collection.
+                - `collection_name` (Optional, str) - the name of the collection.
+                    If key not provided, a default name `autogen-docs` will be used.
+                - `model` (Optional, str) - the model to use for the retrieve chat.
+                    If key not provided, a default model `gpt-4` will be used.
+                - `chunk_token_size` (Optional, int) - the chunk token size for the retrieve chat.
+                    If key not provided, a default size `max_tokens * 0.4` will be used.
+                - `context_max_tokens` (Optional, int) - the context max token size for the
+                    retrieve chat.
+                    If key not provided, a default size `max_tokens * 0.8` will be used.
+                - `chunk_mode` (Optional, str) - the chunk mode for the retrieve chat. Possible values
+                    are "multi_lines" and "one_line". If key not provided, a default mode
+                    `multi_lines` will be used.
+                - `must_break_at_empty_line` (Optional, bool) - chunk will only break at empty line
+                    if True. Default is True.
+                    If chunk_mode is "one_line", this parameter will be ignored.
+                - `overlap` (Optional, int) - the number of lines that overlap between two adjacent
+                    chunks. Default is 10. The overlapping lines are counted in the token budget of
+                    the next chunk, so no chunk will exceed `chunk_token_size`.
+                - `embedding_model` (Optional, str) - the embedding model to use for the retrieve chat.
+                    If key not provided, a default model `all-MiniLM-L6-v2` will be used. All available
+                    models can be found at `https://www.sbert.net/docs/pretrained_models.html`.
+                    The default model is a fast model. If you want to use a high performance model,
+                    `all-mpnet-base-v2` is recommended.
+                - `embedding_function` (Optional, Callable) - the embedding function for creating the
+                    vector db. Default is None, SentenceTransformer with the given `embedding_model`
+                    will be used. If you want to use OpenAI, Cohere, HuggingFace or other embedding
+                    functions, you can pass it here,
+                    follow the examples in `https://docs.trychroma.com/embeddings`.
+                - `customized_prompt` (Optional, str) - the customized prompt for the retrieve chat.
+                    Default is None.
+                - `customized_answer_prefix` (Optional, str) - the customized answer prefix for the
+                    retrieve chat. Default is "".
+                    If not "" and the customized_answer_prefix is not in the answer,
+                    `Update Context` will be triggered.
+                - `update_context` (Optional, bool) - if False, will not apply `Update Context` for
+                    interactive retrieval. Default is True.
+                - `get_or_create` (Optional, bool) - if True, will create/return a collection for the
+                    retrieve chat. This is the same as that used in chromadb.
+                    Default is False. Will raise ValueError if the collection already exists and
+                    get_or_create is False. Will be set to True if docs_path is None.
+                - `custom_token_count_function` (Optional, Callable) - a custom function to count the
+                    number of tokens in a string.
+                    The function should take (text:str, model:str) as input and return the
+                    token_count(int). the retrieve_config["model"] will be passed in the function.
+                    Default is autogen.token_count_utils.count_token that uses tiktoken, which may
+                    not be accurate for non-OpenAI models.
+                - `custom_text_split_function` (Optional, Callable) - a custom function to split a
+                    string into a list of strings.
+                    Default is None, will use the default function in
+                    `autogen.retrieve_utils.split_text_to_chunks`.
+                - `custom_text_types` (Optional, List[str]) - a list of file types to be processed.
+                    Default is `autogen.retrieve_utils.TEXT_FORMATS`.
+                    This only applies to files under the directories in `docs_path`. Explicitly
+                    included files and urls will be chunked regardless of their types.
+                - `recursive` (Optional, bool) - whether to search documents recursively in the
+                    docs_path. Default is True.
+
+            `**kwargs` (dict): other kwargs in [UserProxyAgent](../user_proxy_agent#__init__).
+
+        Example:
+
+        Example of overriding retrieve_docs - If you have set up a customized vector db, and it's
+        not compatible with chromadb, you can easily plug in it with below code.
+        ```python
+        class MyRetrieveUserProxyAgent(RetrieveUserProxyAgent):
+            def query_vector_db(
+                self,
+                query_texts: List[str],
+                n_results: int = 10,
+                search_string: str = "",
+                **kwargs,
+            ) -> Dict[str, Union[List[str], List[List[str]]]]:
+                # define your own query function here
+                pass
+
+            def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = "", **kwargs):
+                results = self.query_vector_db(
+                    query_texts=[problem],
+                    n_results=n_results,
+                    search_string=search_string,
+                    **kwargs,
+                )
+
+                self._results = results
+                print("doc_ids: ", results["ids"])
+        ```
+        """
+        super().__init__(
+            name=name,
+            human_input_mode=human_input_mode,
+            **kwargs,
+        )
+
+        self._retrieve_config = {} if retrieve_config is None else retrieve_config
+        self._task = self._retrieve_config.get("task", "default")
+        self._client = self._retrieve_config.get("client", chromadb.Client())
+        self._docs_path = self._retrieve_config.get("docs_path", None)
+        self._extra_docs = self._retrieve_config.get("extra_docs", False)
+        self._collection_name = self._retrieve_config.get("collection_name", "autogen-docs")
+        if "docs_path" not in self._retrieve_config:
+            logger.warning(
+                "docs_path is not provided in retrieve_config. "
+                f"Will raise ValueError if the collection `{self._collection_name}` doesn't exist. "
+                "Set docs_path to None to suppress this warning."
+            )
+        self._model = self._retrieve_config.get("model", "gpt-4")
+        self._max_tokens = self.get_max_tokens(self._model)
+        self._chunk_token_size = int(self._retrieve_config.get("chunk_token_size", self._max_tokens * 0.4))
+        self._chunk_mode = self._retrieve_config.get("chunk_mode", "multi_lines")
+        self._must_break_at_empty_line = self._retrieve_config.get("must_break_at_empty_line", True)
+        self._overlap = self._retrieve_config.get("overlap", 10)
+        self._embedding_model = self._retrieve_config.get("embedding_model", "all-MiniLM-L6-v2")
+        self._embedding_function = self._retrieve_config.get("embedding_function", None)
+        self.customized_prompt = self._retrieve_config.get("customized_prompt", None)
+        self.customized_answer_prefix = self._retrieve_config.get("customized_answer_prefix", "").upper()
+        self.update_context = self._retrieve_config.get("update_context", True)
+        self._get_or_create = self._retrieve_config.get("get_or_create", False) if self._docs_path is not None else True
+        self.custom_token_count_function = self._retrieve_config.get("custom_token_count_function", count_token)
+        self.custom_text_split_function = self._retrieve_config.get("custom_text_split_function", None)
+        self._custom_text_types = self._retrieve_config.get("custom_text_types", TEXT_FORMATS)
+        self._recursive = self._retrieve_config.get("recursive", True)
+        self._context_max_tokens = self._retrieve_config.get("context_max_tokens", self._max_tokens * 0.8)
+        self._collection = True if self._docs_path is None else False  # whether the collection is created
+        self._ipython = get_ipython()
+        self._doc_idx = -1  # the index of the current used doc
+        self._results = {}  # the results of the current query
+        self._intermediate_answers = set()  # the intermediate answers
+        self._doc_contents = []  # the contents of the current used doc
+        self._doc_ids = []  # the ids of the current used doc
+        self._search_string = ""  # the search string used in the current query
+        # update the termination message function
+        self._is_termination_msg = (
+            self._is_termination_msg_retrievechat if is_termination_msg is None else is_termination_msg
+        )
+        self.register_reply(Agent, RetrieveUserProxyAgent._generate_retrieve_user_reply, position=2)
+
+    def _is_termination_msg_retrievechat(self, message):
+        """Check if a message is a termination message.
+        For code generation, terminate when no code block is detected. Currently only detect python code blocks.
+        For question answering, terminate when don't update context, i.e., answer is given.
+        """
+        if isinstance(message, dict):
+            message = message.get("content")
+            if message is None:
+                return False
+        cb = extract_code(message)
+        contain_code = False
+        for c in cb:
+            # todo: support more languages
+            if c[0] == "python":
+                contain_code = True
+                break
+        update_context_case1, update_context_case2 = self._check_update_context(message)
+        return not (contain_code or update_context_case1 or update_context_case2)
+
+    @staticmethod
+    def get_max_tokens(model="gpt-3.5-turbo"):
+        if "32k" in model:
+            return 32000
+        elif "16k" in model:
+            return 16000
+        elif "gpt-4" in model:
+            return 8000
+        else:
+            return 4000
+
+    def _reset(self, intermediate=False):
+        self._doc_idx = -1  # the index of the current used doc
+        self._results = {}  # the results of the current query
+        if not intermediate:
+            self._intermediate_answers = set()  # the intermediate answers
+            self._doc_contents = []  # the contents of the current used doc
+            self._doc_ids = []  # the ids of the current used doc
+
+    def _get_context(self, results: Dict[str, Union[List[str], List[List[str]]]]):
+        doc_contents = ""
+        current_tokens = 0
+        _doc_idx = self._doc_idx
+        _tmp_retrieve_count = 0
+        for idx, doc in enumerate(results["documents"][0]):
+            if idx <= _doc_idx:
+                continue
+            if results["ids"][0][idx] in self._doc_ids:
+                continue
+            _doc_tokens = self.custom_token_count_function(doc, self._model)
+            if _doc_tokens > self._context_max_tokens:
+                func_print = f"Skip doc_id {results['ids'][0][idx]} as it is too long to fit in the context."
+                print(colored(func_print, "green"), flush=True)
+                self._doc_idx = idx
+                continue
+            if current_tokens + _doc_tokens > self._context_max_tokens:
+                break
+            func_print = f"Adding doc_id {results['ids'][0][idx]} to context."
+            print(colored(func_print, "green"), flush=True)
+            current_tokens += _doc_tokens
+            doc_contents += doc + "\n"
+            self._doc_idx = idx
+            self._doc_ids.append(results["ids"][0][idx])
+            self._doc_contents.append(doc)
+            _tmp_retrieve_count += 1
+            if _tmp_retrieve_count >= self.n_results:
+                break
+        return doc_contents
+
+    def _generate_message(self, doc_contents, task="default"):
+        if not doc_contents:
+            print(colored("No more context, will terminate.", "green"), flush=True)
+            return "TERMINATE"
+        if self.customized_prompt:
+            message = self.customized_prompt.format(input_question=self.problem, input_context=doc_contents)
+        elif task.upper() == "CODE":
+            message = PROMPT_CODE.format(input_question=self.problem, input_context=doc_contents)
+        elif task.upper() == "QA":
+            message = PROMPT_QA.format(input_question=self.problem, input_context=doc_contents)
+        elif task.upper() == "DEFAULT":
+            message = PROMPT_DEFAULT.format(input_question=self.problem, input_context=doc_contents)
+        else:
+            raise NotImplementedError(f"task {task} is not implemented.")
+        return message
+
+    def _check_update_context(self, message):
+        if isinstance(message, dict):
+            message = message.get("content", "")
+        elif not isinstance(message, str):
+            message = ""
+        update_context_case1 = "UPDATE CONTEXT" in message[-20:].upper() or "UPDATE CONTEXT" in message[:20].upper()
+        update_context_case2 = self.customized_answer_prefix and self.customized_answer_prefix not in message.upper()
+        return update_context_case1, update_context_case2
+
+    def _generate_retrieve_user_reply(
+        self,
+        messages: Optional[List[Dict]] = None,
+        sender: Optional[Agent] = None,
+        config: Optional[Any] = None,
+    ) -> Tuple[bool, Union[str, Dict, None]]:
+        """In this function, we will update the context and reset the conversation based on different conditions.
+        We'll update the context and reset the conversation if update_context is True and either of the following:
+        (1) the last message contains "UPDATE CONTEXT",
+        (2) the last message doesn't contain "UPDATE CONTEXT" and the customized_answer_prefix is not in the message.
+        """
+        if config is None:
+            config = self
+        if messages is None:
+            messages = self._oai_messages[sender]
+        message = messages[-1]
+        update_context_case1, update_context_case2 = self._check_update_context(message)
+        if (update_context_case1 or update_context_case2) and self.update_context:
+            print(colored("Updating context and resetting conversation.", "green"), flush=True)
+            # extract the first sentence in the response as the intermediate answer
+            _message = message.get("content", "").split("\n")[0].strip()
+            _intermediate_info = re.split(r"(?<=[.!?])\s+", _message)
+            self._intermediate_answers.add(_intermediate_info[0])
+
+            if update_context_case1:
+                # try to get more context from the current retrieved doc results because the results may be too long to fit
+                # in the LLM context.
+                doc_contents = self._get_context(self._results)
+
+                # Always use self.problem as the query text to retrieve docs, but each time we replace the context with the
+                # next similar docs in the retrieved doc results.
+                if not doc_contents:
+                    for _tmp_retrieve_count in range(1, 5):
+                        self._reset(intermediate=True)
+                        self.retrieve_docs(
+                            self.problem, self.n_results * (2 * _tmp_retrieve_count + 1), self._search_string
+                        )
+                        doc_contents = self._get_context(self._results)
+                        if doc_contents:
+                            break
+            elif update_context_case2:
+                # Use the current intermediate info as the query text to retrieve docs, and each time we append the top similar
+                # docs in the retrieved doc results to the context.
+                for _tmp_retrieve_count in range(5):
+                    self._reset(intermediate=True)
+                    self.retrieve_docs(
+                        _intermediate_info[0], self.n_results * (2 * _tmp_retrieve_count + 1), self._search_string
+                    )
+                    self._get_context(self._results)
+                    doc_contents = "\n".join(self._doc_contents)  # + "\n" + "\n".join(self._intermediate_answers)
+                    if doc_contents:
+                        break
+
+            self.clear_history()
+            sender.clear_history()
+            return True, self._generate_message(doc_contents, task=self._task)
+        else:
+            return False, None
+
+    def retrieve_docs(self, problem: str, n_results: int = 20, search_string: str = ""):
+        """Retrieve docs based on the given problem and assign the results to the class property `_results`.
+        In case you want to customize the retrieval process, such as using a different vector db whose APIs are not
+        compatible with chromadb or filter results with metadata, you can override this function. Just keep the current
+        parameters and add your own parameters with default values, and keep the results in below type.
+
+        Type of the results: Dict[str, List[List[Any]]], should have keys "ids" and "documents", "ids" for the ids of
+        the retrieved docs and "documents" for the contents of the retrieved docs. Any other keys are optional. Refer
+        to `chromadb.api.types.QueryResult` as an example.
+            ids: List[string]
+            documents: List[List[string]]
+
+        Args:
+            problem (str): the problem to be solved.
+            n_results (int): the number of results to be retrieved. Default is 20.
+            search_string (str): only docs that contain an exact match of this string will be retrieved. Default is "".
+        """
+        if not self._collection or not self._get_or_create:
+            print("Trying to create collection.")
+            self._client = create_vector_db_from_dir(
+                dir_path=self._docs_path,
+                max_tokens=self._chunk_token_size,
+                client=self._client,
+                collection_name=self._collection_name,
+                chunk_mode=self._chunk_mode,
+                must_break_at_empty_line=self._must_break_at_empty_line,
+                embedding_model=self._embedding_model,
+                get_or_create=self._get_or_create,
+                embedding_function=self._embedding_function,
+                custom_text_split_function=self.custom_text_split_function,
+                custom_text_types=self._custom_text_types,
+                recursive=self._recursive,
+                extra_docs=self._extra_docs,
+                overlap=self._overlap,
+            )
+            self._collection = True
+            self._get_or_create = True
+
+        results = query_vector_db(
+            query_texts=[problem],
+            n_results=n_results,
+            search_string=search_string,
+            client=self._client,
+            collection_name=self._collection_name,
+            embedding_model=self._embedding_model,
+            embedding_function=self._embedding_function,
+        )
+        self._search_string = search_string
+        self._results = results
+        print("doc_ids: ", results["ids"])
+
+    @staticmethod
+    def message_generator(sender, recipient, context):
+        """
+        Generate an initial message with the given context for the RetrieveUserProxyAgent.
+        Args:
+            sender (Agent): the sender agent. It should be the instance of RetrieveUserProxyAgent.
+            recipient (Agent): the recipient agent. Usually it's the assistant agent.
+            context (dict): the context for the message generation. It should contain the following keys:
+                - `problem` (str) - the problem to be solved.
+                - `n_results` (int) - the number of results to be retrieved. Default is 20.
+                - `search_string` (str) - only docs that contain an exact match of this string will be retrieved. Default is "".
+        Returns:
+            str: the generated message ready to be sent to the recipient agent.
+        """
+        sender._reset()
+
+        problem = context.get("problem", "")
+        n_results = context.get("n_results", 20)
+        search_string = context.get("search_string", "")
+
+        sender.retrieve_docs(problem, n_results, search_string)
+        sender.problem = problem
+        sender.n_results = n_results
+        doc_contents = sender._get_context(sender._results)
+        message = sender._generate_message(doc_contents, sender._task)
+        return message
+
+    def run_code(self, code, **kwargs):
+        lang = kwargs.get("lang", None)
+        if code.startswith("!") or code.startswith("pip") or lang in ["bash", "shell", "sh"]:
+            return (
+                0,
+                "You MUST NOT install any packages because all the packages needed are already installed.",
+                None,
+            )
+        if self._ipython is None or lang != "python":
+            return super().run_code(code, **kwargs)
+        else:
+            result = self._ipython.run_cell(code)
+            log = str(result.result)
+            exitcode = 0 if result.success else 1
+            if result.error_before_exec is not None:
+                log += f"\n{result.error_before_exec}"
+                exitcode = 1
+            if result.error_in_exec is not None:
+                log += f"\n{result.error_in_exec}"
+                exitcode = 1
+            return exitcode, log, None
+
+--------------------------------------------------------------------------------

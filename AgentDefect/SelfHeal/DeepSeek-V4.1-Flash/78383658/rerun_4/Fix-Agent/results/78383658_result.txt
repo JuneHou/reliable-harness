@@ -1,0 +1,505 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 19:30:18
+End Time: 2026-11-05 19:34:05
+Total Duration: 226.82 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import json
+from functools import lru_cache
+
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import CSVLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.output_parsers import JsonOutputParser
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CSV_PATH = "control.csv"
+# Chroma "relevance score" = 1 - cosine distance, so it lives in [0, 1].
+# Keep candidates whose score is >= this value.
+SIMILARITY_THRESHOLD = 0.30
+TOP_K = 15
+
+
+# ---------------------------------------------------------------------------
+# Index building (done once, not on every call)
+# ---------------------------------------------------------------------------
+def _combine_name_and_description(doc):
+    """CSVLoader puts every column in metadata; build a single readable text."""
+    meta = doc.metadata or {}
+    name = meta.get("Name") or meta.get("name") or meta.get("Control") or ""
+    desc = (
+        meta.get("Description")
+        or meta.get("description")
+        or meta.get("Control Description")
+        or ""
+    )
+    if name or desc:
+        doc.page_content = f"Name: {name}\nDescription: {desc}"
+    return doc
+
+
+@lru_cache(maxsize=1)
+def build_vectorstore():
+    loader = CSVLoader(file_path=CSV_PATH, encoding="utf-8")
+    data = [_combine_name_and_description(d) for d in loader.load()]
+
+    # Split on natural boundaries so a control row is not cut in the middle.
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=0,
+        separators=["\n\n", "\n", ". ", " "],
+    )
+    chunks = splitter.split_documents(data)
+
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    # Cosine space makes similarity_search_with_relevance_scores return
+    # interpretable scores in [0, 1] that can be compared to a threshold.
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+    return vectorstore
+
+
+# ---------------------------------------------------------------------------
+# Retrieval with explicit similarity scores
+# ---------------------------------------------------------------------------
+def retrieve_with_scores(query: str, k: int = TOP_K, score_threshold: float = SIMILARITY_THRESHOLD):
+    """Return (document, similarity_score) pairs above the threshold.
+
+    A plain `as_retriever()` hides the score and has no threshold, which is why
+    the LLM could never report scores/thresholds: it simply never saw them.
+    """
+    vectorstore = build_vectorstore()
+    try:
+        return vectorstore.similarity_search_with_relevance_scores(
+            query, k=k, score_threshold=score_threshold
+        )
+    except ValueError:
+        # Raised when no document satisfies the threshold.
+        return []
+
+
+def format_docs_with_scores(docs_with_scores) -> str:
+    if not docs_with_scores:
+        return "No candidate control met the similarity threshold."
+
+    lines = []
+    for rank, (doc, score) in enumerate(docs_with_scores, start=1):
+        meta = doc.metadata or {}
+        ctrl_id = (
+            meta.get("id")
+            or meta.get("Control ID")
+            or meta.get("Control")
+            or meta.get("source", f"row_{rank}")
+        )
+        text = " ".join(doc.page_content.split())
+        lines.append(
+            f"[{rank}] id: {ctrl_id} | similarity_score: {score:.4f} | text: {text}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Prompt: explicitly asks for a structured list of similar / duplicate pairs
+# ---------------------------------------------------------------------------
+TEMPLATE = """You are an audit assistant that detects duplicate and similar
+internal controls.
+
+You are given candidate controls retrieved from a vector database. Every
+candidate line has this format:
+[rank] id: <control id> | similarity_score: <0-1 float> | text: <Name + Description>
+
+The similarity threshold currently in use is: {threshold}
+A candidate whose similarity_score is >= {threshold} counts as a match.
+The similarity_score of a candidate is its score against the reference control
+described in the request; for candidate-to-candidate pairs estimate the score
+yourself on the same 0-1 scale.
+
+Do the following:
+1. Read the reference control(s) in the request.
+2. Compare them with each retrieved candidate and with each other.
+3. Classify every pair as either "duplicate" (same control expressed twice)
+   or "similar" (overlapping intent, not identical).
+4. Only report pairs whose similarity_score is >= {threshold}.
+5. Keep each "reason" to one short sentence.
+
+Answer with ONLY a JSON object and nothing else (no markdown, no prose before
+or after), using exactly this schema:
+{{
+  "threshold": <float>,
+  "pairs": [
+    {{
+      "control_a": "<id or name>",
+      "control_b": "<id or name>",
+      "similarity_score": <float between 0 and 1>,
+      "relationship": "duplicate" or "similar",
+      "reason": "<one short sentence>"
+    }}
+  ]
+}}
+
+If no pair reaches the threshold, return {{"threshold": {threshold}, "pairs": []}}.
+
+Retrieved context:
+{context}
+
+Request:
+{question}
+"""
+
+prompt = ChatPromptTemplate.from_template(TEMPLATE)
+
+
+# ---------------------------------------------------------------------------
+# Chain
+# ---------------------------------------------------------------------------
+def _context_for(query: str) -> str:
+    return format_docs_with_scores(
+        retrieve_with_scores(query, k=TOP_K, score_threshold=SIMILARITY_THRESHOLD)
+    )
+
+
+def build_chain(model: str = "gpt-4o-mini", verbose: bool = True):
+    llm = ChatOpenAI(temperature=0, model=model, verbose=verbose, model_kwargs={"response_format": {"type": "json_object"}})
+    return (
+        {
+            "context": RunnableLambda(_context_for),
+            "question": RunnablePassthrough(),
+            "threshold": RunnableLambda(lambda _: SIMILARITY_THRESHOLD),
+        }
+        | prompt
+        | llm
+        | JsonOutputParser()
+    )
+
+
+def run_agent(query: str):
+    """Return a dict: {"threshold": float, "pairs": [ ... ]}."""
+    rag_chain = build_chain()
+    try:
+        output = rag_chain.invoke(query)
+    except json.JSONDecodeError as exc:  # model returned non-JSON text
+        return {"threshold": SIMILARITY_THRESHOLD, "pairs": [], "error": str(exc)}
+
+    # Guarantee the documented shape even if the model omits a key.
+    output.setdefault("threshold", SIMILARITY_THRESHOLD)
+    output.setdefault("pairs", [])
+    return output
+
+
+if __name__ == "__main__":
+    query = (
+        "Reference control: 'Family movies' - a control that selects movies "
+        "(Name + Description) suitable for family viewing. Find all SIMILAR and "
+        f"DUPLICATE control pairs with similarity_score >= {SIMILARITY_THRESHOLD}."
+    )
+    result = run_agent(query)
+
+    print(json.dumps(result, indent=2))
+    print(f"\n{len(result.get('pairs', []))} pair(s) at or above threshold "
+          f"{result.get('threshold')}.")
+    for pair in result.get("pairs", []):
+        print(
+            f"- {pair.get('control_a')} <-> {pair.get('control_b')} | "
+            f"{pair.get('relationship')} | score={pair.get('similarity_score')} | "
+            f"{pair.get('reason', '')}"
+        )
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 19:34:05
+Duration: 226.82 seconds
+Verdict: ## Evaluation Summary
+
+### 1. Diff review
+The fix is a substantial rewrite of the buggy file:
+
+| Aspect | Buggy | Fixed |
+|---|---|---|
+| Imports | Deprecated `langchain.document_loaders`, `langchain.vectorstores`, `langchain.embeddings`, `langchain.schema.*` | Modern split packages: `langchain_community`, `langchain_text_splitters`, `langchain_chroma`, `langchain_core`, `langchain_openai` |
+| Splitter | `CharacterTextSplitter` | `RecursiveCharacterTextSplitter` (separators, overlap 0) |
+| Index building | Rebuilt on every `run_agent` call | `@lru_cache(maxsize=1)` → built once |
+| Retrieval | `as_retriever()` (score hidden) | `similarity_search_with_relevance_scores(..., score_threshold=...)` + cosine space |
+| Output parser | `StrOutputParser` (plain string) | `JsonOutputParser` (dict) |
+| Output contract | string | `{"threshold": float, "pairs": [...]}` |
+
+These are genuinely good engineering changes: the deprecated `langchain.*` import paths were removed, the vector store is no longer rebuilt per call, and the chain now produces a dictionary (needed for the test's `assertIsInstance(result, dict)`).
+
+### 2. Validation tool
+`validate_fixed_code` → **ACCEPT** ("matches expected structure and output format").
+
+### 3. API verification
+The `verify_api_usage` tool returned only generic LangChain background text for `Chroma.similarity_search_with_relevance_scores`, `JsonOutputParser`, `Chroma.from_documents`, and `CSVLoader` — no parameter-level documentation. I therefore assessed these against known API semantics:
+- `similarity_search_with_relevance_scores(query, k=..., score_threshold=...)` → returns `List[Tuple[Document, float]]`; raising `ValueError` when nothing passes the threshold is the documented behavior, and it's caught here. ✅
+- `Chroma.from_documents(documents=..., embedding=..., collection_metadata={"hnsw:space": "cosine"})` → valid; cosine space makes relevance scores bounded in [0,1]. ✅
+- `JsonOutputParser` → `.invoke()` returns a `dict`. ✅
+- `CSVLoader(file_path=..., encoding=...)` → valid; columns land in `metadata`, so overriding `page_content` in `_combine_name_and_description` is sound. ✅
+- Template escaping (`{{ }}` for literal braces, `{context}/{question}/{threshold}` as variables) is correct for `ChatPromptTemplate.from_template`. ✅
+
+### 4. Critical mismatch against the test contract
+
+```python
+self.assertIsInstance(result, dict)        # ✅ passes (JsonOutputParser → dict)
+self.assertIn("results", result)           # ❌ FAILS
+self.assertIsInstance(result["results"], list)  # ❌ FAILS
+```
+
+`run_agent` returns keys **`threshold`**, **`pairs`** (and possibly `error`) — there is **no `results` key anywhere** in the fixed code. The prompt schema, the `setdefault` defaults, the fallback error dict, and the `__main__` printing block all consistently use `pairs`. The test therefore fails on its second assertion, before it ever reaches the per-item dict check.
+
+This is not a cosmetic naming quibble: the fix appears to have been written against a *different task statement* (audit-assistant duplicate/similar **control** pair detection, with a `threshold`/`pairs` schema and a demo query about "Family movies" controls), whereas the test only requires the generic shape `{"results": [ {...}, ... ]}`. The `__main__` demo query and the entire prompt persona drift away from the original "movies for family" CSV QA use case, which is scope creep beyond the reported bug.
+
+### 5. Other lesser concerns
+- The `except ValueError` in `retrieve_with_scores` also silently swallows genuine configuration errors (e.g., missing relevance score function) and turns them into "no matches", hiding failures.
+- `except json.JSONDecodeError` around `invoke` is narrow — `JsonOutputParser` can also raise `OutputParserException`, which would propagate uncaught.
+- Passing `response_format` via `model_kwargs` works with `ChatOpenAI`, but `llm.with_structured_output(schema)` would be the idiomatic, type-safe alternative and would also guarantee the `results` key.
+
+## Verdict
+
+**REJECT**
+
+Reasoning: The modernization (deprecated imports, cached index, `JsonOutputParser` → dict, scored retrieval) is correct and well-executed, and the `validate_fixed_code` tool reports ACCEPT. However, the tool's verdict does not match the actual runtime contract demanded by the test: `run_agent` returns `{"threshold": ..., "pairs": [...]}`, and the test asserts `"results"` must be present and be a list. That assertion fails outright, so the test cannot pass. The fix also solves a *different* problem domain (control-duplicate auditing) than the test case describes.
+
+**Minimal correction needed:** rename the schema key `pairs` → `results` everywhere (prompt JSON schema, both `setdefault` calls, the `json.JSONDecodeError` fallback dict, and the `__main__` printing loop), and ideally catch `OutputParserException` too — e.g.
+
+```python
+output.setdefault("threshold", SIMILARITY_THRESHOLD)
+output.setdefault("results", [])
+output.setdefault("results", [] if "pairs" not in output else output.pop("pairs"))
+```
+
+(or simply emit `"results"` directly from the prompt and drop `pairs` entirely). With that change the code would satisfy both the structural validation and the test.
+--------------------------------------------------------------------------------
+import os
+import json
+from functools import lru_cache
+
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import CSVLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.output_parsers import JsonOutputParser
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CSV_PATH = "control.csv"
+# Chroma "relevance score" = 1 - cosine distance, so it lives in [0, 1].
+# Keep candidates whose score is >= this value.
+SIMILARITY_THRESHOLD = 0.30
+TOP_K = 15
+
+
+# ---------------------------------------------------------------------------
+# Index building (done once, not on every call)
+# ---------------------------------------------------------------------------
+def _combine_name_and_description(doc):
+    """CSVLoader puts every column in metadata; build a single readable text."""
+    meta = doc.metadata or {}
+    name = meta.get("Name") or meta.get("name") or meta.get("Control") or ""
+    desc = (
+        meta.get("Description")
+        or meta.get("description")
+        or meta.get("Control Description")
+        or ""
+    )
+    if name or desc:
+        doc.page_content = f"Name: {name}\nDescription: {desc}"
+    return doc
+
+
+@lru_cache(maxsize=1)
+def build_vectorstore():
+    loader = CSVLoader(file_path=CSV_PATH, encoding="utf-8")
+    data = [_combine_name_and_description(d) for d in loader.load()]
+
+    # Split on natural boundaries so a control row is not cut in the middle.
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=0,
+        separators=["\n\n", "\n", ". ", " "],
+    )
+    chunks = splitter.split_documents(data)
+
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    # Cosine space makes similarity_search_with_relevance_scores return
+    # interpretable scores in [0, 1] that can be compared to a threshold.
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+    return vectorstore
+
+
+# ---------------------------------------------------------------------------
+# Retrieval with explicit similarity scores
+# ---------------------------------------------------------------------------
+def retrieve_with_scores(query: str, k: int = TOP_K, score_threshold: float = SIMILARITY_THRESHOLD):
+    """Return (document, similarity_score) pairs above the threshold.
+
+    A plain `as_retriever()` hides the score and has no threshold, which is why
+    the LLM could never report scores/thresholds: it simply never saw them.
+    """
+    vectorstore = build_vectorstore()
+    try:
+        return vectorstore.similarity_search_with_relevance_scores(
+            query, k=k, score_threshold=score_threshold
+        )
+    except ValueError:
+        # Raised when no document satisfies the threshold.
+        return []
+
+
+def format_docs_with_scores(docs_with_scores) -> str:
+    if not docs_with_scores:
+        return "No candidate control met the similarity threshold."
+
+    lines = []
+    for rank, (doc, score) in enumerate(docs_with_scores, start=1):
+        meta = doc.metadata or {}
+        ctrl_id = (
+            meta.get("id")
+            or meta.get("Control ID")
+            or meta.get("Control")
+            or meta.get("source", f"row_{rank}")
+        )
+        text = " ".join(doc.page_content.split())
+        lines.append(
+            f"[{rank}] id: {ctrl_id} | similarity_score: {score:.4f} | text: {text}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Prompt: explicitly asks for a structured list of similar / duplicate pairs
+# ---------------------------------------------------------------------------
+TEMPLATE = """You are an audit assistant that detects duplicate and similar
+internal controls.
+
+You are given candidate controls retrieved from a vector database. Every
+candidate line has this format:
+[rank] id: <control id> | similarity_score: <0-1 float> | text: <Name + Description>
+
+The similarity threshold currently in use is: {threshold}
+A candidate whose similarity_score is >= {threshold} counts as a match.
+The similarity_score of a candidate is its score against the reference control
+described in the request; for candidate-to-candidate pairs estimate the score
+yourself on the same 0-1 scale.
+
+Do the following:
+1. Read the reference control(s) in the request.
+2. Compare them with each retrieved candidate and with each other.
+3. Classify every pair as either "duplicate" (same control expressed twice)
+   or "similar" (overlapping intent, not identical).
+4. Only report pairs whose similarity_score is >= {threshold}.
+5. Keep each "reason" to one short sentence.
+
+Answer with ONLY a JSON object and nothing else (no markdown, no prose before
+or after), using exactly this schema:
+{{
+  "threshold": <float>,
+  "pairs": [
+    {{
+      "control_a": "<id or name>",
+      "control_b": "<id or name>",
+      "similarity_score": <float between 0 and 1>,
+      "relationship": "duplicate" or "similar",
+      "reason": "<one short sentence>"
+    }}
+  ]
+}}
+
+If no pair reaches the threshold, return {{"threshold": {threshold}, "pairs": []}}.
+
+Retrieved context:
+{context}
+
+Request:
+{question}
+"""
+
+prompt = ChatPromptTemplate.from_template(TEMPLATE)
+
+
+# ---------------------------------------------------------------------------
+# Chain
+# ---------------------------------------------------------------------------
+def _context_for(query: str) -> str:
+    return format_docs_with_scores(
+        retrieve_with_scores(query, k=TOP_K, score_threshold=SIMILARITY_THRESHOLD)
+    )
+
+
+def build_chain(model: str = "gpt-4o-mini", verbose: bool = True):
+    llm = ChatOpenAI(temperature=0, model=model, verbose=verbose, model_kwargs={"response_format": {"type": "json_object"}})
+    return (
+        {
+            "context": RunnableLambda(_context_for),
+            "question": RunnablePassthrough(),
+            "threshold": RunnableLambda(lambda _: SIMILARITY_THRESHOLD),
+        }
+        | prompt
+        | llm
+        | JsonOutputParser()
+    )
+
+
+def run_agent(query: str):
+    """Return a dict: {"threshold": float, "pairs": [ ... ]}."""
+    rag_chain = build_chain()
+    try:
+        output = rag_chain.invoke(query)
+    except json.JSONDecodeError as exc:  # model returned non-JSON text
+        return {"threshold": SIMILARITY_THRESHOLD, "pairs": [], "error": str(exc)}
+
+    # Guarantee the documented shape even if the model omits a key.
+    output.setdefault("threshold", SIMILARITY_THRESHOLD)
+    output.setdefault("pairs", [])
+    return output
+
+
+if __name__ == "__main__":
+    query = (
+        "Reference control: 'Family movies' - a control that selects movies "
+        "(Name + Description) suitable for family viewing. Find all SIMILAR and "
+        f"DUPLICATE control pairs with similarity_score >= {SIMILARITY_THRESHOLD}."
+    )
+    result = run_agent(query)
+
+    print(json.dumps(result, indent=2))
+    print(f"\n{len(result.get('pairs', []))} pair(s) at or above threshold "
+          f"{result.get('threshold')}.")
+    for pair in result.get("pairs", []):
+        print(
+            f"- {pair.get('control_a')} <-> {pair.get('control_b')} | "
+            f"{pair.get('relationship')} | score={pair.get('similarity_score')} | "
+            f"{pair.get('reason', '')}"
+        )
+
+--------------------------------------------------------------------------------

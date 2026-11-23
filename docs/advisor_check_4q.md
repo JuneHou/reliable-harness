@@ -43,8 +43,6 @@ Where papers differ in generation: Harness-R1 and JIT-Agent train a repairer fro
 
 **Data point — AgentDefect.** The six program patches in the SelfHeal archive are human-authored. The 37 rows of `docs/agentdefect_component_table.csv` record what component each patch touches. The 14 scope names in `motivation_pilot/src/motivation_pilot/extension.py` `COMPONENTS` map each declared change to a code anchor. No LLM generated or judged these patches.
 
-**Data point — AgentIssue-Bench.** `exp-2026-10-22/audit/boundary.json` records `loaded_implementation_verified` per run for case 594. The developer fix has 18 files. Three of 18 were loaded per run. In 15 of 18 runs the patch files were proposed but never executed. A generation method that produces a patch but does not confirm execution cannot tell whether the patch reached the code path it targets.
-
 **Our method adds:** an execution check at the boundary. A change that touches a module with a probe is marked as executed when the probe fires in that run. A change in a scope without a probe is reported as not watchable.
 
 ---
@@ -134,6 +132,6 @@ AgentIssue-Bench defines three criteria with distinct measurement types: (i) cor
 
 The interval crosses zero. P(Δ>0) is 0.92, below the 0.95 level. Only two of nine with-side runs enacted P_core (π=0.22). A paper that reports "6 of 9 passed versus 3 of 9 passed" without an interval treats this as a positive signal. The interval shows the direction of effect is uncertain. The low enactment rate shows the patch rarely reached the module it targets, so the contrast does not measure the patch's actual effect.
 
-**Data point — survival summary.** Source: `motivation_pilot/artifacts/agentdefect_extension/exp-2026-10-23-v/summary.json`. Of the 88 comparison rows: 22 are recorded as required_in_context and all 22 survive at P(Δ>0) at or above 0.95. Eight are recorded as removable_in_context and none survive at P(|Δ|<0.2) at or above 0.95. Three runs cannot bound the removability margin at δ=0.2; about 12 runs a side are needed. No harness paper reports this gap.
+**Data point — survival summary.** Source: `motivation_pilot/artifacts/agentdefect_extension/exp-2026-10-23-v/summary.json`. Of the 88 comparison rows: 22 are recorded as required_in_context and all 22 survive at P(Δ>0) at or above 0.95. Eight are recorded as removable_in_context and none survive at P(|Δ|<0.2) at or above 0.95. Three runs cannot bound the removability margin at δ=0.2. No harness paper reports this gap.
 
 **Our method adds:** the label procedure computes the Jeffreys posterior per cell, the effect Δ with its interval, the execution rate π, and the complier causal effect Δ/π. A required verdict needs P(Δ>0) at or above 0.95. A removable verdict needs P(|Δ|<0.2) at or above 0.95. Three runs settle required verdicts where the evidence is clear (P(Δ>0)=1.00 on 3/3 vs 0/3) but cannot settle removable verdicts.

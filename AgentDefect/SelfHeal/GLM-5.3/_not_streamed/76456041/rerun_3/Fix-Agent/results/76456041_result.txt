@@ -1,0 +1,417 @@
+Case ID: 76456041
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 00:25:14
+End Time: 2026-11-05 00:59:16
+Total Duration: 2041.54 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import uuid
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.docstore.document import Document
+from langchain.document_loaders import CSVLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# CSVLoader produces ONE document per CSV row and the map_reduce chain makes
+# ONE LLM call per document.  Feeding it row-by-row documents therefore meant
+# one API call per row of the full CSV (the source of the huge bill), and each
+# map step only ever saw a single isolated row.  Packing ROWS_PER_DOCUMENT
+# rows into one document cuts the number of map calls (and embeddings) by that
+# factor while every chunk still stays comfortably inside the model context.
+ROWS_PER_DOCUMENT = 20
+
+# ---------------------------------------------------------------------------
+# Custom map / reduce prompts  (the actual bug fix)
+#
+# The built-in map_reduce prompts are purely extractive: the map step is told
+# to "return any relevant text verbatim" and the combine step merely re-answers
+# from that raw text.  That is fine for lookups but fails for aggregation
+# questions ("name every German driver", "oldest birthdate"): no step is ever
+# asked to count rows or compare dates, so the reduce step receives a wall of
+# unprocessed rows, truncates them and returns a wrong/partial answer.  It only
+# *appeared* to work with chain_type="stuff" on the small sample file because
+# there the whole table fitted into a single prompt.
+#
+# The replacement prompts must use exactly the input variables that the
+# map_reduce chain expects:
+#     map (question) step -> ["context", "question"]
+#     combine (reduce) step -> ["summaries", "question"]
+# ---------------------------------------------------------------------------
+QUESTION_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "The following is a chunk of rows taken from a CSV table of drivers:\n"
+        "---------------------\n{context}\n---------------------\n"
+        "Using ONLY the rows in this chunk, produce the partial result needed "
+        "to answer the question:\n"
+        "- If the question asks which rows match a condition (for example a "
+        "given nationality), list EVERY matching row of this chunk together "
+        "with the fields needed to answer (name, nationality, birthdate, ...).\n"
+        "- If the question asks for a count, list the matching rows AND state "
+        "how many of them are in this chunk.\n"
+        "- If the question asks for an extreme value (oldest/youngest driver, "
+        "min/max of a column), list the candidate rows of this chunk together "
+        "with the value that must be compared.\n"
+        "Never invent rows that are not present in the chunk.\n"
+        "If nothing in this chunk is relevant, reply exactly with: "
+        "No relevant rows in this chunk.\n"
+        "Question: \"{question}\"\n"
+        "Partial result for this chunk:"
+    ),
+)
+
+COMBINE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "The following are partial results, each computed on a different "
+        "chunk of the same CSV table:\n"
+        "---------------------\n{summaries}\n---------------------\n"
+        "Combine them into one single final answer to the question:\n"
+        "merge the matching rows reported by all chunks, remove duplicates so "
+        "that every driver is listed and counted only once, then actually "
+        "COMPUTE the requested aggregate (the total count of the merged rows, "
+        "or the extreme value) instead of just repeating the extracted text.\n"
+        "Question: \"{question}\"\n"
+        "Final answer:"
+    ),
+)
+
+
+def batch_documents(row_documents, rows_per_doc=ROWS_PER_DOCUMENT):
+    """Merge the one-row-per-document output of CSVLoader into batch documents.
+
+    Keeps the number of map-step LLM calls (one per document) low while each
+    chunk remains a well-formed, self-describing table excerpt.
+    """
+    batched, chunk = [], []
+    for doc in row_documents:
+        chunk.append(doc.page_content)
+        if len(chunk) >= rows_per_doc:
+            batched.append(Document(page_content="\n".join(chunk)))
+            chunk = []
+    if chunk:
+        batched.append(Document(page_content="\n".join(chunk)))
+    return batched
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as cb:
+
+            loader = CSVLoader(file_path=file, encoding='utf-8')
+            docs = loader.load()
+
+            if not docs:
+                print(f"{file}: no rows found, skipping.")
+                continue
+
+            # Cost fix: batch the rows so the map step runs once per batch
+            # instead of once per row (~ROWS_PER_DOCUMENT times fewer LLM
+            # calls, and fewer embeddings as well).
+            batched_docs = batch_documents(docs)
+
+            embeddings = OpenAIEmbeddings()
+
+            # A unique collection name per file (and per run) keeps the
+            # in-memory Chroma collections of drivers.csv and
+            # drivers_full.csv separate; with the shared default collection
+            # name, rows of the first file would leak into the answers for
+            # the second one and inflate counts.
+            collection_name = (
+                f"qa_{os.path.splitext(os.path.basename(file))[0]}"
+                f"_{uuid.uuid4().hex[:8]}"
+            )
+
+            # create the vectorstore to use as the index (over the batches)
+            db = Chroma.from_documents(
+                batched_docs, embeddings, collection_name=collection_name
+            )
+
+            # Correctness fix: aggregation questions need the COMPLETE table,
+            # so retrieve every chunk (k = number of chunks).  A small k would
+            # silently drop rows and produce wrong counts / wrong extremes.
+            retriever = db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": len(batched_docs)},
+            )
+
+            # Build the chain once per file (not once per query) and hand
+            # map_reduce the aggregation-aware prompts defined above instead
+            # of the default "extract relevant text" prompts.
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=OpenAI(temperature=0),
+                chain_type="map_reduce",
+                retriever=retriever,
+                chain_type_kwargs={
+                    "question_prompt": QUESTION_PROMPT,
+                    "combine_prompt": COMBINE_PROMPT,
+                },
+                verbose=True,
+            )
+
+            for query in queries:
+                print(query)
+                result = qa_chain.run(query)
+                results.append(result)
+
+                print(result)
+
+            print(cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German",
+        "What is the birthdate of the oldest driver?",
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 00:59:16
+Duration: 2041.53 seconds
+Verdict: I now have enough information to evaluate. Let me analyze the diff, validation results, and API usage findings.
+
+## Analysis
+
+**Bug context (inferred):** The script asks aggregation/enumeration questions ("name every German driver") over CSV data using `RetrievalQA` with `chain_type="map_reduce"`, but the answers would come back wrong/partial and the process would be extremely expensive.
+
+**Root causes identified and addressed by the fix:**
+
+1. **Default map_reduce prompts are purely extractive** — LangChain's built-in map step says "return any relevant text verbatim" and the combine step just re-answers from raw extracted text. No step ever counts rows or enumerates matches, so "list every German driver" fails or truncates. The fix's custom `QUESTION_PROMPT` (map) and `COMBINE_PROMPT` (reduce) instruct the model to enumerate matching rows, count them, and compute aggregates. 
+
+2. **API correctness of the prompt fix:** I verified against LangChain's `load_qa_chain` map_reduce construction: `chain_type_kwargs={"question_prompt": ..., "combine_prompt": ...}` are exactly the kwargs `RetrievalQA.from_chain_type` → `load_qa_chain` pops for `chain_type="map_reduce"`. Critically, the input variable names **and ordering** match the requirements: map prompt uses `["context", "question"]` (first var becomes `document_variable_name="context"`) and combine prompt uses `["summaries", "question"]` (first var becomes `document_variable_name="summaries"`). This is correct — a common pitfall this fix avoids.
+
+3. **Cost explosion** — `CSVLoader` yields one Document per CSV row, and map_reduce makes one LLM call per document, so `drivers_full.csv` would trigger hundreds/thousands of map calls per query. Batching 20 rows per Document (`batch_documents`) reduces calls and embeddings ~20× while staying within context. Sound engineering fix.
+
+4. **Chroma collection collision** — both files used the shared default collection name; with chromadb versions that persist by default, rows from `drivers.csv` would leak into `drivers_full.csv` queries and inflate counts. Unique per-file/per-run `collection_name` is a correct defensive fix, and `Chroma.from_documents(documents, embedding, collection_name=...)` is a valid signature.
+
+5. **Retriever `k`** — `k=1000` could silently drop rows on larger files (wrong counts); `k=len(batched_docs)` guarantees the complete table reaches the chain. Guarded by `if not docs: continue` so `k >= 1` always.
+
+6. Minor cleanups (chain built once per file instead of per query, redundant `batch_size=20` removed, removed duplicate inline import) — all harmless, behavior-preserving improvements.
+
+**Validation:** The tool returned "REJECT test code unavailable" — this reflects the *absence of tests* for this case, not a failure of the fixed code. Structural inspection shows valid Python, correct imports for the langchain version implied (`langchain.document_loaders`, `langchain.docstore.document`, `langchain.prompts`), and correct API parameter usage throughout.
+
+**Minor nitpicks (not blocking):** the default reduce `token_max=3000` without a collapse chain is unchanged from the original (pre-existing, not a regression); adding a second demo query changes the `main` output, which is acceptable for demonstrating the fix.
+
+## Verdict
+
+**ACCEPT** — The fix is reasonable and technically sound. It correctly diagnoses the real problems (extraction-only default prompts that cannot handle enumeration/aggregation questions, one-LLM-call-per-CSV-row cost blowup, potential cross-file Chroma collection contamination, and potentially lossy `k` retrieval) and applies fixes using correct LangChain APIs, with prompt input variables that exactly match what the `map_reduce` chain construction requires. The validation rejection was solely due to unavailable test code, not any defect in the fix.
+--------------------------------------------------------------------------------
+import os
+import uuid
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.docstore.document import Document
+from langchain.document_loaders import CSVLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# CSVLoader produces ONE document per CSV row and the map_reduce chain makes
+# ONE LLM call per document.  Feeding it row-by-row documents therefore meant
+# one API call per row of the full CSV (the source of the huge bill), and each
+# map step only ever saw a single isolated row.  Packing ROWS_PER_DOCUMENT
+# rows into one document cuts the number of map calls (and embeddings) by that
+# factor while every chunk still stays comfortably inside the model context.
+ROWS_PER_DOCUMENT = 20
+
+# ---------------------------------------------------------------------------
+# Custom map / reduce prompts  (the actual bug fix)
+#
+# The built-in map_reduce prompts are purely extractive: the map step is told
+# to "return any relevant text verbatim" and the combine step merely re-answers
+# from that raw text.  That is fine for lookups but fails for aggregation
+# questions ("name every German driver", "oldest birthdate"): no step is ever
+# asked to count rows or compare dates, so the reduce step receives a wall of
+# unprocessed rows, truncates them and returns a wrong/partial answer.  It only
+# *appeared* to work with chain_type="stuff" on the small sample file because
+# there the whole table fitted into a single prompt.
+#
+# The replacement prompts must use exactly the input variables that the
+# map_reduce chain expects:
+#     map (question) step -> ["context", "question"]
+#     combine (reduce) step -> ["summaries", "question"]
+# ---------------------------------------------------------------------------
+QUESTION_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "The following is a chunk of rows taken from a CSV table of drivers:\n"
+        "---------------------\n{context}\n---------------------\n"
+        "Using ONLY the rows in this chunk, produce the partial result needed "
+        "to answer the question:\n"
+        "- If the question asks which rows match a condition (for example a "
+        "given nationality), list EVERY matching row of this chunk together "
+        "with the fields needed to answer (name, nationality, birthdate, ...).\n"
+        "- If the question asks for a count, list the matching rows AND state "
+        "how many of them are in this chunk.\n"
+        "- If the question asks for an extreme value (oldest/youngest driver, "
+        "min/max of a column), list the candidate rows of this chunk together "
+        "with the value that must be compared.\n"
+        "Never invent rows that are not present in the chunk.\n"
+        "If nothing in this chunk is relevant, reply exactly with: "
+        "No relevant rows in this chunk.\n"
+        "Question: \"{question}\"\n"
+        "Partial result for this chunk:"
+    ),
+)
+
+COMBINE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "The following are partial results, each computed on a different "
+        "chunk of the same CSV table:\n"
+        "---------------------\n{summaries}\n---------------------\n"
+        "Combine them into one single final answer to the question:\n"
+        "merge the matching rows reported by all chunks, remove duplicates so "
+        "that every driver is listed and counted only once, then actually "
+        "COMPUTE the requested aggregate (the total count of the merged rows, "
+        "or the extreme value) instead of just repeating the extracted text.\n"
+        "Question: \"{question}\"\n"
+        "Final answer:"
+    ),
+)
+
+
+def batch_documents(row_documents, rows_per_doc=ROWS_PER_DOCUMENT):
+    """Merge the one-row-per-document output of CSVLoader into batch documents.
+
+    Keeps the number of map-step LLM calls (one per document) low while each
+    chunk remains a well-formed, self-describing table excerpt.
+    """
+    batched, chunk = [], []
+    for doc in row_documents:
+        chunk.append(doc.page_content)
+        if len(chunk) >= rows_per_doc:
+            batched.append(Document(page_content="\n".join(chunk)))
+            chunk = []
+    if chunk:
+        batched.append(Document(page_content="\n".join(chunk)))
+    return batched
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as cb:
+
+            loader = CSVLoader(file_path=file, encoding='utf-8')
+            docs = loader.load()
+
+            if not docs:
+                print(f"{file}: no rows found, skipping.")
+                continue
+
+            # Cost fix: batch the rows so the map step runs once per batch
+            # instead of once per row (~ROWS_PER_DOCUMENT times fewer LLM
+            # calls, and fewer embeddings as well).
+            batched_docs = batch_documents(docs)
+
+            embeddings = OpenAIEmbeddings()
+
+            # A unique collection name per file (and per run) keeps the
+            # in-memory Chroma collections of drivers.csv and
+            # drivers_full.csv separate; with the shared default collection
+            # name, rows of the first file would leak into the answers for
+            # the second one and inflate counts.
+            collection_name = (
+                f"qa_{os.path.splitext(os.path.basename(file))[0]}"
+                f"_{uuid.uuid4().hex[:8]}"
+            )
+
+            # create the vectorstore to use as the index (over the batches)
+            db = Chroma.from_documents(
+                batched_docs, embeddings, collection_name=collection_name
+            )
+
+            # Correctness fix: aggregation questions need the COMPLETE table,
+            # so retrieve every chunk (k = number of chunks).  A small k would
+            # silently drop rows and produce wrong counts / wrong extremes.
+            retriever = db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": len(batched_docs)},
+            )
+
+            # Build the chain once per file (not once per query) and hand
+            # map_reduce the aggregation-aware prompts defined above instead
+            # of the default "extract relevant text" prompts.
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=OpenAI(temperature=0),
+                chain_type="map_reduce",
+                retriever=retriever,
+                chain_type_kwargs={
+                    "question_prompt": QUESTION_PROMPT,
+                    "combine_prompt": COMBINE_PROMPT,
+                },
+                verbose=True,
+            )
+
+            for query in queries:
+                print(query)
+                result = qa_chain.run(query)
+                results.append(result)
+
+                print(result)
+
+            print(cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German",
+        "What is the birthdate of the oldest driver?",
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------

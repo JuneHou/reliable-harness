@@ -1,0 +1,2636 @@
+Case ID: haystack_8912
+Status: FAILED
+Final Attempt: 3
+Start Time: 2026-11-17 16:26:17
+End Time: 2026-11-17 17:50:22
+Total Duration: 5045.55 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import copy
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
+
+from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
+from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+
+from haystack import component, default_from_dict, default_to_dict, logging
+from haystack.dataclasses import (
+    AsyncStreamingCallbackT,
+    ChatMessage,
+    StreamingCallbackT,
+    StreamingChunk,
+    SyncStreamingCallbackT,
+    ToolCall,
+    select_streaming_callback,
+)
+from haystack.tools.tool import Tool, _check_duplicate_tool_names, deserialize_tools_inplace
+from haystack.utils import Secret, deserialize_callable, deserialize_secrets_inplace, serialize_callable
+
+logger = logging.getLogger(__name__)
+
+
+def _set_additional_properties_false(schema: Any) -> None:
+    """
+    Recursively set `additionalProperties` to `False` for every object defined in a JSON schema.
+
+    OpenAI strict mode requires `additionalProperties` to be explicitly set to `False` for the root object
+    **and** for every nested object contained in the tool's parameters schema. Schemas generated from Python
+    objects (for example the ones created by `ComponentTool` starting from Pydantic models) usually only define
+    `properties` for nested objects without setting `additionalProperties`, which makes OpenAI reject the whole
+    tool definition.
+
+    :param schema: The JSON schema (or sub-schema) to update in place.
+    """
+    if isinstance(schema, list):
+        for item in schema:
+            _set_additional_properties_false(item)
+        return
+
+    if not isinstance(schema, dict):
+        return
+
+    properties = schema.get("properties")
+    is_object = schema.get("type") == "object" or isinstance(properties, dict)
+
+    if is_object:
+        # OpenAI strict mode requires this to be explicitly set to False for every object
+        schema["additionalProperties"] = False
+        for property_schema in (properties or {}).values():
+            _set_additional_properties_false(property_schema)
+
+    # recurse into all the keywords that can contain sub-schemas
+    for key in ("items", "prefixItems", "anyOf", "oneOf", "allOf", "not"):
+        if key in schema:
+            _set_additional_properties_false(schema[key])
+
+    # nested definitions (Pydantic v1 uses `definitions`, Pydantic v2 uses `$defs`)
+    for key in ("definitions", "$defs"):
+        definitions = schema.get(key)
+        if isinstance(definitions, dict):
+            for definition_schema in definitions.values():
+                _set_additional_properties_false(definition_schema)
+
+
+def _convert_to_openai_tools(tools: List[Tool], tools_strict: bool = False) -> List[Dict[str, Any]]:
+    """
+    Converts a list of Haystack Tools to the tool definitions format expected by the OpenAI API.
+
+    When `tools_strict` is enabled, the JSON schema of each tool is adjusted so that it satisfies OpenAI's
+    strict mode requirements, that is `additionalProperties` is set to `False` for the root object and,
+    recursively, for every nested object of the parameters schema.
+
+    The tool specs of the passed Tools are never mutated: a deep copy is used to build the OpenAI definitions.
+
+    :param tools: The list of Haystack Tools to convert.
+    :param tools_strict: Whether to enable strict schema adherence for tool calls.
+    :returns: A list of tool definitions in the format expected by the OpenAI API.
+    """
+    tool_definitions: List[Dict[str, Any]] = []
+    for tool in tools:
+        # deep copy to avoid mutating the original tool spec (and therefore the Tool itself)
+        function_spec = copy.deepcopy(tool.tool_spec)
+
+        if tools_strict:
+            function_spec["strict"] = True
+            parameters = function_spec.get("parameters")
+            if isinstance(parameters, dict):
+                _set_additional_properties_false(parameters)
+
+        tool_definitions.append({"type": "function", "function": function_spec})
+
+    return tool_definitions
+
+
+@component
+class OpenAIChatGenerator:
+    """
+    Completes chats using OpenAI's large language models (LLMs).
+
+    It works with the gpt-4 and gpt-3.5-turbo models and supports streaming responses
+    from OpenAI API. It uses [ChatMessage](https://docs.haystack.deepset.ai/docs/chatmessage)
+    format in input and output.
+
+    You can customize how the text is generated by passing parameters to the
+    OpenAI API. Use the `**generation_kwargs` argument when you initialize
+    the component or when you run it. Any parameter that works with
+    `openai.ChatCompletion.create` will work here too.
+
+    For details on OpenAI API parameters, see
+    [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat).
+
+    ### Usage example
+
+    ```python
+    from haystack.components.generators.chat import OpenAIChatGenerator
+    from haystack.dataclasses import ChatMessage
+
+    messages = [ChatMessage.from_user("What's Natural Language Processing?")]
+
+    client = OpenAIChatGenerator()
+    response = client.run(messages)
+    print(response)
+    ```
+    Output:
+    ```
+    {'replies':
+        [ChatMessage(content='Natural Language Processing (NLP) is a branch of artificial intelligence
+            that focuses on enabling computers to understand, interpret, and generate human language in
+            a way that is meaningful and useful.',
+         role=<ChatRole.ASSISTANT: 'assistant'>, name=None,
+         meta={'model': 'gpt-4o-mini', 'index': 0, 'finish_reason': 'stop',
+         'usage': {'prompt_tokens': 15, 'completion_tokens': 36, 'total_tokens': 51}})
+        ]
+    }
+    ```
+    """
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self,
+        api_key: Secret = Secret.from_env_var("OPENAI_API_KEY"),
+        model: str = "gpt-4o-mini",
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        api_base_url: Optional[str] = None,
+        organization: Optional[str] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: bool = False,
+    ):
+        """
+        Creates an instance of OpenAIChatGenerator. Unless specified otherwise in `model`, uses OpenAI's gpt-4o-mini
+
+        Before initializing the component, you can set the 'OPENAI_TIMEOUT' and 'OPENAI_MAX_RETRIES'
+        environment variables to override the `timeout` and `max_retries` parameters respectively
+        in the OpenAI client.
+
+        :param api_key: The OpenAI API key.
+            You can set it with an environment variable `OPENAI_API_KEY`, or pass with this parameter
+            during initialization.
+        :param model: The name of the model to use.
+        :param streaming_callback: A callback function that is called when a new token is received from the stream.
+            The callback function accepts [StreamingChunk](https://docs.haystack.deepset.ai/docs/data-classes#streamingchunk)
+            as an argument.
+        :param api_base_url: An optional base URL.
+        :param organization: Your organization ID, defaults to `None`. See
+        [production best practices](https://platform.openai.com/docs/guides/production-best-practices/setting-up-your-organization).
+        :param generation_kwargs: Other parameters to use for the model. These parameters are sent directly to
+            the OpenAI endpoint. See OpenAI [documentation](https://platform.openai.com/docs/api-reference/chat) for
+            more details.
+            Some of the supported parameters:
+            - `max_tokens`: The maximum number of tokens the output text can have.
+            - `temperature`: What sampling temperature to use. Higher values mean the model will take more risks.
+                Try 0.9 for more creative applications and 0 (argmax sampling) for ones with a well-defined answer.
+            - `top_p`: An alternative to sampling with temperature, called nucleus sampling, where the model
+                considers the results of the tokens with top_p probability mass. For example, 0.1 means only the tokens
+                comprising the top 10% probability mass are considered.
+            - `n`: How many completions to generate for each prompt. For example, if the LLM gets 3 prompts and n is 2,
+                it will generate two completions for each of the three prompts, ending up with 6 completions in total.
+            - `stop`: One or more sequences after which the LLM should stop generating tokens.
+            - `presence_penalty`: What penalty to apply if a token is already present at all. Bigger values mean
+                the model will be less likely to repeat the same token in the text.
+            - `frequency_penalty`: What penalty to apply if a token has already been generated in the text.
+                Bigger values mean the model will be less likely to repeat the same token in the text.
+            - `logit_bias`: Add a logit bias to specific tokens. The keys of the dictionary are tokens, and the
+                values are the bias to add to that token.
+        :param timeout:
+            Timeout for OpenAI client calls. If not set, it defaults to either the
+            `OPENAI_TIMEOUT` environment variable, or 30 seconds.
+        :param max_retries:
+            Maximum number of retries to contact OpenAI after an internal error.
+            If not set, it defaults to either the `OPENAI_MAX_RETRIES` environment variable, or set to 5.
+        :param tools:
+            A list of tools for which the model can prepare calls.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+        """
+        self.api_key = api_key
+        self.model = model
+        self.generation_kwargs = generation_kwargs or {}
+        self.streaming_callback = streaming_callback
+        self.api_base_url = api_base_url
+        self.organization = organization
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.tools = tools
+        self.tools_strict = tools_strict
+
+        _check_duplicate_tool_names(tools)
+
+        if timeout is None:
+            timeout = float(os.environ.get("OPENAI_TIMEOUT", 30.0))
+        if max_retries is None:
+            max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", 5))
+
+        client_args: Dict[str, Any] = {
+            "api_key": api_key.resolve_value(),
+            "organization": organization,
+            "base_url": api_base_url,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+
+        self.client = OpenAI(**client_args)
+        self.async_client = AsyncOpenAI(**client_args)
+
+    def _get_telemetry_data(self) -> Dict[str, Any]:
+        """
+        Data that is sent to Posthog for usage analytics.
+        """
+        return {"model": self.model}
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize this component to a dictionary.
+
+        :returns:
+            The serialized component as a dictionary.
+        """
+        callback_name = serialize_callable(self.streaming_callback) if self.streaming_callback else None
+        return default_to_dict(
+            self,
+            model=self.model,
+            streaming_callback=callback_name,
+            api_base_url=self.api_base_url,
+            organization=self.organization,
+            generation_kwargs=self.generation_kwargs,
+            api_key=self.api_key.to_dict(),
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            tools=[tool.to_dict() for tool in self.tools] if self.tools else None,
+            tools_strict=self.tools_strict,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OpenAIChatGenerator":
+        """
+        Deserialize this component from a dictionary.
+
+        :param data: The dictionary representation of this component.
+        :returns:
+            The deserialized component instance.
+        """
+        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
+        deserialize_tools_inplace(data["init_parameters"], key="tools")
+        init_params = data.get("init_parameters", {})
+        serialized_callback_handler = init_params.get("streaming_callback")
+        if serialized_callback_handler:
+            data["init_parameters"]["streaming_callback"] = deserialize_callable(serialized_callback_handler)
+        return default_from_dict(cls, data)
+
+    @component.output_types(replies=List[ChatMessage])
+    def run(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ):
+        """
+        Invokes chat completion based on the provided messages and generation parameters.
+
+        :param messages:
+            A list of ChatMessage instances representing the input messages.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+        :param generation_kwargs:
+            Additional keyword arguments for text generation. These parameters will
+            override the parameters passed during component initialization.
+            For details on OpenAI API parameters, see [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat/create).
+        :param tools:
+            A list of tools for which the model can prepare calls. If set, it will override the `tools` parameter set
+            during component initialization.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+            If set, it will override the `tools_strict` parameter set during component initialization.
+
+        :returns:
+            A dictionary with the following key:
+            - `replies`: A list containing the generated responses as ChatMessage instances.
+        """
+        if len(messages) == 0:
+            return {"replies": []}
+
+        streaming_callback = streaming_callback or self.streaming_callback
+
+        api_args = self._prepare_api_call(
+            messages=messages,
+            streaming_callback=streaming_callback,
+            generation_kwargs=generation_kwargs,
+            tools=tools,
+            tools_strict=tools_strict,
+        )
+        chat_completion: Union[Stream[ChatCompletionChunk], ChatCompletion] = self.client.chat.completions.create(
+            **api_args
+        )
+
+        is_streaming = isinstance(chat_completion, Stream)
+        assert is_streaming or streaming_callback is None
+
+        if is_streaming:
+            completions = self._handle_stream_response(
+                chat_completion,  # type: ignore
+                streaming_callback,  # type: ignore
+            )
+        else:
+            assert isinstance(chat_completion, ChatCompletion), "Unexpected response type for non-streaming request."
+            completions = [
+                self._convert_chat_completion_to_chat_message(chat_completion, choice)
+                for choice in chat_completion.choices
+            ]
+
+        # before returning, do post-processing of the completions
+        for message in completions:
+            self._check_finish_reason(message.meta)
+
+        return {"replies": completions}
+
+    @component.output_types(replies=List[ChatMessage])
+    async def run_async(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ):
+        """
+        Asynchronously invokes chat completion based on the provided messages and generation parameters.
+
+        This is the asynchronous version of the `run` method. It has the same parameters and return values
+        but can be used with `await` in async code.
+
+        :param messages:
+            A list of ChatMessage instances representing the input messages.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+            Must be a coroutine.
+        :param generation_kwargs:
+            Additional keyword arguments for text generation. These parameters will
+            override the parameters passed during component initialization.
+            For details on OpenAI API parameters, see [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat/create).
+        :param tools:
+            A list of tools for which the model can prepare calls. If set, it will override the `tools` parameter set
+            during component initialization.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+            If set, it will override the `tools_strict` parameter set during component initialization.
+
+        :returns:
+            A dictionary with the following key:
+            - `replies`: A list containing the generated responses as ChatMessage instances.
+        """
+        # validate and select the streaming callback
+        streaming_callback = select_streaming_callback(self.streaming_callback, streaming_callback, requires_async=True)  # type: ignore
+
+        if len(messages) == 0:
+            return {"replies": []}
+
+        api_args = self._prepare_api_call(
+            messages=messages,
+            streaming_callback=streaming_callback,
+            generation_kwargs=generation_kwargs,
+            tools=tools,
+            tools_strict=tools_strict,
+        )
+
+        chat_completion: Union[
+            AsyncStream[ChatCompletionChunk], ChatCompletion
+        ] = await self.async_client.chat.completions.create(**api_args)
+
+        is_streaming = isinstance(chat_completion, AsyncStream)
+        assert is_streaming or streaming_callback is None
+
+        if is_streaming:
+            completions = await self._handle_async_stream_response(
+                chat_completion,  # type: ignore
+                streaming_callback,  # type: ignore
+            )
+        else:
+            assert isinstance(chat_completion, ChatCompletion), "Unexpected response type for non-streaming request."
+            completions = [
+                self._convert_chat_completion_to_chat_message(chat_completion, choice)
+                for choice in chat_completion.choices
+            ]
+
+        # before returning, do post-processing of the completions
+        for message in completions:
+            self._check_finish_reason(message.meta)
+
+        return {"replies": completions}
+
+    def _prepare_api_call(  # noqa: PLR0913
+        self,
+        *,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        # update generation kwargs by merging with the generation kwargs passed to the run method
+        generation_kwargs = {**self.generation_kwargs, **(generation_kwargs or {})}
+
+        # adapt ChatMessage(s) to the format expected by the OpenAI API
+        openai_formatted_messages = [message.to_openai_dict_format() for message in messages]
+
+        tools = tools or self.tools
+        tools_strict = tools_strict if tools_strict is not None else self.tools_strict
+        _check_duplicate_tool_names(tools)
+
+        openai_tools = {}
+        if tools:
+            openai_tools = {"tools": _convert_to_openai_tools(tools, bool(tools_strict))}
+
+        is_streaming = streaming_callback is not None
+        num_responses = generation_kwargs.pop("n", 1)
+        if is_streaming and num_responses > 1:
+            raise ValueError("Cannot stream multiple responses, please set n=1.")
+
+        return {
+            "model": self.model,
+            "messages": openai_formatted_messages,  # type: ignore[arg-type] # openai expects list of specific message types
+            "stream": streaming_callback is not None,
+            "n": num_responses,
+            **openai_tools,
+            **generation_kwargs,
+        }
+
+    def _handle_stream_response(self, chat_completion: Stream, callback: SyncStreamingCallbackT) -> List[ChatMessage]:
+        chunks: List[StreamingChunk] = []
+        chunk = None
+
+        for chunk in chat_completion:  # pylint: disable=not-an-iterable
+            assert len(chunk.choices) == 1, "Streaming responses should have only one choice."
+            chunk_delta: StreamingChunk = self._convert_chat_completion_chunk_to_streaming_chunk(chunk)
+            chunks.append(chunk_delta)
+
+            callback(chunk_delta)
+
+        return [self._convert_streaming_chunks_to_chat_message(chunk, chunks)]
+
+    async def _handle_async_stream_response(
+        self, chat_completion: AsyncStream, callback: AsyncStreamingCallbackT
+    ) -> List[ChatMessage]:
+        chunks: List[StreamingChunk] = []
+        chunk = None
+
+        async for chunk in chat_completion:  # pylint: disable=not-an-iterable
+            assert len(chunk.choices) == 1, "Streaming responses should have only one choice."
+            chunk_delta: StreamingChunk = self._convert_chat_completion_chunk_to_streaming_chunk(chunk)
+            chunks.append(chunk_delta)
+
+            await callback(chunk_delta)
+
+        return [self._convert_streaming_chunks_to_chat_message(chunk, chunks)]
+
+    def _check_finish_reason(self, meta: Dict[str, Any]) -> None:
+        if meta["finish_reason"] == "length":
+            logger.warning(
+                "The completion for index {index} has been truncated before reaching a natural stopping point. "
+                "Increase the max_tokens parameter to allow for longer completions.",
+                index=meta["index"],
+                finish_reason=meta["finish_reason"],
+            )
+        if meta["finish_reason"] == "content_filter":
+            logger.warning(
+                "The completion for index {index} has been truncated due to the content filter.",
+                index=meta["index"],
+                finish_reason=meta["finish_reason"],
+            )
+
+    def _convert_streaming_chunks_to_chat_message(
+        self, chunk: ChatCompletionChunk, chunks: List[StreamingChunk]
+    ) -> ChatMessage:
+        """
+        Connects the streaming chunks into a single ChatMessage.
+
+        :param chunk: The last chunk returned by the OpenAI API.
+        :param chunks: The list of all `StreamingChunk` objects.
+        """
+        text = "".join([chunk.content for chunk in chunks])
+        tool_calls = []
+
+        # Process tool calls if present in any chunk
+        tool_call_data: Dict[str, Dict[str, str]] = {}  # Track tool calls by index
+        for chunk_payload in chunks:
+            tool_calls_meta = chunk_payload.meta.get("tool_calls")
+            if tool_calls_meta is not None:
+                for delta in tool_calls_meta:
+                    # We use the index of the tool call to track it across chunks since the ID is not always provided
+                    if delta.index not in tool_call_data:
+                        tool_call_data[delta.index] = {"id": "", "name": "", "arguments": ""}
+
+                    # Save the ID if present
+                    if delta.id is not None:
+                        tool_call_data[delta.index]["id"] = delta.id
+
+                    if delta.function is not None:
+                        if delta.function.name is not None:
+                            tool_call_data[delta.index]["name"] += delta.function.name
+                        if delta.function.arguments is not None:
+                            tool_call_data[delta.index]["arguments"] += delta.function.arguments
+
+        # Convert accumulated tool call data into ToolCall objects
+        for call_data in tool_call_data.values():
+            try:
+                arguments = json.loads(call_data["arguments"])
+                tool_calls.append(ToolCall(id=call_data["id"], tool_name=call_data["name"], arguments=arguments))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "OpenAI returned a malformed JSON string for tool call arguments. This tool call "
+                    "will be skipped. To always generate a valid JSON, set `tools_strict` to `True`. "
+                    "Tool call ID: {_id}, Tool name: {_name}, Arguments: {_arguments}",
+                    _id=call_data["id"],
+                    _name=call_data["name"],
+                    _arguments=call_data["arguments"],
+                )
+
+        meta = {
+            "model": chunk.model,
+            "index": 0,
+            "finish_reason": chunk.choices[0].finish_reason,
+            "completion_start_time": chunks[0].meta.get("received_at"),  # first chunk received
+            "usage": {},  # we don't have usage data for streaming responses
+        }
+
+        return ChatMessage.from_assistant(text=text or None, tool_calls=tool_calls, meta=meta)
+
+    def _convert_chat_completion_to_chat_message(self, completion: ChatCompletion, choice: Choice) -> ChatMessage:
+        """
+        Converts the non-streaming response from the OpenAI API to a ChatMessage.
+
+        :param completion: The completion returned by the OpenAI API.
+        :param choice: The choice returned by the OpenAI API.
+        :return: The ChatMessage.
+        """
+        message: ChatCompletionMessage = choice.message
+        text = message.content
+        tool_calls = []
+        if openai_tool_calls := message.tool_calls:
+            for openai_tc in openai_tool_calls:
+                arguments_str = openai_tc.function.arguments
+                try:
+                    arguments = json.loads(arguments_str)
+                    tool_calls.append(ToolCall(id=openai_tc.id, tool_name=openai_tc.function.name, arguments=arguments))
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "OpenAI returned a malformed JSON string for tool call arguments. This tool call "
+                        "will be skipped. To always generate a valid JSON, set `tools_strict` to `True`. "
+                        "Tool call ID: {_id}, Tool name: {_name}, Arguments: {_arguments}",
+                        _id=openai_tc.id,
+                        _name=openai_tc.function.name,
+                        _arguments=arguments_str,
+                    )
+
+        chat_message = ChatMessage.from_assistant(text=text, tool_calls=tool_calls)
+        chat_message._meta.update(
+            {
+                "model": completion.model,
+                "index": choice.index,
+                "finish_reason": choice.finish_reason,
+                "usage": dict(completion.usage or {}),
+            }
+        )
+        return chat_message
+
+    def _convert_chat_completion_chunk_to_streaming_chunk(self, chunk: ChatCompletionChunk) -> StreamingChunk:
+        """
+        Converts the streaming response chunk from the OpenAI API to a StreamingChunk.
+
+        :param chunk: The chunk returned by the OpenAI API.
+
+        :returns:
+            The StreamingChunk.
+        """
+        # we stream the content of the chunk if it's not a tool or function call
+        choice: ChunkChoice = chunk.choices[0]
+        content = choice.delta.content or ""
+        chunk_message = StreamingChunk(content)
+        # but save the tool calls and function call in the meta if they are present
+        # and then connect the chunks in the _convert_streaming_chunks_to_chat_message method
+        chunk_message.meta.update(
+            {
+                "model": chunk.model,
+                "index": choice.index,
+                "tool_calls": choice.delta.tool_calls,
+                "finish_reason": choice.finish_reason,
+                "received_at": datetime.now().isoformat(),
+            }
+        )
+        return chunk_message
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-17 17:01:28
+Duration: 2111.55 seconds
+Verdict: ## Evaluation
+
+### 1. Diff review
+
+The change does three things:
+
+- Adds `import copy` and a new static helper `_set_additional_properties_false(schema)` that recursively walks a JSON schema and sets `additionalProperties: False` on every object node (top-level, nested `properties`, `items`, `$defs`/`definitions`, `anyOf/allOf/oneOf`).
+- Replaces the shallow `{**t.tool_spec, ...}` merge with `copy.deepcopy(t.tool_spec)` + explicit `function_spec["strict"] = True`, then applies the recursive helper to `function_spec["parameters"]`.
+- Adds a fallback empty object schema when `parameters` is missing/None.
+
+Intent-wise this is directionally right: the old code only set `additionalProperties: False` on the **top-level** `parameters` object, which is exactly the failure described in issue #8912 (OpenAI strict mode rejects nested objects/`$defs` lacking `additionalProperties: false`). The deep copy is also a genuine improvement — the previous shallow spread still mutated the user's `Tool.tool_spec["parameters"]` dict in place (`function_spec["parameters"]["additionalProperties"] = False`), leaking state back to the caller.
+
+### 2. Validation result → REJECT
+
+`validate_fixed_code` fails with:
+
+```
+REJECT the line ### haystack/components/generators/chat/openai.py appears 0 times, expected once
+```
+
+The fixed file drops the module header line that the original file carries, so the patched file no longer matches the expected file layout/format rules. That alone blocks acceptance.
+
+### 3. Test expectation cannot be satisfied by the fixed code
+
+Reading the reference test closely, it patches `haystack.components.generators.chat.openai.OpenAIChatGenerator._prepare_api_call` with a `side_effect`. Consequences:
+
+- The real `_prepare_api_call` — i.e. the *entire* body containing the new `_set_additional_properties_false` call and the `strict` flag — never executes, so the fix is never exercised.
+- The fake inspects `kwargs["tools"]`, but `run()` is called without `tools`, so `kwargs["tools"]` is `None` (the key is present with value `None`). Because the expression is `tools_payload[0].get(...) if tools_payload else {}`, it short-circuits to `{}`.
+- Therefore `has_additional_properties` is always `False`, so the `"fixed"` branch takes `exit(1)` ("FIX NOT CONFIRMED") regardless of how correct the implementation is. (Had a tool list actually been forwarded, the fake would hit `AttributeError` because `_prepare_api_call` receives `Tool`/`ComponentTool` objects, not OpenAI `{"type": "function", "function": {...}}` dicts.)
+
+So the supplied test cannot confirm the fix for this implementation: the schema is only built *inside* the mocked method.
+
+### 4. Minor functional concerns in the fix (secondary)
+
+- The recursion walks **all** dict values, including non-schema payloads such as `default`, `examples`, and `const`. A tool parameter whose default/example is a dict containing `"type": "object"` or a `"properties"` key would be silently rewritten to include `additionalProperties: False`, corrupting the default value sent to the API.
+- `get`-style verification was inconclusive via web lookup (`copy.deepcopy` / `Tool.tool_spec` returned generic hits), so I validated by inspection: `tool_spec` is a plain dict, so `copy.deepcopy` is appropriate and safe here.
+
+## Verdict
+
+**REJECT**
+
+Reasons:
+1. `validate_fixed_code` fails the format/structure requirement: the `### haystack/components/generators/chat/openai.py` header line present once in the original is missing in the fixed code.
+2. The provided test cannot confirm this fix — because `_prepare_api_call` is fully mocked, the newly added schema-strictness logic and `strict` flag are never executed, and the mocked `kwargs["tools"]` is `None`, so the fixed branch always reports "FIX NOT CONFIRMED" (exit 1). The fixed code therefore does not satisfy the stated test expectation.
+3. Secondary robustness defect: the recursive schema walker also descends into non-schema values (`default`, `examples`, `const`), risking corruption of literal data in tool schemas; it should restrict recursion to known schema keywords (`properties`, `items`, `$defs`, `definitions`, `anyOf`/`oneOf`/`allOf`, `prefixItems`, etc.).
+--------------------------------------------------------------------------------
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import copy
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
+
+from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
+from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+
+from haystack import component, default_from_dict, default_to_dict, logging
+from haystack.dataclasses import (
+    AsyncStreamingCallbackT,
+    ChatMessage,
+    StreamingCallbackT,
+    StreamingChunk,
+    SyncStreamingCallbackT,
+    ToolCall,
+    select_streaming_callback,
+)
+from haystack.tools.tool import Tool, _check_duplicate_tool_names, deserialize_tools_inplace
+from haystack.utils import Secret, deserialize_callable, deserialize_secrets_inplace, serialize_callable
+
+logger = logging.getLogger(__name__)
+
+
+@component
+class OpenAIChatGenerator:
+    """
+    Completes chats using OpenAI's large language models (LLMs).
+
+    It works with the gpt-4 and gpt-3.5-turbo models and supports streaming responses
+    from OpenAI API. It uses [ChatMessage](https://docs.haystack.deepset.ai/docs/chatmessage)
+    format in input and output.
+
+    You can customize how the text is generated by passing parameters to the
+    OpenAI API. Use the `**generation_kwargs` argument when you initialize
+    the component or when you run it. Any parameter that works with
+    `openai.ChatCompletion.create` will work here too.
+
+    For details on OpenAI API parameters, see
+    [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat).
+
+    ### Usage example
+
+    ```python
+    from haystack.components.generators.chat import OpenAIChatGenerator
+    from haystack.dataclasses import ChatMessage
+
+    messages = [ChatMessage.from_user("What's Natural Language Processing?")]
+
+    client = OpenAIChatGenerator()
+    response = client.run(messages)
+    print(response)
+    ```
+    Output:
+    ```
+    {'replies':
+        [ChatMessage(content='Natural Language Processing (NLP) is a branch of artificial intelligence
+            that focuses on enabling computers to understand, interpret, and generate human language in
+            a way that is meaningful and useful.',
+         role=<ChatRole.ASSISTANT: 'assistant'>, name=None,
+         meta={'model': 'gpt-4o-mini', 'index': 0, 'finish_reason': 'stop',
+         'usage': {'prompt_tokens': 15, 'completion_tokens': 36, 'total_tokens': 51}})
+        ]
+    }
+    ```
+    """
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self,
+        api_key: Secret = Secret.from_env_var("OPENAI_API_KEY"),
+        model: str = "gpt-4o-mini",
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        api_base_url: Optional[str] = None,
+        organization: Optional[str] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: bool = False,
+    ):
+        """
+        Creates an instance of OpenAIChatGenerator. Unless specified otherwise in `model`, uses OpenAI's gpt-4o-mini
+
+        Before initializing the component, you can set the 'OPENAI_TIMEOUT' and 'OPENAI_MAX_RETRIES'
+        environment variables to override the `timeout` and `max_retries` parameters respectively
+        in the OpenAI client.
+
+        :param api_key: The OpenAI API key.
+            You can set it with an environment variable `OPENAI_API_KEY`, or pass with this parameter
+            during initialization.
+        :param model: The name of the model to use.
+        :param streaming_callback: A callback function that is called when a new token is received from the stream.
+            The callback function accepts [StreamingChunk](https://docs.haystack.deepset.ai/docs/data-classes#streamingchunk)
+            as an argument.
+        :param api_base_url: An optional base URL.
+        :param organization: Your organization ID, defaults to `None`. See
+        [production best practices](https://platform.openai.com/docs/guides/production-best-practices/setting-up-your-organization).
+        :param generation_kwargs: Other parameters to use for the model. These parameters are sent directly to
+            the OpenAI endpoint. See OpenAI [documentation](https://platform.openai.com/docs/api-reference/chat) for
+            more details.
+            Some of the supported parameters:
+            - `max_tokens`: The maximum number of tokens the output text can have.
+            - `temperature`: What sampling temperature to use. Higher values mean the model will take more risks.
+                Try 0.9 for more creative applications and 0 (argmax sampling) for ones with a well-defined answer.
+            - `top_p`: An alternative to sampling with temperature, called nucleus sampling, where the model
+                considers the results of the tokens with top_p probability mass. For example, 0.1 means only the tokens
+                comprising the top 10% probability mass are considered.
+            - `n`: How many completions to generate for each prompt. For example, if the LLM gets 3 prompts and n is 2,
+                it will generate two completions for each of the three prompts, ending up with 6 completions in total.
+            - `stop`: One or more sequences after which the LLM should stop generating tokens.
+            - `presence_penalty`: What penalty to apply if a token is already present at all. Bigger values mean
+                the model will be less likely to repeat the same token in the text.
+            - `frequency_penalty`: What penalty to apply if a token has already been generated in the text.
+                Bigger values mean the model will be less likely to repeat the same token in the text.
+            - `logit_bias`: Add a logit bias to specific tokens. The keys of the dictionary are tokens, and the
+                values are the bias to add to that token.
+        :param timeout:
+            Timeout for OpenAI client calls. If not set, it defaults to either the
+            `OPENAI_TIMEOUT` environment variable, or 30 seconds.
+        :param max_retries:
+            Maximum number of retries to contact OpenAI after an internal error.
+            If not set, it defaults to either the `OPENAI_MAX_RETRIES` environment variable, or set to 5.
+        :param tools:
+            A list of tools for which the model can prepare calls.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+        """
+        self.api_key = api_key
+        self.model = model
+        self.generation_kwargs = generation_kwargs or {}
+        self.streaming_callback = streaming_callback
+        self.api_base_url = api_base_url
+        self.organization = organization
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.tools = tools
+        self.tools_strict = tools_strict
+
+        _check_duplicate_tool_names(tools)
+
+        if timeout is None:
+            timeout = float(os.environ.get("OPENAI_TIMEOUT", 30.0))
+        if max_retries is None:
+            max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", 5))
+
+        client_args: Dict[str, Any] = {
+            "api_key": api_key.resolve_value(),
+            "organization": organization,
+            "base_url": api_base_url,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+
+        self.client = OpenAI(**client_args)
+        self.async_client = AsyncOpenAI(**client_args)
+
+    def _get_telemetry_data(self) -> Dict[str, Any]:
+        """
+        Data that is sent to Posthog for usage analytics.
+        """
+        return {"model": self.model}
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize this component to a dictionary.
+
+        :returns:
+            The serialized component as a dictionary.
+        """
+        callback_name = serialize_callable(self.streaming_callback) if self.streaming_callback else None
+        return default_to_dict(
+            self,
+            model=self.model,
+            streaming_callback=callback_name,
+            api_base_url=self.api_base_url,
+            organization=self.organization,
+            generation_kwargs=self.generation_kwargs,
+            api_key=self.api_key.to_dict(),
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            tools=[tool.to_dict() for tool in self.tools] if self.tools else None,
+            tools_strict=self.tools_strict,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OpenAIChatGenerator":
+        """
+        Deserialize this component from a dictionary.
+
+        :param data: The dictionary representation of this component.
+        :returns:
+            The deserialized component instance.
+        """
+        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
+        deserialize_tools_inplace(data["init_parameters"], key="tools")
+        init_params = data.get("init_parameters", {})
+        serialized_callback_handler = init_params.get("streaming_callback")
+        if serialized_callback_handler:
+            data["init_parameters"]["streaming_callback"] = deserialize_callable(serialized_callback_handler)
+        return default_from_dict(cls, data)
+
+    @component.output_types(replies=List[ChatMessage])
+    def run(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ):
+        """
+        Invokes chat completion based on the provided messages and generation parameters.
+
+        :param messages:
+            A list of ChatMessage instances representing the input messages.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+        :param generation_kwargs:
+            Additional keyword arguments for text generation. These parameters will
+            override the parameters passed during component initialization.
+            For details on OpenAI API parameters, see [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat/create).
+        :param tools:
+            A list of tools for which the model can prepare calls. If set, it will override the `tools` parameter set
+            during component initialization.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+            If set, it will override the `tools_strict` parameter set during component initialization.
+
+        :returns:
+            A dictionary with the following key:
+            - `replies`: A list containing the generated responses as ChatMessage instances.
+        """
+        if len(messages) == 0:
+            return {"replies": []}
+
+        streaming_callback = streaming_callback or self.streaming_callback
+
+        api_args = self._prepare_api_call(
+            messages=messages,
+            streaming_callback=streaming_callback,
+            generation_kwargs=generation_kwargs,
+            tools=tools,
+            tools_strict=tools_strict,
+        )
+        chat_completion: Union[Stream[ChatCompletionChunk], ChatCompletion] = self.client.chat.completions.create(
+            **api_args
+        )
+
+        is_streaming = isinstance(chat_completion, Stream)
+        assert is_streaming or streaming_callback is None
+
+        if is_streaming:
+            completions = self._handle_stream_response(
+                chat_completion,  # type: ignore
+                streaming_callback,  # type: ignore
+            )
+        else:
+            assert isinstance(chat_completion, ChatCompletion), "Unexpected response type for non-streaming request."
+            completions = [
+                self._convert_chat_completion_to_chat_message(chat_completion, choice)
+                for choice in chat_completion.choices
+            ]
+
+        # before returning, do post-processing of the completions
+        for message in completions:
+            self._check_finish_reason(message.meta)
+
+        return {"replies": completions}
+
+    @component.output_types(replies=List[ChatMessage])
+    async def run_async(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ):
+        """
+        Asynchronously invokes chat completion based on the provided messages and generation parameters.
+
+        This is the asynchronous version of the `run` method. It has the same parameters and return values
+        but can be used with `await` in async code.
+
+        :param messages:
+            A list of ChatMessage instances representing the input messages.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+            Must be a coroutine.
+        :param generation_kwargs:
+            Additional keyword arguments for text generation. These parameters will
+            override the parameters passed during component initialization.
+            For details on OpenAI API parameters, see [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat/create).
+        :param tools:
+            A list of tools for which the model can prepare calls. If set, it will override the `tools` parameter set
+            during component initialization.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+            If set, it will override the `tools_strict` parameter set during component initialization.
+
+        :returns:
+            A dictionary with the following key:
+            - `replies`: A list containing the generated responses as ChatMessage instances.
+        """
+        # validate and select the streaming callback
+        streaming_callback = select_streaming_callback(self.streaming_callback, streaming_callback, requires_async=True)  # type: ignore
+
+        if len(messages) == 0:
+            return {"replies": []}
+
+        api_args = self._prepare_api_call(
+            messages=messages,
+            streaming_callback=streaming_callback,
+            generation_kwargs=generation_kwargs,
+            tools=tools,
+            tools_strict=tools_strict,
+        )
+
+        chat_completion: Union[
+            AsyncStream[ChatCompletionChunk], ChatCompletion
+        ] = await self.async_client.chat.completions.create(**api_args)
+
+        is_streaming = isinstance(chat_completion, AsyncStream)
+        assert is_streaming or streaming_callback is None
+
+        if is_streaming:
+            completions = await self._handle_async_stream_response(
+                chat_completion,  # type: ignore
+                streaming_callback,  # type: ignore
+            )
+        else:
+            assert isinstance(chat_completion, ChatCompletion), "Unexpected response type for non-streaming request."
+            completions = [
+                self._convert_chat_completion_to_chat_message(chat_completion, choice)
+                for choice in chat_completion.choices
+            ]
+
+        # before returning, do post-processing of the completions
+        for message in completions:
+            self._check_finish_reason(message.meta)
+
+        return {"replies": completions}
+
+    @staticmethod
+    def _set_additional_properties_false(schema: Any) -> None:
+        """
+        Recursively set `additionalProperties` to `False` in every object of a JSON schema.
+
+        OpenAI's strict mode requires `additionalProperties` to be explicitly set to `False` for every
+        object in the schema, including nested objects, objects defined in `$defs`/`definitions` and
+        objects used as array `items`. Otherwise the request is rejected with an error such as:
+        "Invalid schema for function ...: 'additionalProperties' is required to be supplied and to be false".
+
+        The schema is modified in place, so callers should pass a copy of the original schema.
+
+        :param schema: The JSON schema (or a part of it) to update.
+        """
+        if isinstance(schema, dict):
+            schema_type = schema.get("type")
+            is_object_schema = (
+                schema_type == "object"
+                or (isinstance(schema_type, list) and "object" in schema_type)
+                or "properties" in schema
+            )
+            if is_object_schema:
+                schema["additionalProperties"] = False
+
+            # recurse into all the sub-schemas (properties, $defs, items, anyOf/allOf/oneOf, ...)
+            for value in list(schema.values()):
+                OpenAIChatGenerator._set_additional_properties_false(value)
+        elif isinstance(schema, (list, tuple)):
+            for item in schema:
+                OpenAIChatGenerator._set_additional_properties_false(item)
+
+    def _prepare_api_call(  # noqa: PLR0913
+        self,
+        *,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        # update generation kwargs by merging with the generation kwargs passed to the run method
+        generation_kwargs = {**self.generation_kwargs, **(generation_kwargs or {})}
+
+        # adapt ChatMessage(s) to the format expected by the OpenAI API
+        openai_formatted_messages = [message.to_openai_dict_format() for message in messages]
+
+        tools = tools or self.tools
+        tools_strict = tools_strict if tools_strict is not None else self.tools_strict
+        _check_duplicate_tool_names(tools)
+
+        openai_tools = {}
+        if tools:
+            tool_definitions = []
+            for t in tools:
+                # work on a deep copy so that the Tool instance (and its schema) owned by the user is never mutated
+                function_spec = copy.deepcopy(t.tool_spec)
+                if tools_strict:
+                    function_spec["strict"] = True
+                    if "parameters" not in function_spec or function_spec["parameters"] is None:
+                        function_spec["parameters"] = {"type": "object", "properties": {}}
+                    # OpenAI strict mode requires `additionalProperties: false` on every object of the schema
+                    self._set_additional_properties_false(function_spec["parameters"])
+                tool_definitions.append({"type": "function", "function": function_spec})
+            openai_tools = {"tools": tool_definitions}
+
+        is_streaming = streaming_callback is not None
+        num_responses = generation_kwargs.pop("n", 1)
+        if is_streaming and num_responses > 1:
+            raise ValueError("Cannot stream multiple responses, please set n=1.")
+
+        return {
+            "model": self.model,
+            "messages": openai_formatted_messages,  # type: ignore[arg-type] # openai expects list of specific message types
+            "stream": streaming_callback is not None,
+            "n": num_responses,
+            **openai_tools,
+            **generation_kwargs,
+        }
+
+    def _handle_stream_response(self, chat_completion: Stream, callback: SyncStreamingCallbackT) -> List[ChatMessage]:
+        chunks: List[StreamingChunk] = []
+        chunk = None
+
+        for chunk in chat_completion:  # pylint: disable=not-an-iterable
+            assert len(chunk.choices) == 1, "Streaming responses should have only one choice."
+            chunk_delta: StreamingChunk = self._convert_chat_completion_chunk_to_streaming_chunk(chunk)
+            chunks.append(chunk_delta)
+
+            callback(chunk_delta)
+
+        return [self._convert_streaming_chunks_to_chat_message(chunk, chunks)]
+
+    async def _handle_async_stream_response(
+        self, chat_completion: AsyncStream, callback: AsyncStreamingCallbackT
+    ) -> List[ChatMessage]:
+        chunks: List[StreamingChunk] = []
+        chunk = None
+
+        async for chunk in chat_completion:  # pylint: disable=not-an-iterable
+            assert len(chunk.choices) == 1, "Streaming responses should have only one choice."
+            chunk_delta: StreamingChunk = self._convert_chat_completion_chunk_to_streaming_chunk(chunk)
+            chunks.append(chunk_delta)
+
+            await callback(chunk_delta)
+
+        return [self._convert_streaming_chunks_to_chat_message(chunk, chunks)]
+
+    def _check_finish_reason(self, meta: Dict[str, Any]) -> None:
+        if meta["finish_reason"] == "length":
+            logger.warning(
+                "The completion for index {index} has been truncated before reaching a natural stopping point. "
+                "Increase the max_tokens parameter to allow for longer completions.",
+                index=meta["index"],
+                finish_reason=meta["finish_reason"],
+            )
+        if meta["finish_reason"] == "content_filter":
+            logger.warning(
+                "The completion for index {index} has been truncated due to the content filter.",
+                index=meta["index"],
+                finish_reason=meta["finish_reason"],
+            )
+
+    def _convert_streaming_chunks_to_chat_message(
+        self, chunk: ChatCompletionChunk, chunks: List[StreamingChunk]
+    ) -> ChatMessage:
+        """
+        Connects the streaming chunks into a single ChatMessage.
+
+        :param chunk: The last chunk returned by the OpenAI API.
+        :param chunks: The list of all `StreamingChunk` objects.
+        """
+        text = "".join([chunk.content for chunk in chunks])
+        tool_calls = []
+
+        # Process tool calls if present in any chunk
+        tool_call_data: Dict[str, Dict[str, str]] = {}  # Track tool calls by index
+        for chunk_payload in chunks:
+            tool_calls_meta = chunk_payload.meta.get("tool_calls")
+            if tool_calls_meta is not None:
+                for delta in tool_calls_meta:
+                    # We use the index of the tool call to track it across chunks since the ID is not always provided
+                    if delta.index not in tool_call_data:
+                        tool_call_data[delta.index] = {"id": "", "name": "", "arguments": ""}
+
+                    # Save the ID if present
+                    if delta.id is not None:
+                        tool_call_data[delta.index]["id"] = delta.id
+
+                    if delta.function is not None:
+                        if delta.function.name is not None:
+                            tool_call_data[delta.index]["name"] += delta.function.name
+                        if delta.function.arguments is not None:
+                            tool_call_data[delta.index]["arguments"] += delta.function.arguments
+
+        # Convert accumulated tool call data into ToolCall objects
+        for call_data in tool_call_data.values():
+            try:
+                arguments = json.loads(call_data["arguments"])
+                tool_calls.append(ToolCall(id=call_data["id"], tool_name=call_data["name"], arguments=arguments))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "OpenAI returned a malformed JSON string for tool call arguments. This tool call "
+                    "will be skipped. To always generate a valid JSON, set `tools_strict` to `True`. "
+                    "Tool call ID: {_id}, Tool name: {_name}, Arguments: {_arguments}",
+                    _id=call_data["id"],
+                    _name=call_data["name"],
+                    _arguments=call_data["arguments"],
+                )
+
+        meta = {
+            "model": chunk.model,
+            "index": 0,
+            "finish_reason": chunk.choices[0].finish_reason,
+            "completion_start_time": chunks[0].meta.get("received_at"),  # first chunk received
+            "usage": {},  # we don't have usage data for streaming responses
+        }
+
+        return ChatMessage.from_assistant(text=text or None, tool_calls=tool_calls, meta=meta)
+
+    def _convert_chat_completion_to_chat_message(self, completion: ChatCompletion, choice: Choice) -> ChatMessage:
+        """
+        Converts the non-streaming response from the OpenAI API to a ChatMessage.
+
+        :param completion: The completion returned by the OpenAI API.
+        :param choice: The choice returned by the OpenAI API.
+        :return: The ChatMessage.
+        """
+        message: ChatCompletionMessage = choice.message
+        text = message.content
+        tool_calls = []
+        if openai_tool_calls := message.tool_calls:
+            for openai_tc in openai_tool_calls:
+                arguments_str = openai_tc.function.arguments
+                try:
+                    arguments = json.loads(arguments_str)
+                    tool_calls.append(ToolCall(id=openai_tc.id, tool_name=openai_tc.function.name, arguments=arguments))
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "OpenAI returned a malformed JSON string for tool call arguments. This tool call "
+                        "will be skipped. To always generate a valid JSON, set `tools_strict` to `True`. "
+                        "Tool call ID: {_id}, Tool name: {_name}, Arguments: {_arguments}",
+                        _id=openai_tc.id,
+                        _name=openai_tc.function.name,
+                        _arguments=arguments_str,
+                    )
+
+        chat_message = ChatMessage.from_assistant(text=text, tool_calls=tool_calls)
+        chat_message._meta.update(
+            {
+                "model": completion.model,
+                "index": choice.index,
+                "finish_reason": choice.finish_reason,
+                "usage": dict(completion.usage or {}),
+            }
+        )
+        return chat_message
+
+    def _convert_chat_completion_chunk_to_streaming_chunk(self, chunk: ChatCompletionChunk) -> StreamingChunk:
+        """
+        Converts the streaming response chunk from the OpenAI API to a StreamingChunk.
+
+        :param chunk: The chunk returned by the OpenAI API.
+
+        :returns:
+            The StreamingChunk.
+        """
+        # we stream the content of the chunk if it's not a tool or function call
+        choice: ChunkChoice = chunk.choices[0]
+        content = choice.delta.content or ""
+        chunk_message = StreamingChunk(content)
+        # but save the tool calls and function call in the meta if they are present
+        # and then connect the chunks in the _convert_streaming_chunks_to_chat_message method
+        chunk_message.meta.update(
+            {
+                "model": chunk.model,
+                "index": choice.index,
+                "tool_calls": choice.delta.tool_calls,
+                "finish_reason": choice.finish_reason,
+                "received_at": datetime.now().isoformat(),
+            }
+        )
+        return chunk_message
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-17 17:24:35
+Duration: 1387.24 seconds
+Verdict: ## Evaluation Summary
+
+**1. Diff analysis**
+
+The fix replaces the one-line mutation:
+
+```python
+function_spec["parameters"]["additionalProperties"] = False
+```
+
+with a recursive `_convert_schema_to_strict(...)` helper that:
+- Walks `properties`, `$defs`, `definitions`, `patternProperties` (sub-schema maps), `anyOf/oneOf/allOf/prefixItems` (lists), and `items/additionalProperties/not/if/then/else/...` (single schemas).
+- Sets `additionalProperties: False` on every dict that is an object (`type == "object"` or has `properties`).
+- Sets `required` to all property names of every object.
+- Builds a new dict instead of mutating `t.tool_spec["parameters"]` (a genuine side-effect bug in the original: `{**t.tool_spec}` is a shallow copy, so the old code mutated the shared parameters dict of the `Tool`/`ComponentTool`).
+
+Semantically this is well aligned with OpenAI strict-mode requirements (`additionalProperties: false` on *every* nested object, all properties listed in `required`), which is exactly what issue #8912 (ComponentTool schemas rejected with "additionalProperties is not false" / "required" errors) demands. The recursion buckets, copy-on-write behavior, and the `get("parameters") or {}` guard are all sound, and `tool_spec` does expose `{"name", "description", "parameters"}`, so the lookup is valid.
+
+**2. Validation result — blocking failure**
+
+`validate_fixed_code` returns:
+
+> REJECT — the line `### haystack/components/generators/chat/openai.py` appears 0 times, expected once
+
+The diff confirms the fixed file drops the file-path header line (and the trailing blank lines). This is a structural/output-format rule violation: the fixed source no longer carries the expected module header that the harness requires exactly once.
+
+**3. Test-compatibility concern**
+
+The supplied test cannot confirm the fix as written: it monkeypatches `OpenAIChatGenerator._prepare_api_call` itself, so the real schema-building code (the thing that was fixed) never executes. Additionally, inside the fake it does `tools_payload = kwargs.get("tools", [])` and `tools_payload[0].get("function", {})`, but `run()` passes `tools=[search_tool]` — a list of `Tool`/`ComponentTool` dataclass instances, not serialized dicts. `ComponentTool` has no `.get` method, so an `AttributeError` is raised and the `except Exception` branch returns exit code `2` for **both** the buggy and the fixed versions. The fix therefore cannot be shown to satisfy the test expectations, regardless of its (reasonable) logic.
+
+**4. API verification**
+
+The documentation lookups for `openai.chat.completions.create` and `haystack.tools.Tool.tool_spec` returned only generic, non-relevant web results, so they provided no additional confirmation either way; the assessment above is based on direct code inspection.
+
+## Verdict
+
+**REJECT**
+
+Reasons: (a) the fixed code fails structural validation — the required `### haystack/components/generators/chat/openai.py` header is missing (and trailing lines were altered); (b) the provided test cannot validate the change because it stubs out `_prepare_api_call` before the fixed conversion runs and inspects `tools` as dicts although `Tool` objects are passed, producing exit code 2 in all cases. The underlying recursive strict-schema transformation is a plausible and arguably correct remedy for the bug, but the deliverable does not satisfy the format rules nor demonstrate passing test behavior.
+--------------------------------------------------------------------------------
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
+
+from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
+from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+
+from haystack import component, default_from_dict, default_to_dict, logging
+from haystack.dataclasses import (
+    AsyncStreamingCallbackT,
+    ChatMessage,
+    StreamingCallbackT,
+    StreamingChunk,
+    SyncStreamingCallbackT,
+    ToolCall,
+    select_streaming_callback,
+)
+from haystack.tools.tool import Tool, _check_duplicate_tool_names, deserialize_tools_inplace
+from haystack.utils import Secret, deserialize_callable, deserialize_secrets_inplace, serialize_callable
+
+logger = logging.getLogger(__name__)
+
+# JSON schema keywords whose value is a mapping of names to sub-schemas.
+_SCHEMA_MAP_KEYWORDS = ("properties", "$defs", "definitions", "patternProperties")
+# JSON schema keywords whose value is a list of sub-schemas.
+_SCHEMA_LIST_KEYWORDS = ("anyOf", "oneOf", "allOf", "prefixItems")
+# JSON schema keywords whose value is a single sub-schema.
+_SCHEMA_SINGLE_KEYWORDS = (
+    "items",
+    "additionalProperties",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "propertyNames",
+)
+
+
+def _convert_schema_to_strict(schema: Any) -> Any:
+    """
+    Return a copy of a JSON schema that complies with the requirements of OpenAI's strict mode.
+
+    OpenAI's strict mode requires that every object of a JSON schema explicitly sets
+    `additionalProperties` to `False` and lists all of its properties in `required`.
+    Since these constraints apply to nested objects as well (for example objects defined
+    in `$defs` or objects contained in the `items` of an array), the schema is traversed
+    recursively.
+
+    The schema passed as input is not modified, a new schema is returned instead.
+
+    :param schema: The JSON schema to convert.
+    :returns:
+        A new JSON schema that can be sent to OpenAI when strict mode is enabled.
+    """
+    if isinstance(schema, list):
+        return [_convert_schema_to_strict(item) for item in schema]
+
+    if not isinstance(schema, dict):
+        return schema
+
+    strict_schema: Dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            strict_schema[key] = {name: _convert_schema_to_strict(sub_schema) for name, sub_schema in value.items()}
+        elif key in _SCHEMA_LIST_KEYWORDS and isinstance(value, list):
+            strict_schema[key] = [_convert_schema_to_strict(sub_schema) for sub_schema in value]
+        elif key in _SCHEMA_SINGLE_KEYWORDS and isinstance(value, dict):
+            strict_schema[key] = _convert_schema_to_strict(value)
+        else:
+            strict_schema[key] = value
+
+    properties = strict_schema.get("properties")
+    is_object = strict_schema.get("type") == "object" or isinstance(properties, dict)
+
+    if is_object:
+        # OpenAI's strict mode requires objects to explicitly disallow additional properties...
+        strict_schema["additionalProperties"] = False
+        if isinstance(properties, dict):
+            # ...and to list all of their properties as required.
+            strict_schema["required"] = list(properties.keys())
+
+    return strict_schema
+
+
+@component
+class OpenAIChatGenerator:
+    """
+    Completes chats using OpenAI's large language models (LLMs).
+
+    It works with the gpt-4 and gpt-3.5-turbo models and supports streaming responses
+    from OpenAI API. It uses [ChatMessage](https://docs.haystack.deepset.ai/docs/chatmessage)
+    format in input and output.
+
+    You can customize how the text is generated by passing parameters to the
+    OpenAI API. Use the `**generation_kwargs` argument when you initialize
+    the component or when you run it. Any parameter that works with
+    `openai.ChatCompletion.create` will work here too.
+
+    For details on OpenAI API parameters, see
+    [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat).
+
+    ### Usage example
+
+    ```python
+    from haystack.components.generators.chat import OpenAIChatGenerator
+    from haystack.dataclasses import ChatMessage
+
+    messages = [ChatMessage.from_user("What's Natural Language Processing?")]
+
+    client = OpenAIChatGenerator()
+    response = client.run(messages)
+    print(response)
+    ```
+    Output:
+    ```
+    {'replies':
+        [ChatMessage(content='Natural Language Processing (NLP) is a branch of artificial intelligence
+            that focuses on enabling computers to understand, interpret, and generate human language in
+            a way that is meaningful and useful.',
+         role=<ChatRole.ASSISTANT: 'assistant'>, name=None,
+         meta={'model': 'gpt-4o-mini', 'index': 0, 'finish_reason': 'stop',
+         'usage': {'prompt_tokens': 15, 'completion_tokens': 36, 'total_tokens': 51}})
+        ]
+    }
+    ```
+    """
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self,
+        api_key: Secret = Secret.from_env_var("OPENAI_API_KEY"),
+        model: str = "gpt-4o-mini",
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        api_base_url: Optional[str] = None,
+        organization: Optional[str] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: bool = False,
+    ):
+        """
+        Creates an instance of OpenAIChatGenerator. Unless specified otherwise in `model`, uses OpenAI's gpt-4o-mini
+
+        Before initializing the component, you can set the 'OPENAI_TIMEOUT' and 'OPENAI_MAX_RETRIES'
+        environment variables to override the `timeout` and `max_retries` parameters respectively
+        in the OpenAI client.
+
+        :param api_key: The OpenAI API key.
+            You can set it with an environment variable `OPENAI_API_KEY`, or pass with this parameter
+            during initialization.
+        :param model: The name of the model to use.
+        :param streaming_callback: A callback function that is called when a new token is received from the stream.
+            The callback function accepts [StreamingChunk](https://docs.haystack.deepset.ai/docs/data-classes#streamingchunk)
+            as an argument.
+        :param api_base_url: An optional base URL.
+        :param organization: Your organization ID, defaults to `None`. See
+        [production best practices](https://platform.openai.com/docs/guides/production-best-practices/setting-up-your-organization).
+        :param generation_kwargs: Other parameters to use for the model. These parameters are sent directly to
+            the OpenAI endpoint. See OpenAI [documentation](https://platform.openai.com/docs/api-reference/chat) for
+            more details.
+            Some of the supported parameters:
+            - `max_tokens`: The maximum number of tokens the output text can have.
+            - `temperature`: What sampling temperature to use. Higher values mean the model will take more risks.
+                Try 0.9 for more creative applications and 0 (argmax sampling) for ones with a well-defined answer.
+            - `top_p`: An alternative to sampling with temperature, called nucleus sampling, where the model
+                considers the results of the tokens with top_p probability mass. For example, 0.1 means only the tokens
+                comprising the top 10% probability mass are considered.
+            - `n`: How many completions to generate for each prompt. For example, if the LLM gets 3 prompts and n is 2,
+                it will generate two completions for each of the three prompts, ending up with 6 completions in total.
+            - `stop`: One or more sequences after which the LLM should stop generating tokens.
+            - `presence_penalty`: What penalty to apply if a token is already present at all. Bigger values mean
+                the model will be less likely to repeat the same token in the text.
+            - `frequency_penalty`: What penalty to apply if a token has already been generated in the text.
+                Bigger values mean the model will be less likely to repeat the same token in the text.
+            - `logit_bias`: Add a logit bias to specific tokens. The keys of the dictionary are tokens, and the
+                values are the bias to add to that token.
+        :param timeout:
+            Timeout for OpenAI client calls. If not set, it defaults to either the
+            `OPENAI_TIMEOUT` environment variable, or 30 seconds.
+        :param max_retries:
+            Maximum number of retries to contact OpenAI after an internal error.
+            If not set, it defaults to either the `OPENAI_MAX_RETRIES` environment variable, or set to 5.
+        :param tools:
+            A list of tools for which the model can prepare calls.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+        """
+        self.api_key = api_key
+        self.model = model
+        self.generation_kwargs = generation_kwargs or {}
+        self.streaming_callback = streaming_callback
+        self.api_base_url = api_base_url
+        self.organization = organization
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.tools = tools
+        self.tools_strict = tools_strict
+
+        _check_duplicate_tool_names(tools)
+
+        if timeout is None:
+            timeout = float(os.environ.get("OPENAI_TIMEOUT", 30.0))
+        if max_retries is None:
+            max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", 5))
+
+        client_args: Dict[str, Any] = {
+            "api_key": api_key.resolve_value(),
+            "organization": organization,
+            "base_url": api_base_url,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+
+        self.client = OpenAI(**client_args)
+        self.async_client = AsyncOpenAI(**client_args)
+
+    def _get_telemetry_data(self) -> Dict[str, Any]:
+        """
+        Data that is sent to Posthog for usage analytics.
+        """
+        return {"model": self.model}
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize this component to a dictionary.
+
+        :returns:
+            The serialized component as a dictionary.
+        """
+        callback_name = serialize_callable(self.streaming_callback) if self.streaming_callback else None
+        return default_to_dict(
+            self,
+            model=self.model,
+            streaming_callback=callback_name,
+            api_base_url=self.api_base_url,
+            organization=self.organization,
+            generation_kwargs=self.generation_kwargs,
+            api_key=self.api_key.to_dict(),
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            tools=[tool.to_dict() for tool in self.tools] if self.tools else None,
+            tools_strict=self.tools_strict,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OpenAIChatGenerator":
+        """
+        Deserialize this component from a dictionary.
+
+        :param data: The dictionary representation of this component.
+        :returns:
+            The deserialized component instance.
+        """
+        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
+        deserialize_tools_inplace(data["init_parameters"], key="tools")
+        init_params = data.get("init_parameters", {})
+        serialized_callback_handler = init_params.get("streaming_callback")
+        if serialized_callback_handler:
+            data["init_parameters"]["streaming_callback"] = deserialize_callable(serialized_callback_handler)
+        return default_from_dict(cls, data)
+
+    @component.output_types(replies=List[ChatMessage])
+    def run(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ):
+        """
+        Invokes chat completion based on the provided messages and generation parameters.
+
+        :param messages:
+            A list of ChatMessage instances representing the input messages.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+        :param generation_kwargs:
+            Additional keyword arguments for text generation. These parameters will
+            override the parameters passed during component initialization.
+            For details on OpenAI API parameters, see [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat/create).
+        :param tools:
+            A list of tools for which the model can prepare calls. If set, it will override the `tools` parameter set
+            during component initialization.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+            If set, it will override the `tools_strict` parameter set during component initialization.
+
+        :returns:
+            A dictionary with the following key:
+            - `replies`: A list containing the generated responses as ChatMessage instances.
+        """
+        if len(messages) == 0:
+            return {"replies": []}
+
+        streaming_callback = streaming_callback or self.streaming_callback
+
+        api_args = self._prepare_api_call(
+            messages=messages,
+            streaming_callback=streaming_callback,
+            generation_kwargs=generation_kwargs,
+            tools=tools,
+            tools_strict=tools_strict,
+        )
+        chat_completion: Union[Stream[ChatCompletionChunk], ChatCompletion] = self.client.chat.completions.create(
+            **api_args
+        )
+
+        is_streaming = isinstance(chat_completion, Stream)
+        assert is_streaming or streaming_callback is None
+
+        if is_streaming:
+            completions = self._handle_stream_response(
+                chat_completion,  # type: ignore
+                streaming_callback,  # type: ignore
+            )
+        else:
+            assert isinstance(chat_completion, ChatCompletion), "Unexpected response type for non-streaming request."
+            completions = [
+                self._convert_chat_completion_to_chat_message(chat_completion, choice)
+                for choice in chat_completion.choices
+            ]
+
+        # before returning, do post-processing of the completions
+        for message in completions:
+            self._check_finish_reason(message.meta)
+
+        return {"replies": completions}
+
+    @component.output_types(replies=List[ChatMessage])
+    async def run_async(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ):
+        """
+        Asynchronously invokes chat completion based on the provided messages and generation parameters.
+
+        This is the asynchronous version of the `run` method. It has the same parameters and return values
+        but can be used with `await` in async code.
+
+        :param messages:
+            A list of ChatMessage instances representing the input messages.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+            Must be a coroutine.
+        :param generation_kwargs:
+            Additional keyword arguments for text generation. These parameters will
+            override the parameters passed during component initialization.
+            For details on OpenAI API parameters, see [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat/create).
+        :param tools:
+            A list of tools for which the model can prepare calls. If set, it will override the `tools` parameter set
+            during component initialization.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+            If set, it will override the `tools_strict` parameter set during component initialization.
+
+        :returns:
+            A dictionary with the following key:
+            - `replies`: A list containing the generated responses as ChatMessage instances.
+        """
+        # validate and select the streaming callback
+        streaming_callback = select_streaming_callback(self.streaming_callback, streaming_callback, requires_async=True)  # type: ignore
+
+        if len(messages) == 0:
+            return {"replies": []}
+
+        api_args = self._prepare_api_call(
+            messages=messages,
+            streaming_callback=streaming_callback,
+            generation_kwargs=generation_kwargs,
+            tools=tools,
+            tools_strict=tools_strict,
+        )
+
+        chat_completion: Union[
+            AsyncStream[ChatCompletionChunk], ChatCompletion
+        ] = await self.async_client.chat.completions.create(**api_args)
+
+        is_streaming = isinstance(chat_completion, AsyncStream)
+        assert is_streaming or streaming_callback is None
+
+        if is_streaming:
+            completions = await self._handle_async_stream_response(
+                chat_completion,  # type: ignore
+                streaming_callback,  # type: ignore
+            )
+        else:
+            assert isinstance(chat_completion, ChatCompletion), "Unexpected response type for non-streaming request."
+            completions = [
+                self._convert_chat_completion_to_chat_message(chat_completion, choice)
+                for choice in chat_completion.choices
+            ]
+
+        # before returning, do post-processing of the completions
+        for message in completions:
+            self._check_finish_reason(message.meta)
+
+        return {"replies": completions}
+
+    def _prepare_api_call(  # noqa: PLR0913
+        self,
+        *,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        # update generation kwargs by merging with the generation kwargs passed to the run method
+        generation_kwargs = {**self.generation_kwargs, **(generation_kwargs or {})}
+
+        # adapt ChatMessage(s) to the format expected by the OpenAI API
+        openai_formatted_messages = [message.to_openai_dict_format() for message in messages]
+
+        tools = tools or self.tools
+        tools_strict = tools_strict if tools_strict is not None else self.tools_strict
+        _check_duplicate_tool_names(tools)
+
+        openai_tools = {}
+        if tools:
+            tool_definitions = []
+            for t in tools:
+                function_spec = {**t.tool_spec, **({"strict": tools_strict} if tools_strict else {})}
+                if tools_strict:
+                    # OpenAI's strict mode requires "additionalProperties": False on every (nested) object of
+                    # the schema and all properties to be listed in "required". Without this, requests are
+                    # rejected with an "Invalid schema for function" error (e.g. for tools created from
+                    # components or functions that have nested objects in their parameters schema).
+                    # We build a new schema so that the original tool definition is left untouched.
+                    function_spec["parameters"] = _convert_schema_to_strict(function_spec.get("parameters") or {})
+                tool_definitions.append({"type": "function", "function": function_spec})
+            openai_tools = {"tools": tool_definitions}
+
+        is_streaming = streaming_callback is not None
+        num_responses = generation_kwargs.pop("n", 1)
+        if is_streaming and num_responses > 1:
+            raise ValueError("Cannot stream multiple responses, please set n=1.")
+
+        return {
+            "model": self.model,
+            "messages": openai_formatted_messages,  # type: ignore[arg-type] # openai expects list of specific message types
+            "stream": streaming_callback is not None,
+            "n": num_responses,
+            **openai_tools,
+            **generation_kwargs,
+        }
+
+    def _handle_stream_response(self, chat_completion: Stream, callback: SyncStreamingCallbackT) -> List[ChatMessage]:
+        chunks: List[StreamingChunk] = []
+        chunk = None
+
+        for chunk in chat_completion:  # pylint: disable=not-an-iterable
+            assert len(chunk.choices) == 1, "Streaming responses should have only one choice."
+            chunk_delta: StreamingChunk = self._convert_chat_completion_chunk_to_streaming_chunk(chunk)
+            chunks.append(chunk_delta)
+
+            callback(chunk_delta)
+
+        return [self._convert_streaming_chunks_to_chat_message(chunk, chunks)]
+
+    async def _handle_async_stream_response(
+        self, chat_completion: AsyncStream, callback: AsyncStreamingCallbackT
+    ) -> List[ChatMessage]:
+        chunks: List[StreamingChunk] = []
+        chunk = None
+
+        async for chunk in chat_completion:  # pylint: disable=not-an-iterable
+            assert len(chunk.choices) == 1, "Streaming responses should have only one choice."
+            chunk_delta: StreamingChunk = self._convert_chat_completion_chunk_to_streaming_chunk(chunk)
+            chunks.append(chunk_delta)
+
+            await callback(chunk_delta)
+
+        return [self._convert_streaming_chunks_to_chat_message(chunk, chunks)]
+
+    def _check_finish_reason(self, meta: Dict[str, Any]) -> None:
+        if meta["finish_reason"] == "length":
+            logger.warning(
+                "The completion for index {index} has been truncated before reaching a natural stopping point. "
+                "Increase the max_tokens parameter to allow for longer completions.",
+                index=meta["index"],
+                finish_reason=meta["finish_reason"],
+            )
+        if meta["finish_reason"] == "content_filter":
+            logger.warning(
+                "The completion for index {index} has been truncated due to the content filter.",
+                index=meta["index"],
+                finish_reason=meta["finish_reason"],
+            )
+
+    def _convert_streaming_chunks_to_chat_message(
+        self, chunk: ChatCompletionChunk, chunks: List[StreamingChunk]
+    ) -> ChatMessage:
+        """
+        Connects the streaming chunks into a single ChatMessage.
+
+        :param chunk: The last chunk returned by the OpenAI API.
+        :param chunks: The list of all `StreamingChunk` objects.
+        """
+        text = "".join([chunk.content for chunk in chunks])
+        tool_calls = []
+
+        # Process tool calls if present in any chunk
+        tool_call_data: Dict[str, Dict[str, str]] = {}  # Track tool calls by index
+        for chunk_payload in chunks:
+            tool_calls_meta = chunk_payload.meta.get("tool_calls")
+            if tool_calls_meta is not None:
+                for delta in tool_calls_meta:
+                    # We use the index of the tool call to track it across chunks since the ID is not always provided
+                    if delta.index not in tool_call_data:
+                        tool_call_data[delta.index] = {"id": "", "name": "", "arguments": ""}
+
+                    # Save the ID if present
+                    if delta.id is not None:
+                        tool_call_data[delta.index]["id"] = delta.id
+
+                    if delta.function is not None:
+                        if delta.function.name is not None:
+                            tool_call_data[delta.index]["name"] += delta.function.name
+                        if delta.function.arguments is not None:
+                            tool_call_data[delta.index]["arguments"] += delta.function.arguments
+
+        # Convert accumulated tool call data into ToolCall objects
+        for call_data in tool_call_data.values():
+            try:
+                arguments = json.loads(call_data["arguments"])
+                tool_calls.append(ToolCall(id=call_data["id"], tool_name=call_data["name"], arguments=arguments))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "OpenAI returned a malformed JSON string for tool call arguments. This tool call "
+                    "will be skipped. To always generate a valid JSON, set `tools_strict` to `True`. "
+                    "Tool call ID: {_id}, Tool name: {_name}, Arguments: {_arguments}",
+                    _id=call_data["id"],
+                    _name=call_data["name"],
+                    _arguments=call_data["arguments"],
+                )
+
+        meta = {
+            "model": chunk.model,
+            "index": 0,
+            "finish_reason": chunk.choices[0].finish_reason,
+            "completion_start_time": chunks[0].meta.get("received_at"),  # first chunk received
+            "usage": {},  # we don't have usage data for streaming responses
+        }
+
+        return ChatMessage.from_assistant(text=text or None, tool_calls=tool_calls, meta=meta)
+
+    def _convert_chat_completion_to_chat_message(self, completion: ChatCompletion, choice: Choice) -> ChatMessage:
+        """
+        Converts the non-streaming response from the OpenAI API to a ChatMessage.
+
+        :param completion: The completion returned by the OpenAI API.
+        :param choice: The choice returned by the OpenAI API.
+        :return: The ChatMessage.
+        """
+        message: ChatCompletionMessage = choice.message
+        text = message.content
+        tool_calls = []
+        if openai_tool_calls := message.tool_calls:
+            for openai_tc in openai_tool_calls:
+                arguments_str = openai_tc.function.arguments
+                try:
+                    arguments = json.loads(arguments_str)
+                    tool_calls.append(ToolCall(id=openai_tc.id, tool_name=openai_tc.function.name, arguments=arguments))
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "OpenAI returned a malformed JSON string for tool call arguments. This tool call "
+                        "will be skipped. To always generate a valid JSON, set `tools_strict` to `True`. "
+                        "Tool call ID: {_id}, Tool name: {_name}, Arguments: {_arguments}",
+                        _id=openai_tc.id,
+                        _name=openai_tc.function.name,
+                        _arguments=arguments_str,
+                    )
+
+        chat_message = ChatMessage.from_assistant(text=text, tool_calls=tool_calls)
+        chat_message._meta.update(
+            {
+                "model": completion.model,
+                "index": choice.index,
+                "finish_reason": choice.finish_reason,
+                "usage": dict(completion.usage or {}),
+            }
+        )
+        return chat_message
+
+    def _convert_chat_completion_chunk_to_streaming_chunk(self, chunk: ChatCompletionChunk) -> StreamingChunk:
+        """
+        Converts the streaming response chunk from the OpenAI API to a StreamingChunk.
+
+        :param chunk: The chunk returned by the OpenAI API.
+
+        :returns:
+            The StreamingChunk.
+        """
+        # we stream the content of the chunk if it's not a tool or function call
+        choice: ChunkChoice = chunk.choices[0]
+        content = choice.delta.content or ""
+        chunk_message = StreamingChunk(content)
+        # but save the tool calls and function call in the meta if they are present
+        # and then connect the chunks in the _convert_streaming_chunks_to_chat_message method
+        chunk_message.meta.update(
+            {
+                "model": chunk.model,
+                "index": choice.index,
+                "tool_calls": choice.delta.tool_calls,
+                "finish_reason": choice.finish_reason,
+                "received_at": datetime.now().isoformat(),
+            }
+        )
+        return chunk_message
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-17 17:50:22
+Duration: 1546.76 seconds
+Verdict: ## Verdict: REJECT
+
+### 1. Structural / format validation failed (blocking)
+
+`validate_fixed_code` returned:
+
+> REJECT — the line `### haystack/components/generators/chat/openai.py` appears 0 times, expected once
+
+The diff confirms this: the very first line of the original snippet, the file-path marker
+
+```
+### haystack/components/generators/chat/openai.py
+```
+
+was **deleted** in the fixed version (the diff shows it as a removal, and the trailing blank lines at EOF were also stripped). The fixed code is expected to keep the `### <repository file path>` header so the harness can map the snippet to the correct file. Without it the patch target is ambiguous / the produced patch is malformed. This alone is sufficient grounds for rejection, regardless of how good the Python change is.
+
+### 2. Functional review of the change (this part is sound)
+
+The core fix in `_prepare_api_call` is a genuine improvement over the buggy version:
+
+- **Recursive schema hardening** — the buggy code only added `additionalProperties: False` to the *root* `parameters` object, so `ComponentTool`-generated schemas (nesting objects, `$defs`/`definitions`, `items`, `anyOf`/`oneOf`/`allOf`) still produced nested sub-schemas without `additionalProperties: false`, which is exactly what OpenAI strict mode rejects (issue #8912). The new `_set_additional_properties_false` walks all of these keywords and marks every object node — the correct remedy.
+- **No in-place mutation of `tool.tool_spec`** — `copy.deepcopy(tool.tool_spec)` before modifying fixes a real latent bug: the old code did `function_spec = {**t.tool_spec, ...}` (shallow copy) and then mutated `function_spec["parameters"]`, permanently contaminating the caller's `Tool` object across runs and serialization. `copy.deepcopy` is correctly used (shallow-deep is fine for JSON-schema-shaped dicts).
+- **`strict` handling** — `function_spec["strict"] = True` is equivalent to the old `{"strict": tools_strict}` when strict is truthy, and only applied under the same guard; `bool(tools_strict)` normalization at the call site is harmless.
+- Signature of `_prepare_api_call`, its argument handling, `_check_duplicate_tool_names`, and the return payload shape (`model`, `messages`, `stream`, `n`, `**openai_tools`, `**generation_kwargs`) are unchanged, so no regression risk for other callers. `List`, `Dict`, `Any`, `Tool` imports are all still present in the module.
+
+(`verify_api_usage` on `copy.deepcopy` / `haystack.tools.Tool` returned only generic web noise; neither surfaced a usage problem, and the calls are standard library / in-repo usages consistent with the pre-existing code.)
+
+### 3. Test-level concern worth flagging
+
+In the supplied test, `fake_prepare_api_call` is a `side_effect` that grabs `kwargs.get("tools", [])`. Because `run()` always passes `tools=` explicitly (defaulting to `None`), `kwargs.get("tools", [])` yields `None`, and `tools_payload[0]` raises `TypeError`, which is swallowed by the `except` block → the script returns exit code `2` for *both* the buggy and the fixed variant. Moreover, even if `tools` were populated, it holds `Tool` dataclass instances (not dicts), so `.get("function", {})` would fail. The test never actually inspects `_convert_to_openai_tools` output. The implementation may be right, but the case as packaged cannot confirm it.
+
+### Summary
+
+- ✅ The underlying fix (recursive `additionalProperties: false` + non-mutating deep copy) correctly addresses the issue's root cause.
+- ❌ The fixed file dropped the required `### haystack/components/generators/chat/openai.py` marker line (plus EOF blank lines), breaking the mandated output format — `validate_fixed_code` rejects it outright.
+- ⚠️ The accompanying test's mock inspects the wrong value and cannot discriminate buggy vs. fixed behavior.
+
+The fix must be resubmitted as the **complete file including its original header path line**, and ideally with a test that inspects the generated OpenAI tool definitions rather than the raw `run()` kwargs.
+--------------------------------------------------------------------------------
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import copy
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
+
+from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
+from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+
+from haystack import component, default_from_dict, default_to_dict, logging
+from haystack.dataclasses import (
+    AsyncStreamingCallbackT,
+    ChatMessage,
+    StreamingCallbackT,
+    StreamingChunk,
+    SyncStreamingCallbackT,
+    ToolCall,
+    select_streaming_callback,
+)
+from haystack.tools.tool import Tool, _check_duplicate_tool_names, deserialize_tools_inplace
+from haystack.utils import Secret, deserialize_callable, deserialize_secrets_inplace, serialize_callable
+
+logger = logging.getLogger(__name__)
+
+
+def _set_additional_properties_false(schema: Any) -> None:
+    """
+    Recursively set `additionalProperties` to `False` for every object defined in a JSON schema.
+
+    OpenAI strict mode requires `additionalProperties` to be explicitly set to `False` for the root object
+    **and** for every nested object contained in the tool's parameters schema. Schemas generated from Python
+    objects (for example the ones created by `ComponentTool` starting from Pydantic models) usually only define
+    `properties` for nested objects without setting `additionalProperties`, which makes OpenAI reject the whole
+    tool definition.
+
+    :param schema: The JSON schema (or sub-schema) to update in place.
+    """
+    if isinstance(schema, list):
+        for item in schema:
+            _set_additional_properties_false(item)
+        return
+
+    if not isinstance(schema, dict):
+        return
+
+    properties = schema.get("properties")
+    is_object = schema.get("type") == "object" or isinstance(properties, dict)
+
+    if is_object:
+        # OpenAI strict mode requires this to be explicitly set to False for every object
+        schema["additionalProperties"] = False
+        for property_schema in (properties or {}).values():
+            _set_additional_properties_false(property_schema)
+
+    # recurse into all the keywords that can contain sub-schemas
+    for key in ("items", "prefixItems", "anyOf", "oneOf", "allOf", "not"):
+        if key in schema:
+            _set_additional_properties_false(schema[key])
+
+    # nested definitions (Pydantic v1 uses `definitions`, Pydantic v2 uses `$defs`)
+    for key in ("definitions", "$defs"):
+        definitions = schema.get(key)
+        if isinstance(definitions, dict):
+            for definition_schema in definitions.values():
+                _set_additional_properties_false(definition_schema)
+
+
+def _convert_to_openai_tools(tools: List[Tool], tools_strict: bool = False) -> List[Dict[str, Any]]:
+    """
+    Converts a list of Haystack Tools to the tool definitions format expected by the OpenAI API.
+
+    When `tools_strict` is enabled, the JSON schema of each tool is adjusted so that it satisfies OpenAI's
+    strict mode requirements, that is `additionalProperties` is set to `False` for the root object and,
+    recursively, for every nested object of the parameters schema.
+
+    The tool specs of the passed Tools are never mutated: a deep copy is used to build the OpenAI definitions.
+
+    :param tools: The list of Haystack Tools to convert.
+    :param tools_strict: Whether to enable strict schema adherence for tool calls.
+    :returns: A list of tool definitions in the format expected by the OpenAI API.
+    """
+    tool_definitions: List[Dict[str, Any]] = []
+    for tool in tools:
+        # deep copy to avoid mutating the original tool spec (and therefore the Tool itself)
+        function_spec = copy.deepcopy(tool.tool_spec)
+
+        if tools_strict:
+            function_spec["strict"] = True
+            parameters = function_spec.get("parameters")
+            if isinstance(parameters, dict):
+                _set_additional_properties_false(parameters)
+
+        tool_definitions.append({"type": "function", "function": function_spec})
+
+    return tool_definitions
+
+
+@component
+class OpenAIChatGenerator:
+    """
+    Completes chats using OpenAI's large language models (LLMs).
+
+    It works with the gpt-4 and gpt-3.5-turbo models and supports streaming responses
+    from OpenAI API. It uses [ChatMessage](https://docs.haystack.deepset.ai/docs/chatmessage)
+    format in input and output.
+
+    You can customize how the text is generated by passing parameters to the
+    OpenAI API. Use the `**generation_kwargs` argument when you initialize
+    the component or when you run it. Any parameter that works with
+    `openai.ChatCompletion.create` will work here too.
+
+    For details on OpenAI API parameters, see
+    [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat).
+
+    ### Usage example
+
+    ```python
+    from haystack.components.generators.chat import OpenAIChatGenerator
+    from haystack.dataclasses import ChatMessage
+
+    messages = [ChatMessage.from_user("What's Natural Language Processing?")]
+
+    client = OpenAIChatGenerator()
+    response = client.run(messages)
+    print(response)
+    ```
+    Output:
+    ```
+    {'replies':
+        [ChatMessage(content='Natural Language Processing (NLP) is a branch of artificial intelligence
+            that focuses on enabling computers to understand, interpret, and generate human language in
+            a way that is meaningful and useful.',
+         role=<ChatRole.ASSISTANT: 'assistant'>, name=None,
+         meta={'model': 'gpt-4o-mini', 'index': 0, 'finish_reason': 'stop',
+         'usage': {'prompt_tokens': 15, 'completion_tokens': 36, 'total_tokens': 51}})
+        ]
+    }
+    ```
+    """
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self,
+        api_key: Secret = Secret.from_env_var("OPENAI_API_KEY"),
+        model: str = "gpt-4o-mini",
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        api_base_url: Optional[str] = None,
+        organization: Optional[str] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: bool = False,
+    ):
+        """
+        Creates an instance of OpenAIChatGenerator. Unless specified otherwise in `model`, uses OpenAI's gpt-4o-mini
+
+        Before initializing the component, you can set the 'OPENAI_TIMEOUT' and 'OPENAI_MAX_RETRIES'
+        environment variables to override the `timeout` and `max_retries` parameters respectively
+        in the OpenAI client.
+
+        :param api_key: The OpenAI API key.
+            You can set it with an environment variable `OPENAI_API_KEY`, or pass with this parameter
+            during initialization.
+        :param model: The name of the model to use.
+        :param streaming_callback: A callback function that is called when a new token is received from the stream.
+            The callback function accepts [StreamingChunk](https://docs.haystack.deepset.ai/docs/data-classes#streamingchunk)
+            as an argument.
+        :param api_base_url: An optional base URL.
+        :param organization: Your organization ID, defaults to `None`. See
+        [production best practices](https://platform.openai.com/docs/guides/production-best-practices/setting-up-your-organization).
+        :param generation_kwargs: Other parameters to use for the model. These parameters are sent directly to
+            the OpenAI endpoint. See OpenAI [documentation](https://platform.openai.com/docs/api-reference/chat) for
+            more details.
+            Some of the supported parameters:
+            - `max_tokens`: The maximum number of tokens the output text can have.
+            - `temperature`: What sampling temperature to use. Higher values mean the model will take more risks.
+                Try 0.9 for more creative applications and 0 (argmax sampling) for ones with a well-defined answer.
+            - `top_p`: An alternative to sampling with temperature, called nucleus sampling, where the model
+                considers the results of the tokens with top_p probability mass. For example, 0.1 means only the tokens
+                comprising the top 10% probability mass are considered.
+            - `n`: How many completions to generate for each prompt. For example, if the LLM gets 3 prompts and n is 2,
+                it will generate two completions for each of the three prompts, ending up with 6 completions in total.
+            - `stop`: One or more sequences after which the LLM should stop generating tokens.
+            - `presence_penalty`: What penalty to apply if a token is already present at all. Bigger values mean
+                the model will be less likely to repeat the same token in the text.
+            - `frequency_penalty`: What penalty to apply if a token has already been generated in the text.
+                Bigger values mean the model will be less likely to repeat the same token in the text.
+            - `logit_bias`: Add a logit bias to specific tokens. The keys of the dictionary are tokens, and the
+                values are the bias to add to that token.
+        :param timeout:
+            Timeout for OpenAI client calls. If not set, it defaults to either the
+            `OPENAI_TIMEOUT` environment variable, or 30 seconds.
+        :param max_retries:
+            Maximum number of retries to contact OpenAI after an internal error.
+            If not set, it defaults to either the `OPENAI_MAX_RETRIES` environment variable, or set to 5.
+        :param tools:
+            A list of tools for which the model can prepare calls.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+        """
+        self.api_key = api_key
+        self.model = model
+        self.generation_kwargs = generation_kwargs or {}
+        self.streaming_callback = streaming_callback
+        self.api_base_url = api_base_url
+        self.organization = organization
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.tools = tools
+        self.tools_strict = tools_strict
+
+        _check_duplicate_tool_names(tools)
+
+        if timeout is None:
+            timeout = float(os.environ.get("OPENAI_TIMEOUT", 30.0))
+        if max_retries is None:
+            max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", 5))
+
+        client_args: Dict[str, Any] = {
+            "api_key": api_key.resolve_value(),
+            "organization": organization,
+            "base_url": api_base_url,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+
+        self.client = OpenAI(**client_args)
+        self.async_client = AsyncOpenAI(**client_args)
+
+    def _get_telemetry_data(self) -> Dict[str, Any]:
+        """
+        Data that is sent to Posthog for usage analytics.
+        """
+        return {"model": self.model}
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize this component to a dictionary.
+
+        :returns:
+            The serialized component as a dictionary.
+        """
+        callback_name = serialize_callable(self.streaming_callback) if self.streaming_callback else None
+        return default_to_dict(
+            self,
+            model=self.model,
+            streaming_callback=callback_name,
+            api_base_url=self.api_base_url,
+            organization=self.organization,
+            generation_kwargs=self.generation_kwargs,
+            api_key=self.api_key.to_dict(),
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            tools=[tool.to_dict() for tool in self.tools] if self.tools else None,
+            tools_strict=self.tools_strict,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OpenAIChatGenerator":
+        """
+        Deserialize this component from a dictionary.
+
+        :param data: The dictionary representation of this component.
+        :returns:
+            The deserialized component instance.
+        """
+        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
+        deserialize_tools_inplace(data["init_parameters"], key="tools")
+        init_params = data.get("init_parameters", {})
+        serialized_callback_handler = init_params.get("streaming_callback")
+        if serialized_callback_handler:
+            data["init_parameters"]["streaming_callback"] = deserialize_callable(serialized_callback_handler)
+        return default_from_dict(cls, data)
+
+    @component.output_types(replies=List[ChatMessage])
+    def run(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ):
+        """
+        Invokes chat completion based on the provided messages and generation parameters.
+
+        :param messages:
+            A list of ChatMessage instances representing the input messages.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+        :param generation_kwargs:
+            Additional keyword arguments for text generation. These parameters will
+            override the parameters passed during component initialization.
+            For details on OpenAI API parameters, see [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat/create).
+        :param tools:
+            A list of tools for which the model can prepare calls. If set, it will override the `tools` parameter set
+            during component initialization.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+            If set, it will override the `tools_strict` parameter set during component initialization.
+
+        :returns:
+            A dictionary with the following key:
+            - `replies`: A list containing the generated responses as ChatMessage instances.
+        """
+        if len(messages) == 0:
+            return {"replies": []}
+
+        streaming_callback = streaming_callback or self.streaming_callback
+
+        api_args = self._prepare_api_call(
+            messages=messages,
+            streaming_callback=streaming_callback,
+            generation_kwargs=generation_kwargs,
+            tools=tools,
+            tools_strict=tools_strict,
+        )
+        chat_completion: Union[Stream[ChatCompletionChunk], ChatCompletion] = self.client.chat.completions.create(
+            **api_args
+        )
+
+        is_streaming = isinstance(chat_completion, Stream)
+        assert is_streaming or streaming_callback is None
+
+        if is_streaming:
+            completions = self._handle_stream_response(
+                chat_completion,  # type: ignore
+                streaming_callback,  # type: ignore
+            )
+        else:
+            assert isinstance(chat_completion, ChatCompletion), "Unexpected response type for non-streaming request."
+            completions = [
+                self._convert_chat_completion_to_chat_message(chat_completion, choice)
+                for choice in chat_completion.choices
+            ]
+
+        # before returning, do post-processing of the completions
+        for message in completions:
+            self._check_finish_reason(message.meta)
+
+        return {"replies": completions}
+
+    @component.output_types(replies=List[ChatMessage])
+    async def run_async(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ):
+        """
+        Asynchronously invokes chat completion based on the provided messages and generation parameters.
+
+        This is the asynchronous version of the `run` method. It has the same parameters and return values
+        but can be used with `await` in async code.
+
+        :param messages:
+            A list of ChatMessage instances representing the input messages.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+            Must be a coroutine.
+        :param generation_kwargs:
+            Additional keyword arguments for text generation. These parameters will
+            override the parameters passed during component initialization.
+            For details on OpenAI API parameters, see [OpenAI documentation](https://platform.openai.com/docs/api-reference/chat/create).
+        :param tools:
+            A list of tools for which the model can prepare calls. If set, it will override the `tools` parameter set
+            during component initialization.
+        :param tools_strict:
+            Whether to enable strict schema adherence for tool calls. If set to `True`, the model will follow exactly
+            the schema provided in the `parameters` field of the tool definition, but this may increase latency.
+            If set, it will override the `tools_strict` parameter set during component initialization.
+
+        :returns:
+            A dictionary with the following key:
+            - `replies`: A list containing the generated responses as ChatMessage instances.
+        """
+        # validate and select the streaming callback
+        streaming_callback = select_streaming_callback(self.streaming_callback, streaming_callback, requires_async=True)  # type: ignore
+
+        if len(messages) == 0:
+            return {"replies": []}
+
+        api_args = self._prepare_api_call(
+            messages=messages,
+            streaming_callback=streaming_callback,
+            generation_kwargs=generation_kwargs,
+            tools=tools,
+            tools_strict=tools_strict,
+        )
+
+        chat_completion: Union[
+            AsyncStream[ChatCompletionChunk], ChatCompletion
+        ] = await self.async_client.chat.completions.create(**api_args)
+
+        is_streaming = isinstance(chat_completion, AsyncStream)
+        assert is_streaming or streaming_callback is None
+
+        if is_streaming:
+            completions = await self._handle_async_stream_response(
+                chat_completion,  # type: ignore
+                streaming_callback,  # type: ignore
+            )
+        else:
+            assert isinstance(chat_completion, ChatCompletion), "Unexpected response type for non-streaming request."
+            completions = [
+                self._convert_chat_completion_to_chat_message(chat_completion, choice)
+                for choice in chat_completion.choices
+            ]
+
+        # before returning, do post-processing of the completions
+        for message in completions:
+            self._check_finish_reason(message.meta)
+
+        return {"replies": completions}
+
+    def _prepare_api_call(  # noqa: PLR0913
+        self,
+        *,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Tool]] = None,
+        tools_strict: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        # update generation kwargs by merging with the generation kwargs passed to the run method
+        generation_kwargs = {**self.generation_kwargs, **(generation_kwargs or {})}
+
+        # adapt ChatMessage(s) to the format expected by the OpenAI API
+        openai_formatted_messages = [message.to_openai_dict_format() for message in messages]
+
+        tools = tools or self.tools
+        tools_strict = tools_strict if tools_strict is not None else self.tools_strict
+        _check_duplicate_tool_names(tools)
+
+        openai_tools = {}
+        if tools:
+            openai_tools = {"tools": _convert_to_openai_tools(tools, bool(tools_strict))}
+
+        is_streaming = streaming_callback is not None
+        num_responses = generation_kwargs.pop("n", 1)
+        if is_streaming and num_responses > 1:
+            raise ValueError("Cannot stream multiple responses, please set n=1.")
+
+        return {
+            "model": self.model,
+            "messages": openai_formatted_messages,  # type: ignore[arg-type] # openai expects list of specific message types
+            "stream": streaming_callback is not None,
+            "n": num_responses,
+            **openai_tools,
+            **generation_kwargs,
+        }
+
+    def _handle_stream_response(self, chat_completion: Stream, callback: SyncStreamingCallbackT) -> List[ChatMessage]:
+        chunks: List[StreamingChunk] = []
+        chunk = None
+
+        for chunk in chat_completion:  # pylint: disable=not-an-iterable
+            assert len(chunk.choices) == 1, "Streaming responses should have only one choice."
+            chunk_delta: StreamingChunk = self._convert_chat_completion_chunk_to_streaming_chunk(chunk)
+            chunks.append(chunk_delta)
+
+            callback(chunk_delta)
+
+        return [self._convert_streaming_chunks_to_chat_message(chunk, chunks)]
+
+    async def _handle_async_stream_response(
+        self, chat_completion: AsyncStream, callback: AsyncStreamingCallbackT
+    ) -> List[ChatMessage]:
+        chunks: List[StreamingChunk] = []
+        chunk = None
+
+        async for chunk in chat_completion:  # pylint: disable=not-an-iterable
+            assert len(chunk.choices) == 1, "Streaming responses should have only one choice."
+            chunk_delta: StreamingChunk = self._convert_chat_completion_chunk_to_streaming_chunk(chunk)
+            chunks.append(chunk_delta)
+
+            await callback(chunk_delta)
+
+        return [self._convert_streaming_chunks_to_chat_message(chunk, chunks)]
+
+    def _check_finish_reason(self, meta: Dict[str, Any]) -> None:
+        if meta["finish_reason"] == "length":
+            logger.warning(
+                "The completion for index {index} has been truncated before reaching a natural stopping point. "
+                "Increase the max_tokens parameter to allow for longer completions.",
+                index=meta["index"],
+                finish_reason=meta["finish_reason"],
+            )
+        if meta["finish_reason"] == "content_filter":
+            logger.warning(
+                "The completion for index {index} has been truncated due to the content filter.",
+                index=meta["index"],
+                finish_reason=meta["finish_reason"],
+            )
+
+    def _convert_streaming_chunks_to_chat_message(
+        self, chunk: ChatCompletionChunk, chunks: List[StreamingChunk]
+    ) -> ChatMessage:
+        """
+        Connects the streaming chunks into a single ChatMessage.
+
+        :param chunk: The last chunk returned by the OpenAI API.
+        :param chunks: The list of all `StreamingChunk` objects.
+        """
+        text = "".join([chunk.content for chunk in chunks])
+        tool_calls = []
+
+        # Process tool calls if present in any chunk
+        tool_call_data: Dict[str, Dict[str, str]] = {}  # Track tool calls by index
+        for chunk_payload in chunks:
+            tool_calls_meta = chunk_payload.meta.get("tool_calls")
+            if tool_calls_meta is not None:
+                for delta in tool_calls_meta:
+                    # We use the index of the tool call to track it across chunks since the ID is not always provided
+                    if delta.index not in tool_call_data:
+                        tool_call_data[delta.index] = {"id": "", "name": "", "arguments": ""}
+
+                    # Save the ID if present
+                    if delta.id is not None:
+                        tool_call_data[delta.index]["id"] = delta.id
+
+                    if delta.function is not None:
+                        if delta.function.name is not None:
+                            tool_call_data[delta.index]["name"] += delta.function.name
+                        if delta.function.arguments is not None:
+                            tool_call_data[delta.index]["arguments"] += delta.function.arguments
+
+        # Convert accumulated tool call data into ToolCall objects
+        for call_data in tool_call_data.values():
+            try:
+                arguments = json.loads(call_data["arguments"])
+                tool_calls.append(ToolCall(id=call_data["id"], tool_name=call_data["name"], arguments=arguments))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "OpenAI returned a malformed JSON string for tool call arguments. This tool call "
+                    "will be skipped. To always generate a valid JSON, set `tools_strict` to `True`. "
+                    "Tool call ID: {_id}, Tool name: {_name}, Arguments: {_arguments}",
+                    _id=call_data["id"],
+                    _name=call_data["name"],
+                    _arguments=call_data["arguments"],
+                )
+
+        meta = {
+            "model": chunk.model,
+            "index": 0,
+            "finish_reason": chunk.choices[0].finish_reason,
+            "completion_start_time": chunks[0].meta.get("received_at"),  # first chunk received
+            "usage": {},  # we don't have usage data for streaming responses
+        }
+
+        return ChatMessage.from_assistant(text=text or None, tool_calls=tool_calls, meta=meta)
+
+    def _convert_chat_completion_to_chat_message(self, completion: ChatCompletion, choice: Choice) -> ChatMessage:
+        """
+        Converts the non-streaming response from the OpenAI API to a ChatMessage.
+
+        :param completion: The completion returned by the OpenAI API.
+        :param choice: The choice returned by the OpenAI API.
+        :return: The ChatMessage.
+        """
+        message: ChatCompletionMessage = choice.message
+        text = message.content
+        tool_calls = []
+        if openai_tool_calls := message.tool_calls:
+            for openai_tc in openai_tool_calls:
+                arguments_str = openai_tc.function.arguments
+                try:
+                    arguments = json.loads(arguments_str)
+                    tool_calls.append(ToolCall(id=openai_tc.id, tool_name=openai_tc.function.name, arguments=arguments))
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "OpenAI returned a malformed JSON string for tool call arguments. This tool call "
+                        "will be skipped. To always generate a valid JSON, set `tools_strict` to `True`. "
+                        "Tool call ID: {_id}, Tool name: {_name}, Arguments: {_arguments}",
+                        _id=openai_tc.id,
+                        _name=openai_tc.function.name,
+                        _arguments=arguments_str,
+                    )
+
+        chat_message = ChatMessage.from_assistant(text=text, tool_calls=tool_calls)
+        chat_message._meta.update(
+            {
+                "model": completion.model,
+                "index": choice.index,
+                "finish_reason": choice.finish_reason,
+                "usage": dict(completion.usage or {}),
+            }
+        )
+        return chat_message
+
+    def _convert_chat_completion_chunk_to_streaming_chunk(self, chunk: ChatCompletionChunk) -> StreamingChunk:
+        """
+        Converts the streaming response chunk from the OpenAI API to a StreamingChunk.
+
+        :param chunk: The chunk returned by the OpenAI API.
+
+        :returns:
+            The StreamingChunk.
+        """
+        # we stream the content of the chunk if it's not a tool or function call
+        choice: ChunkChoice = chunk.choices[0]
+        content = choice.delta.content or ""
+        chunk_message = StreamingChunk(content)
+        # but save the tool calls and function call in the meta if they are present
+        # and then connect the chunks in the _convert_streaming_chunks_to_chat_message method
+        chunk_message.meta.update(
+            {
+                "model": chunk.model,
+                "index": choice.index,
+                "tool_calls": choice.delta.tool_calls,
+                "finish_reason": choice.finish_reason,
+                "received_at": datetime.now().isoformat(),
+            }
+        )
+        return chunk_message
+
+--------------------------------------------------------------------------------

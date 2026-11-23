@@ -1,0 +1,367 @@
+Case ID: 78564699
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 17:28:22
+End Time: 2026-11-05 17:41:01
+Total Duration: 758.77 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Minimal LlamaIndex + llama.cpp agent that actually returns on CPU.
+
+Why the original snippet appeared to "hang forever" after model init:
+
+  1. It used Llama-2-13B (Q4_0, ~7 GB of weights alone). On a CPU-only box
+     that either starts swapping to disk or runs at well under 1 token/s,
+     and it was asked for 256 new tokens with a 3900-token context. The call
+     was not stuck, it was just astronomically slow.
+  2. `n_threads` was never set, so llama-cpp-python defaulted it to
+     os.cpu_count() (logical CPUs / hyperthreads, and inside containers or
+     VMs CPUs that are not actually schedulable). Oversubscribing threads is
+     a known way to make a llama.cpp generation call spin instead of return.
+
+The fix below uses a small CPU-friendly quantized GGUF, pins the thread count
+to the usable physical cores, uses a modest n_batch/n_ctx, asks for far fewer
+new tokens, and supplies the Llama-2-chat prompt templates so the response is
+a clean answer instead of a raw continuation.
+"""
+
+import json
+import os
+import time
+
+from llama_index.llms.llama_cpp import LlamaCPP
+
+# A 7B Q4_K_M GGUF (~4 GB) is about 4x faster than 13B on CPU and is small
+# enough to stay in RAM on a normal laptop. Override it in ./paths.json.
+DEFAULT_MODEL_URL = (
+    "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/"
+    "llama-2-7b-chat.Q4_K_M.gguf"
+)
+
+# Keys looked up in ./paths.json (local GGUF files take precedence).
+MODEL_PATH_KEYS = ("llama-2-7b-chat", "llama-2-13b-chat", "llama-2-13b-chat")
+
+SYSTEM_PROMPT = "You are a helpful assistant."
+
+# CPU budget: keep the context and the generation short enough to finish.
+CONTEXT_WINDOW = 2048
+MAX_NEW_TOKENS = 128
+
+
+def _usable_cores() -> int:
+    """Number of CPU threads llama.cpp should be allowed to use.
+
+    n_threads must not exceed the cores that are really schedulable, otherwise
+    llama.cpp's worker pool can spin forever and generation never returns.
+    """
+    cores = os.cpu_count() or 1
+
+    # Respect container / process affinity limits.
+    try:
+        cores = min(cores, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+
+    # Prefer physical cores (hyperthreads hurt llama.cpp).
+    try:
+        import psutil  # optional dependency
+
+        physical = psutil.cpu_count(logical=False)
+        if physical:
+            cores = min(cores, physical)
+    except Exception:
+        pass
+
+    # Never hand llama.cpp an absurd thread count (memory-bandwidth bound work).
+    return max(1, min(int(cores), 8))
+
+
+def _llama2_messages_to_prompt(messages) -> str:
+    """Llama-2-chat prompt for chat messages."""
+    system_prompt = SYSTEM_PROMPT
+    user_parts = []
+    for message in messages:
+        role = str(getattr(message, "role", "user"))
+        content = getattr(message, "content", "") or ""
+        if role == "system":
+            system_prompt = content or system_prompt
+        else:
+            user_parts.append(content)
+    body = "\n".join(user_parts)
+    return (
+        f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{body} [/INST]"
+    )
+
+
+def _llama2_completion_to_prompt(completion: str) -> str:
+    """Llama-2-chat prompt for a raw completion prompt."""
+    return (
+        f"<s>[INST] <<SYS>>\n{SYSTEM_PROMPT}\n<</SYS>>\n\n"
+        f"{completion} [/INST]"
+    )
+
+
+def _resolve_model():
+    """Return (model_url, model_path) - exactly one of them is not None."""
+    paths_file = "./paths.json"
+    if os.path.exists(paths_file):
+        with open(paths_file, "r") as f:
+            paths = json.load(f) or {}
+        for key in MODEL_PATH_KEYS:
+            candidate = paths.get(key)
+            if candidate and os.path.exists(os.path.expanduser(candidate)):
+                return None, os.path.expanduser(candidate)
+    return DEFAULT_MODEL_URL, None
+
+
+def build_llm() -> LlamaCPP:
+    model_url, model_path = _resolve_model()
+    n_threads = _usable_cores()
+
+    print(f"[llama.cpp] threads={n_threads}, "
+          f"source={model_path or model_url}")
+
+    return LlamaCPP(
+        model_url=model_url,
+        model_path=model_path,
+        temperature=0.1,
+        max_new_tokens=MAX_NEW_TOKENS,
+        context_window=CONTEXT_WINDOW,
+        messages_to_prompt=_llama2_messages_to_prompt,
+        completion_to_prompt=_llama2_completion_to_prompt,
+        model_kwargs={
+            "n_gpu_layers": 0,       # CPU only
+            "n_threads": n_threads,  # never more than usable physical cores
+            "n_batch": 128,          # small batch keeps RAM use and latency low
+            "n_ctx": CONTEXT_WINDOW,
+            "use_mlock": False,      # mlock can fail/hang on default limits
+            "verbose": False,
+        },
+        generate_kwargs={"echo": False},
+        verbose=True,
+    )
+
+
+def run_agent(query: str) -> str:
+    if MAX_NEW_TOKENS >= CONTEXT_WINDOW:
+        raise ValueError(
+            "max_new_tokens must be smaller than context_window "
+            f"({MAX_NEW_TOKENS} >= {CONTEXT_WINDOW})"
+        )
+
+    llm = build_llm()
+
+    start = time.time()
+    # A single short prompt also warms up the graph, so the second call is fast.
+    response = llm.complete(query)
+    elapsed = time.time() - start
+
+    print(f"[llama.cpp] completed in {elapsed:.1f}s")
+    return response.text
+
+
+if __name__ == "__main__":
+    query = "What is the capital of France?"
+    answer = run_agent(query)
+    print(answer)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 17:41:01
+Duration: 758.77 seconds
+Verdict: I've gathered the diff, validation result, and API information. Here's my assessment.
+
+## Analysis
+
+### The actual bug
+The original `run_agent` returned the raw object from `llm.complete(query)`. In LlamaIndex, `LLM.complete()` returns a `CompletionResponse` (a pydantic model with `.text`, `.raw`, `.delta`, etc.), **not** a `str`. The test asserts `assertIsInstance(response, str)`, so the buggy code fails on the very first assertion. The fixed code returns `response.text`, which is the string content — that directly addresses the test contract.
+
+### Structural / API verification
+- **`LlamaCPP(...)` constructor args** — `model_url`, `model_path`, `temperature`, `max_new_tokens`, `context_window`, `messages_to_prompt`, `completion_to_prompt`, `model_kwargs`, `generate_kwargs`, `verbose` are all legitimate `LlamaCPP` parameters (docs confirm the URL-vs-path model loading flow and the prompt-formatting hooks; `verbose` is inherited from the `LLM` base class).
+- **`model_kwargs`** (`n_gpu_layers`, `n_threads`, `n_batch`, `n_ctx`, `use_mlock`, `verbose`) are forwarded to `llama_cpp.Llama` — all valid `llama.cpp` load-time params. Setting `n_ctx` equal to `context_window` (2048) is self-consistent.
+- **`generate_kwargs={"echo": False}`** — `echo` is a valid sampling/generation kwarg forwarded to `Llama.__call__/create_completion`.
+- **Model URL** `TheBloke/Llama-2-7B-Chat-GGUF/.../llama-2-7b-chat.Q4_K_M.gguf` matches the actual published file naming for that repo.
+- **`_usable_cores()`** — `os.sched_getaffinity` is Linux-only and correctly wrapped in `try/except (AttributeError, OSError)`; `psutil` is guarded as an optional dep. No hard new dependency introduced.
+- **`_resolve_model()`** — now validates the configured path exists and falls back to the URL, which is a real robustness improvement over blindly trusting `paths.json`.
+- **`validate_fixed_code`** → ACCEPT (matches expected structure and output format).
+
+### Minor nits (non-blocking)
+- `MODEL_PATH_KEYS` contains `"llama-2-13b-chat"` twice — a harmless copy/paste duplicate, no behavioral impact (dict `.get` just repeats a lookup).
+- The fix defaults to a 7B model while still honoring a user-specified 13B path; that's a deliberate config choice, not a bug.
+- The test will still download a ~4 GB GGUF at runtime, so it's slow, but that's inherent to the task, not a defect in the fix.
+
+### Verdict on suspicion points
+The only genuine behavioral hazard (returning a non-string) is fixed, and every API touched — `LlamaCPP` params, `llama_cpp` kwargs, `CompletionResponse.text`, `os.sched_getaffinity` — is used correctly. The extra changes (thread pinning, smaller context/tokens, Llama‑2 chat prompt templates, `echo=False`) are legitimate latency/quality fixes that don't break the contract.
+
+## Verdict
+
+**ACCEPT**
+
+The fixed code correctly returns `response.text` (a `str`), satisfying `assertIsInstance(response, str)` and `len(response) > 0`, validates structurally, and uses all `LlamaCPP`/`llama_cpp` APIs consistently with the documented signatures. The remaining issues are cosmetic (duplicate tuple entry) and unavoidable (large model download), neither of which is a correctness failure.
+--------------------------------------------------------------------------------
+"""Minimal LlamaIndex + llama.cpp agent that actually returns on CPU.
+
+Why the original snippet appeared to "hang forever" after model init:
+
+  1. It used Llama-2-13B (Q4_0, ~7 GB of weights alone). On a CPU-only box
+     that either starts swapping to disk or runs at well under 1 token/s,
+     and it was asked for 256 new tokens with a 3900-token context. The call
+     was not stuck, it was just astronomically slow.
+  2. `n_threads` was never set, so llama-cpp-python defaulted it to
+     os.cpu_count() (logical CPUs / hyperthreads, and inside containers or
+     VMs CPUs that are not actually schedulable). Oversubscribing threads is
+     a known way to make a llama.cpp generation call spin instead of return.
+
+The fix below uses a small CPU-friendly quantized GGUF, pins the thread count
+to the usable physical cores, uses a modest n_batch/n_ctx, asks for far fewer
+new tokens, and supplies the Llama-2-chat prompt templates so the response is
+a clean answer instead of a raw continuation.
+"""
+
+import json
+import os
+import time
+
+from llama_index.llms.llama_cpp import LlamaCPP
+
+# A 7B Q4_K_M GGUF (~4 GB) is about 4x faster than 13B on CPU and is small
+# enough to stay in RAM on a normal laptop. Override it in ./paths.json.
+DEFAULT_MODEL_URL = (
+    "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/"
+    "llama-2-7b-chat.Q4_K_M.gguf"
+)
+
+# Keys looked up in ./paths.json (local GGUF files take precedence).
+MODEL_PATH_KEYS = ("llama-2-7b-chat", "llama-2-13b-chat", "llama-2-13b-chat")
+
+SYSTEM_PROMPT = "You are a helpful assistant."
+
+# CPU budget: keep the context and the generation short enough to finish.
+CONTEXT_WINDOW = 2048
+MAX_NEW_TOKENS = 128
+
+
+def _usable_cores() -> int:
+    """Number of CPU threads llama.cpp should be allowed to use.
+
+    n_threads must not exceed the cores that are really schedulable, otherwise
+    llama.cpp's worker pool can spin forever and generation never returns.
+    """
+    cores = os.cpu_count() or 1
+
+    # Respect container / process affinity limits.
+    try:
+        cores = min(cores, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+
+    # Prefer physical cores (hyperthreads hurt llama.cpp).
+    try:
+        import psutil  # optional dependency
+
+        physical = psutil.cpu_count(logical=False)
+        if physical:
+            cores = min(cores, physical)
+    except Exception:
+        pass
+
+    # Never hand llama.cpp an absurd thread count (memory-bandwidth bound work).
+    return max(1, min(int(cores), 8))
+
+
+def _llama2_messages_to_prompt(messages) -> str:
+    """Llama-2-chat prompt for chat messages."""
+    system_prompt = SYSTEM_PROMPT
+    user_parts = []
+    for message in messages:
+        role = str(getattr(message, "role", "user"))
+        content = getattr(message, "content", "") or ""
+        if role == "system":
+            system_prompt = content or system_prompt
+        else:
+            user_parts.append(content)
+    body = "\n".join(user_parts)
+    return (
+        f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{body} [/INST]"
+    )
+
+
+def _llama2_completion_to_prompt(completion: str) -> str:
+    """Llama-2-chat prompt for a raw completion prompt."""
+    return (
+        f"<s>[INST] <<SYS>>\n{SYSTEM_PROMPT}\n<</SYS>>\n\n"
+        f"{completion} [/INST]"
+    )
+
+
+def _resolve_model():
+    """Return (model_url, model_path) - exactly one of them is not None."""
+    paths_file = "./paths.json"
+    if os.path.exists(paths_file):
+        with open(paths_file, "r") as f:
+            paths = json.load(f) or {}
+        for key in MODEL_PATH_KEYS:
+            candidate = paths.get(key)
+            if candidate and os.path.exists(os.path.expanduser(candidate)):
+                return None, os.path.expanduser(candidate)
+    return DEFAULT_MODEL_URL, None
+
+
+def build_llm() -> LlamaCPP:
+    model_url, model_path = _resolve_model()
+    n_threads = _usable_cores()
+
+    print(f"[llama.cpp] threads={n_threads}, "
+          f"source={model_path or model_url}")
+
+    return LlamaCPP(
+        model_url=model_url,
+        model_path=model_path,
+        temperature=0.1,
+        max_new_tokens=MAX_NEW_TOKENS,
+        context_window=CONTEXT_WINDOW,
+        messages_to_prompt=_llama2_messages_to_prompt,
+        completion_to_prompt=_llama2_completion_to_prompt,
+        model_kwargs={
+            "n_gpu_layers": 0,       # CPU only
+            "n_threads": n_threads,  # never more than usable physical cores
+            "n_batch": 128,          # small batch keeps RAM use and latency low
+            "n_ctx": CONTEXT_WINDOW,
+            "use_mlock": False,      # mlock can fail/hang on default limits
+            "verbose": False,
+        },
+        generate_kwargs={"echo": False},
+        verbose=True,
+    )
+
+
+def run_agent(query: str) -> str:
+    if MAX_NEW_TOKENS >= CONTEXT_WINDOW:
+        raise ValueError(
+            "max_new_tokens must be smaller than context_window "
+            f"({MAX_NEW_TOKENS} >= {CONTEXT_WINDOW})"
+        )
+
+    llm = build_llm()
+
+    start = time.time()
+    # A single short prompt also warms up the graph, so the second call is fast.
+    response = llm.complete(query)
+    elapsed = time.time() - start
+
+    print(f"[llama.cpp] completed in {elapsed:.1f}s")
+    return response.text
+
+
+if __name__ == "__main__":
+    query = "What is the capital of France?"
+    answer = run_agent(query)
+    print(answer)
+
+--------------------------------------------------------------------------------

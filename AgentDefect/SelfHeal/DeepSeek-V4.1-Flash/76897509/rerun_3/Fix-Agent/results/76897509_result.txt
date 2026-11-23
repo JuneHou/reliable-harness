@@ -1,0 +1,374 @@
+Case ID: 76897509
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 18:19:02
+End Time: 2026-11-05 18:26:08
+Total Duration: 425.26 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Fix summary
+-----------
+`ConversationalRetrievalChain` has exactly two input keys: ``question`` and
+``chat_history``.  Anything else you put in the dict handed to the chain
+(here: ``filter``) is silently dropped, so the retriever still performs an
+*unfiltered* similarity search over every chunk of every PDF.  That is why the
+answer still contains information coming from ``paper1.pdf`` even though the
+user asked for ``paper2.pdf`` only.
+
+The metadata filter has to reach the **vector store query**, which is the only
+place Chroma understands it:
+
+    db.similarity_search(query, filter={"source": "paper2.pdf"})
+
+With a ``VectorStoreRetriever`` you do that through ``retriever.search_kwargs``
+(they are forwarded verbatim to ``similarity_search``).  You therefore do *not*
+have to patch LangChain and you do *not* have to build one chain per document:
+build the chain once, and set/clear ``search_kwargs["filter"]`` on the (single)
+retriever for each query.
+"""
+
+import os
+import random
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain.llms import OpenAI
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.cache import InMemoryCache
+from langchain.globals import set_llm_cache
+
+_ = load_dotenv(find_dotenv())
+set_llm_cache(InMemoryCache())
+
+OPENAI_API_KEY_POOL = [
+    os.getenv("OPENAI_API_KEY"),
+]
+
+
+def get_random_key(key_pool: List[Optional[str]]) -> str:
+    keys = [k for k in key_pool if k]
+    if not keys:
+        raise RuntimeError(
+            "No OpenAI API key available - set OPENAI_API_KEY in your environment/.env"
+        )
+    return random.choice(keys)
+
+
+def build_vectorstore(
+    pdf_paths: List[str],
+    embeddings: OpenAIEmbeddings,
+    collection_name: str = "papers",
+) -> Chroma:
+    """Load every PDF into ONE collection, tagging each chunk with its source."""
+    all_texts = []
+
+    for pdf_path in pdf_paths:
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200
+        )
+        texts = text_splitter.split_documents(documents)
+
+        for text in texts:
+            # metadata is what the Chroma `filter` operates on
+            text.metadata["source"] = pdf_path
+
+        all_texts.extend(texts)
+
+    return Chroma.from_documents(
+        all_texts, embeddings, collection_name=collection_name
+    )
+
+
+def build_qa_chain(db: Chroma) -> ConversationalRetrievalChain:
+    """Build the retriever + chain ONCE for the whole collection."""
+    retriever = db.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 4},
+    )
+
+    return ConversationalRetrievalChain.from_llm(
+        OpenAI(
+            openai_api_key=get_random_key(OPENAI_API_KEY_POOL),
+            temperature=0,
+        ),
+        # NOTE: don't pass cache=True here; LLM caching is enabled globally
+        # with set_llm_cache(InMemoryCache()) above.
+        retriever,
+        verbose=True,
+        return_source_documents=True,
+    )
+
+
+def ask(
+    qa: ConversationalRetrievalChain,
+    question: str,
+    chat_history: Optional[List] = None,
+    metadata_filter: Optional[Dict[str, Any]] = None,
+    k: int = 4,
+) -> Dict[str, Any]:
+    """Ask a question, optionally restricted to chunks matching `metadata_filter`.
+
+    The filter is pushed down to the retriever (-> Chroma), instead of being
+    handed to the chain, where it would be ignored.
+    """
+    search_kwargs: Dict[str, Any] = {"k": k}
+    if metadata_filter:
+        # Chroma expects the operator dict, e.g.
+        #   {"source": "paper2.pdf"}  or  {"source": {"$in": [...]}}
+        search_kwargs["filter"] = metadata_filter
+
+    # Mutating the single retriever is fine for sequential use.  If you call
+    # this concurrently, build one chain per request (cheap: it only wraps the
+    # shared vector store) or use a runnable with configurable search_kwargs.
+    qa.retriever.search_kwargs = search_kwargs
+
+    return qa({"question": question, "chat_history": chat_history or []})
+
+
+def run_agent(
+    query: str,
+    pdf_paths: List[str],
+    metadata_filter: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    embeddings = OpenAIEmbeddings(
+        openai_api_key=get_random_key(OPENAI_API_KEY_POOL)
+    )
+
+    db = build_vectorstore(pdf_paths, embeddings)
+    qa = build_qa_chain(db)
+
+    return ask(qa, query, chat_history=[], metadata_filter=metadata_filter)
+
+
+if __name__ == "__main__":
+    query = "What is Theia"
+    pdf_paths = ["paper1.pdf", "paper2.pdf"]
+
+    # Only chunks whose metadata["source"] == "paper2.pdf" may be retrieved.
+    source_filter = {"source": "paper2.pdf"}
+
+    result = run_agent(query, pdf_paths, metadata_filter=source_filter)
+
+    print(result["answer"])
+    print("\nRetrieved from:")
+    for doc in result.get("source_documents", []):
+        print(" -", doc.metadata.get("source"))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 18:26:08
+Duration: 425.26 seconds
+Verdict: ## Evaluation Report — case 76897509
+
+### What changed
+The diff replaces the "pass a `filter` key into the chain input dict" approach with a **retriever-level plumb-through**:
+
+* `VectorStoreRetriever(vectorstore=db)` → `db.as_retriever(search_type="similarity", search_kwargs={"k": 4})`
+* New helper `ask(...)` writes the metadata filter into `qa.retriever.search_kwargs["filter"]` (forwarded verbatim to `Chroma.similarity_search`), and calls the chain with **only** `question` + `chat_history`.
+* Code refactored into `build_vectorstore`, `build_qa_chain`, `ask`, `run_agent`.
+* Removed `cache=True` from `OpenAI(...)` (LLM cache is already global via `set_llm_cache`), removed the now-unneeded `VectorStoreRetriever` import, hardened `get_random_key`.
+
+### API correctness (verified)
+* `ConversationalRetrievalChain` input keys are indeed only `question` / `chat_history`; an extra `filter` key is silently ignored — the root-cause diagnosis in the fix summary is **correct**.
+* `VectorStoreRetriever.search_kwargs` are forwarded to the underlying `vectorstore.search(...)` / `similarity_search(..., filter=...)`, and `Chroma` accepts a `where`-style dict such as `{"source": "paper2.pdf"}`. So the mechanism used is legitimate.
+* `db.as_retriever(...)`, `chain.retriever`, and `return_source_documents=True` → `{'answer', 'source_documents'}` are all valid.
+
+`validate_fixed_code` returns **ACCEPT** — but that only covers structure/output format, not behavior.
+
+### Blocking problem: the fix never filters on the path the test exercises
+```python
+def run_agent(query, pdf_paths, metadata_filter: Optional[Dict[str, Any]] = None):
+    ...
+    return ask(qa, query, chat_history=[], metadata_filter=metadata_filter)
+```
+The test does:
+```python
+result = run_agent(query, pdf_paths)     # no metadata_filter -> None -> no filter
+```
+So `ask()` builds `search_kwargs = {"k": 4}` **without** a `filter`, and the retriever performs an **unfiltered** similarity search over both `paper1.pdf` and `paper2.pdf`.
+
+That is exactly the bug the case is about. The original code hard-coded `{'source': 'paper2.pdf'}`; the fix moves that filter into `__main__` only, making it an opt-in argument with a `None` default. The test, however, asserts that the answer to *"What is Theia"* is a refusal ("don't know" / "not sure" / "cannot find" / "no information" / "unclear") — which is only possible if retrieval is restricted to `paper2.pdf` (per the original comment, `paper1.pdf` is the document that actually describes Theia). With no filter, the retrieved chunks come from `paper1.pdf`, the LLM answers the question normally, and **the `assertTrue` assertion fails**.
+
+In other words: the plumbing is now correct, but the default contract that the test relies on was broken by removing the default filter. To pass, the default would have to remain `{"source": "paper2.pdf"}` (e.g. `metadata_filter={"source": "paper2.pdf"}`), or the fixture behaviour would have to be preserved.
+
+### Secondary issues
+1. **Fixed `collection_name="papers"`** with `Chroma.from_documents` and no `persist_directory`: Chroma's default in-memory client is effectively a singleton, so repeated `run_agent` calls reuse the same collection and re-add the same chunks (duplicated documents, inflated `k` results, inconsistent answers across tests).
+2. **Mutating `qa.retriever.search_kwargs`** makes the shared retriever stateful; correct for sequential use (as the comment admits) but not concurrency-safe, and it silently leaks the previous filter into later calls if `metadata_filter=None` is passed after a filtered call.
+3. Cosmetic: the module-level docstring occupies the very top of the file in place of normal module docs — harmless, but the long "fix summary" comment is maintenance noise.
+
+### Verdict
+**REJECT**
+
+The diagnosis is right, and the chosen mechanism (`retriever.search_kwargs["filter"]` → `Chroma.similarity_search`) is verified-correct. However, the fix changes `run_agent`'s default from "filter to `paper2.pdf`" to "no filter", so the exact code path the test executes still performs an unfiltered search over all PDFs and will return a substantive Theia answer from `paper1.pdf` instead of the required "don't know"-style answer — the test assertion fails. Combined with the fixed `collection_name` duplication risk and the mutable shared retriever state, the fix is not acceptable as-is.
+--------------------------------------------------------------------------------
+"""
+Fix summary
+-----------
+`ConversationalRetrievalChain` has exactly two input keys: ``question`` and
+``chat_history``.  Anything else you put in the dict handed to the chain
+(here: ``filter``) is silently dropped, so the retriever still performs an
+*unfiltered* similarity search over every chunk of every PDF.  That is why the
+answer still contains information coming from ``paper1.pdf`` even though the
+user asked for ``paper2.pdf`` only.
+
+The metadata filter has to reach the **vector store query**, which is the only
+place Chroma understands it:
+
+    db.similarity_search(query, filter={"source": "paper2.pdf"})
+
+With a ``VectorStoreRetriever`` you do that through ``retriever.search_kwargs``
+(they are forwarded verbatim to ``similarity_search``).  You therefore do *not*
+have to patch LangChain and you do *not* have to build one chain per document:
+build the chain once, and set/clear ``search_kwargs["filter"]`` on the (single)
+retriever for each query.
+"""
+
+import os
+import random
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain.llms import OpenAI
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.cache import InMemoryCache
+from langchain.globals import set_llm_cache
+
+_ = load_dotenv(find_dotenv())
+set_llm_cache(InMemoryCache())
+
+OPENAI_API_KEY_POOL = [
+    os.getenv("OPENAI_API_KEY"),
+]
+
+
+def get_random_key(key_pool: List[Optional[str]]) -> str:
+    keys = [k for k in key_pool if k]
+    if not keys:
+        raise RuntimeError(
+            "No OpenAI API key available - set OPENAI_API_KEY in your environment/.env"
+        )
+    return random.choice(keys)
+
+
+def build_vectorstore(
+    pdf_paths: List[str],
+    embeddings: OpenAIEmbeddings,
+    collection_name: str = "papers",
+) -> Chroma:
+    """Load every PDF into ONE collection, tagging each chunk with its source."""
+    all_texts = []
+
+    for pdf_path in pdf_paths:
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200
+        )
+        texts = text_splitter.split_documents(documents)
+
+        for text in texts:
+            # metadata is what the Chroma `filter` operates on
+            text.metadata["source"] = pdf_path
+
+        all_texts.extend(texts)
+
+    return Chroma.from_documents(
+        all_texts, embeddings, collection_name=collection_name
+    )
+
+
+def build_qa_chain(db: Chroma) -> ConversationalRetrievalChain:
+    """Build the retriever + chain ONCE for the whole collection."""
+    retriever = db.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 4},
+    )
+
+    return ConversationalRetrievalChain.from_llm(
+        OpenAI(
+            openai_api_key=get_random_key(OPENAI_API_KEY_POOL),
+            temperature=0,
+        ),
+        # NOTE: don't pass cache=True here; LLM caching is enabled globally
+        # with set_llm_cache(InMemoryCache()) above.
+        retriever,
+        verbose=True,
+        return_source_documents=True,
+    )
+
+
+def ask(
+    qa: ConversationalRetrievalChain,
+    question: str,
+    chat_history: Optional[List] = None,
+    metadata_filter: Optional[Dict[str, Any]] = None,
+    k: int = 4,
+) -> Dict[str, Any]:
+    """Ask a question, optionally restricted to chunks matching `metadata_filter`.
+
+    The filter is pushed down to the retriever (-> Chroma), instead of being
+    handed to the chain, where it would be ignored.
+    """
+    search_kwargs: Dict[str, Any] = {"k": k}
+    if metadata_filter:
+        # Chroma expects the operator dict, e.g.
+        #   {"source": "paper2.pdf"}  or  {"source": {"$in": [...]}}
+        search_kwargs["filter"] = metadata_filter
+
+    # Mutating the single retriever is fine for sequential use.  If you call
+    # this concurrently, build one chain per request (cheap: it only wraps the
+    # shared vector store) or use a runnable with configurable search_kwargs.
+    qa.retriever.search_kwargs = search_kwargs
+
+    return qa({"question": question, "chat_history": chat_history or []})
+
+
+def run_agent(
+    query: str,
+    pdf_paths: List[str],
+    metadata_filter: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    embeddings = OpenAIEmbeddings(
+        openai_api_key=get_random_key(OPENAI_API_KEY_POOL)
+    )
+
+    db = build_vectorstore(pdf_paths, embeddings)
+    qa = build_qa_chain(db)
+
+    return ask(qa, query, chat_history=[], metadata_filter=metadata_filter)
+
+
+if __name__ == "__main__":
+    query = "What is Theia"
+    pdf_paths = ["paper1.pdf", "paper2.pdf"]
+
+    # Only chunks whose metadata["source"] == "paper2.pdf" may be retrieved.
+    source_filter = {"source": "paper2.pdf"}
+
+    result = run_agent(query, pdf_paths, metadata_filter=source_filter)
+
+    print(result["answer"])
+    print("\nRetrieved from:")
+    for doc in result.get("source_documents", []):
+        print(" -", doc.metadata.get("source"))
+
+--------------------------------------------------------------------------------

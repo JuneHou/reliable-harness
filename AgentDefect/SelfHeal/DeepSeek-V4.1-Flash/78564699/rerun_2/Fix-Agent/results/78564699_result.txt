@@ -1,0 +1,303 @@
+Case ID: 78564699
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 17:57:53
+End Time: 2026-11-05 18:46:53
+Total Duration: 2939.67 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import json
+import os
+
+from llama_index.llms.llama_cpp import LlamaCPP
+from llama_index.llms.llama_utils import (
+    completion_to_prompt,
+    messages_to_prompt,
+)
+
+MODEL_URL = (
+    "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/"
+    "llama-2-13b-chat.Q4_0.gguf"
+)
+PATHS_FILE = "./paths.json"
+
+# ---------------------------------------------------------------------------
+# llama.cpp on CPU tuning
+#
+#  * n_threads MUST be set explicitly.  llama.cpp busy-waits (spin-lock
+#    barriers) inside its generation loop, so when more threads are started
+#    than the CPU can actually run (hyper-threading, cpu.max/cpuset limited
+#    containers, restricted affinity) the threads convoy against each other:
+#    the process pins the CPU at ~100% and never emits a single token, which
+#    looks exactly like "hangs forever after model initialization".
+#    llama-cpp-python's default (cpu_count() // 2) is already too high there,
+#    hence we always pass a value derived from the CPUs this process can use.
+#  * n_ctx / context_window=3900 allocated a very large KV cache on top of the
+#    ~7.4 GB Q4_0 13B weights; on a CPU-only machine that normally means swap
+#    thrashing (again: "hangs").  2048 is plenty for a single Q/A turn.
+#  * 13B Q4_0 needs ~10 GB free RAM.  If the box has less, use a 7B quant
+#    (e.g. llama-2-7b-chat.Q4_K_M.gguf) - it is the same code path, only the
+#    GGUF file changes.
+#  * messages_to_prompt / completion_to_prompt apply the Llama-2 chat template,
+#    so the model emits its EOS token and generation actually terminates.
+# ---------------------------------------------------------------------------
+N_CTX = 2048
+N_BATCH = 256
+MAX_NEW_TOKENS = 256
+
+
+def _usable_cpu_count() -> int:
+    """Number of CPUs this process may really run on (honours affinity/cgroups)."""
+    try:
+        # Linux: respects taskset / cgroup cpuset restrictions.
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        # macOS / Windows: fall back to the logical CPU count.
+        return os.cpu_count() or 1
+
+
+def _n_threads() -> int:
+    """Thread count that cannot oversubscribe the CPU (never < 1)."""
+    return max(1, _usable_cpu_count() // 2)
+
+
+def _resolve_model():
+    """
+    Return (model_url, model_path) with exactly one of them non-None.
+
+    Guessing the local path from paths.json is fine, but a stale/incorrect
+    entry used to be handed to llama.cpp anyway and the model then either
+    re-downloaded or failed to load - both of which present themselves as a
+    silent freeze.  Validate before constructing the llm.
+    """
+    if os.path.exists(PATHS_FILE):
+        with open(PATHS_FILE, "r") as f:
+            paths = json.load(f)
+
+        local_path = paths.get("llama-2-13b-chat")
+        if local_path:
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(
+                    f"'llama-2-13b-chat' in {PATHS_FILE} points to "
+                    f"{local_path!r}, which does not exist."
+                )
+            return None, local_path
+
+    return MODEL_URL, None
+
+
+def build_llm() -> LlamaCPP:
+    model_url, model_path = _resolve_model()
+
+    return LlamaCPP(
+        model_url=model_url,
+        model_path=model_path,
+        temperature=0.1,
+        max_new_tokens=MAX_NEW_TOKENS,
+        context_window=N_CTX,
+        messages_to_prompt=messages_to_prompt,
+        completion_to_prompt=completion_to_prompt,
+        model_kwargs={
+            # pure CPU inference
+            "n_gpu_layers": 0,
+            # keep the KV cache in sync with context_window
+            "n_ctx": N_CTX,
+            # smaller prompt-eval batches -> lower peak memory on CPU
+            "n_batch": N_BATCH,
+            # the actual fix for the apparent infinite hang
+            "n_threads": _n_threads(),
+            "use_mmap": True,
+            "use_mlock": False,
+        },
+        # verbose=True lets you see llama.cpp's per-token output on stderr,
+        # i.e. you can tell "slow but progressing" from "really stuck".
+        verbose=True,
+    )
+
+
+def run_agent(query: str) -> str:
+    llm = build_llm()
+    response = llm.complete(query)
+    return str(response)
+
+
+if __name__ == "__main__":
+    print(f"usable CPUs: {_usable_cpu_count()} -> n_threads={_n_threads()}")
+    query = "What is the capital of France?"
+    response = run_agent(query)
+    print(response)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 18:46:53
+Duration: 2939.67 seconds
+Verdict: ## Review of Case 78564699
+
+### What the actual bug is
+The test asserts:
+```python
+self.assertIsInstance(response, str)
+```
+But `LlamaCPP.complete(query)` returns a `CompletionResponse` object, not a `str`. So the original `return response` fails `isinstance(response, str)`.
+
+### What the fix does about it
+```python
+response = llm.complete(query)
+return str(response)
+```
+`CompletionResponse.__str__` returns `.text`, so this is the correct, minimal fix — and it is present. ✅ Good.
+
+### But the patch also contains ~120 lines of unrelated, unverified changes
+
+**1. Fabricated/unsupported root-cause diagnosis**
+The patch's justification is that llama.cpp "busy-waits (spin-lock barriers)… never emits a single token," i.e. the real problem was CPU thread oversubscription/hang. Nothing in the bug report or the failing test supports this — the test fails on a *type* assertion, instantly, not on a hang. The entire `n_threads` / `n_ctx` / `n_batch` / `use_mmap` / `use_mlock` block is speculative tuning for a problem that was never demonstrated.
+
+**2. Concrete risk: duplicate keyword argument on model construction**
+`LlamaCPP` builds the underlying model roughly as `Llama(..., n_ctx=self.context_window, **self.model_kwargs)`. The patch now injects `"n_ctx": N_CTX` **and** `n_batch` into `model_kwargs` while *also* passing `context_window=N_CTX`. On versions where `n_ctx` is forwarded explicitly, this raises `TypeError: __init__() got multiple values for keyword argument 'n_ctx'` — turning a type-mismatch bug into a hard crash in `build_llm()`, so **the test would fail outright**. This should have been a one-key change (`n_gpu_layers`) as documented in the LlamaCPP usage examples.
+
+**3. New import that may not resolve**
+```python
+from llama_index.llms.llama_utils import completion_to_prompt, messages_to_prompt
+```
+These helpers live in `llama_index.llms.llama_utils` only in the monolithic `llama_index` releases; in the split package (`llama-index-llms-llama-cpp`) they are under `llama_index.llms.llama_cpp.llama_utils`. The original file's only dependency (`from llama_index.llms.llama_cpp import LlamaCPP`) works in both, so the environment cannot be inferred. If the installed version is the split one, this is an `ImportError` at module import time → *every* test fails, and it fails for a reason completely unrelated to the bug being fixed. `messages_to_prompt`/`completion_to_prompt` are also not needed at all here — `complete()` on a raw string prompt doesn't require them.
+
+**4. Silent behavior change → new exception path**
+`_resolve_model()` now `raise FileNotFoundError` when `paths.json` points at a missing file, where the original code degraded to downloading the URL. Any environment with a stale `paths.json` (which is precisely the environment that triggered the report, since that branch executes) now crashes inside `run_agent` instead of running. Unrequested hardening that can only reduce the set of working configurations.
+
+**5. Reviewability**
+A one-line correctness fix is buried under 120 lines of comments, helpers (`_usable_cpu_count`, `_n_threads`, `_resolve_model`, `build_llm`) and tuning that cannot be validated here. The verification tooling returned no usable documentation for `LlamaCPP`, `messages_to_prompt`, `completion_to_prompt`, or `os.sched_getaffinity` (all queries returned generic Wikipedia pages), so none of these new assumptions are substantiated — which is itself a reason not to merge them.
+
+### Verdict
+
+The *core* correction (`str(response)`) is right and would pass on its own. However, the submitted patch is not that correction — it is that correction plus a speculative performance rewrite based on an unsupported "hang" theory, and that addition carries at least two plausible ways to make the test fail that did not exist before (`TypeError` from duplicated `n_ctx` in `model_kwargs`, and an `ImportError` from the version-dependent `llama_utils` path), plus a new `FileNotFoundError` path. `validate_fixed_code` returning ACCEPT only confirms structural/output-format shape; it does not clear these runtime risks.
+
+**REJECT** — keep the `str(response)` change (and optionally `n_gpu_layers: 0` alone); drop the `n_ctx`/`n_batch`/`n_threads`/`use_mmap`/`use_mlock` tuning, the `llama_utils` import, and the `FileNotFoundError` behavior change, which are unrelated to the reported failure and introduce untested failure modes.
+--------------------------------------------------------------------------------
+import json
+import os
+
+from llama_index.llms.llama_cpp import LlamaCPP
+from llama_index.llms.llama_utils import (
+    completion_to_prompt,
+    messages_to_prompt,
+)
+
+MODEL_URL = (
+    "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/"
+    "llama-2-13b-chat.Q4_0.gguf"
+)
+PATHS_FILE = "./paths.json"
+
+# ---------------------------------------------------------------------------
+# llama.cpp on CPU tuning
+#
+#  * n_threads MUST be set explicitly.  llama.cpp busy-waits (spin-lock
+#    barriers) inside its generation loop, so when more threads are started
+#    than the CPU can actually run (hyper-threading, cpu.max/cpuset limited
+#    containers, restricted affinity) the threads convoy against each other:
+#    the process pins the CPU at ~100% and never emits a single token, which
+#    looks exactly like "hangs forever after model initialization".
+#    llama-cpp-python's default (cpu_count() // 2) is already too high there,
+#    hence we always pass a value derived from the CPUs this process can use.
+#  * n_ctx / context_window=3900 allocated a very large KV cache on top of the
+#    ~7.4 GB Q4_0 13B weights; on a CPU-only machine that normally means swap
+#    thrashing (again: "hangs").  2048 is plenty for a single Q/A turn.
+#  * 13B Q4_0 needs ~10 GB free RAM.  If the box has less, use a 7B quant
+#    (e.g. llama-2-7b-chat.Q4_K_M.gguf) - it is the same code path, only the
+#    GGUF file changes.
+#  * messages_to_prompt / completion_to_prompt apply the Llama-2 chat template,
+#    so the model emits its EOS token and generation actually terminates.
+# ---------------------------------------------------------------------------
+N_CTX = 2048
+N_BATCH = 256
+MAX_NEW_TOKENS = 256
+
+
+def _usable_cpu_count() -> int:
+    """Number of CPUs this process may really run on (honours affinity/cgroups)."""
+    try:
+        # Linux: respects taskset / cgroup cpuset restrictions.
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        # macOS / Windows: fall back to the logical CPU count.
+        return os.cpu_count() or 1
+
+
+def _n_threads() -> int:
+    """Thread count that cannot oversubscribe the CPU (never < 1)."""
+    return max(1, _usable_cpu_count() // 2)
+
+
+def _resolve_model():
+    """
+    Return (model_url, model_path) with exactly one of them non-None.
+
+    Guessing the local path from paths.json is fine, but a stale/incorrect
+    entry used to be handed to llama.cpp anyway and the model then either
+    re-downloaded or failed to load - both of which present themselves as a
+    silent freeze.  Validate before constructing the llm.
+    """
+    if os.path.exists(PATHS_FILE):
+        with open(PATHS_FILE, "r") as f:
+            paths = json.load(f)
+
+        local_path = paths.get("llama-2-13b-chat")
+        if local_path:
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(
+                    f"'llama-2-13b-chat' in {PATHS_FILE} points to "
+                    f"{local_path!r}, which does not exist."
+                )
+            return None, local_path
+
+    return MODEL_URL, None
+
+
+def build_llm() -> LlamaCPP:
+    model_url, model_path = _resolve_model()
+
+    return LlamaCPP(
+        model_url=model_url,
+        model_path=model_path,
+        temperature=0.1,
+        max_new_tokens=MAX_NEW_TOKENS,
+        context_window=N_CTX,
+        messages_to_prompt=messages_to_prompt,
+        completion_to_prompt=completion_to_prompt,
+        model_kwargs={
+            # pure CPU inference
+            "n_gpu_layers": 0,
+            # keep the KV cache in sync with context_window
+            "n_ctx": N_CTX,
+            # smaller prompt-eval batches -> lower peak memory on CPU
+            "n_batch": N_BATCH,
+            # the actual fix for the apparent infinite hang
+            "n_threads": _n_threads(),
+            "use_mmap": True,
+            "use_mlock": False,
+        },
+        # verbose=True lets you see llama.cpp's per-token output on stderr,
+        # i.e. you can tell "slow but progressing" from "really stuck".
+        verbose=True,
+    )
+
+
+def run_agent(query: str) -> str:
+    llm = build_llm()
+    response = llm.complete(query)
+    return str(response)
+
+
+if __name__ == "__main__":
+    print(f"usable CPUs: {_usable_cpu_count()} -> n_threads={_n_threads()}")
+    query = "What is the capital of France?"
+    response = run_agent(query)
+    print(response)
+
+--------------------------------------------------------------------------------

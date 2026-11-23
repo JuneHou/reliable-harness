@@ -1,0 +1,766 @@
+Case ID: metagpt_1313
+Status: FAILED
+Final Attempt: 3
+Start Time: 2026-11-09 11:43:23
+End Time: 2026-11-09 11:47:29
+Total Duration: 245.65 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### metagpt/ext/werewolf/roles/base_player.py
+import re
+
+from pydantic import Field, SerializeAsAny, model_validator
+
+from metagpt.actions.action import Action
+from metagpt.environment.werewolf.const import RoleState, RoleType
+from metagpt.ext.werewolf.actions import (
+    ACTIONS,
+    AddNewExperiences,
+    InstructSpeak,
+    NighttimeWhispers,
+    Reflect,
+    RetrieveExperiences,
+    Speak,
+)
+from metagpt.ext.werewolf.schema import RoleExperience, WwMessage
+from metagpt.logs import logger
+from metagpt.roles import Role
+from metagpt.utils.common import any_to_str
+
+
+class BasePlayer(Role):
+    name: str = "PlayerXYZ"
+    profile: str = "BasePlayer"
+    special_action_names: list[str] = []
+    use_reflection: bool = True
+    use_experience: bool = False
+    use_memory_selection: bool = False
+    new_experience_version: str = ""
+    status: RoleState = RoleState.ALIVE
+
+    special_actions: list[SerializeAsAny[Action]] = Field(default=[], validate_default=True)
+    experiences: list[RoleExperience] = []
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # 技能和监听配置
+        self._watch([InstructSpeak])  # 监听Moderator的指令以做行动
+        special_actions = [ACTIONS[action_name] for action_name in self.special_action_names]
+        capable_actions = [Speak] + special_actions
+        self.set_actions(capable_actions)  # 给角色赋予行动技能
+        self.special_actions = special_actions
+
+        if not self.use_reflection and self.use_experience:
+            logger.warning("You must enable use_reflection before using experience")
+            self.use_experience = False
+
+    @model_validator(mode="after")
+    def check_addresses(self):
+        if not self.addresses:
+            self.addresses = {any_to_str(self), self.name, self.profile} if self.name else {any_to_str(self)}
+        return self
+
+    async def _observe(self, ignore_memory=False) -> int:
+        if self.status != RoleState.ALIVE:
+            # 死者不再参与游戏
+            return 0
+        news = []
+        if not news:
+            news = self.rc.msg_buffer.pop_all()
+        old_messages = [] if ignore_memory else self.rc.memory.get()
+        for m in news:
+            # Some Message objects (e.g., generic Message) may not have a 'restricted_to' attribute.
+            # Use getattr with a default empty set for compatibility.
+            restricted = getattr(m, "restricted_to", set())
+            if len(restricted) and self.profile not in restricted and self.name not in restricted:
+                # if the msg is not sent to the whole audience ("" or missing) nor this role (self.profile or self.name),
+                # then this role should not be able to receive it and record it into its memory
+                continue
+            self.rc.memory.add(m)
+        self.rc.news = [
+            n for n in news if (n.cause_by in self.rc.watch or self.profile in n.send_to) and n not in old_messages
+        ]
+
+        # TODO to delete
+        # await super()._observe()
+        # # 只有发给全体的（""）或发给自己的（self.profile）消息需要走下面的_react流程，
+        # # 其他的收听到即可，不用做动作
+        # self.rc.news = [msg for msg in self.rc.news if msg.send_to in ["", self.profile]]
+        return len(self.rc.news)
+
+    async def _think(self):
+        news = self.rc.news[0]
+        assert news.cause_by == any_to_str(InstructSpeak)  # 消息为来自Moderator的指令时，才去做动作
+        if not news.restricted_to:
+            # 消息接收范围为全体角色的，做公开发言（发表投票观点也算发言）
+            self.rc.todo = Speak()
+        elif self.profile in news.restricted_to:
+            # FIXME: hard code to split, restricted为"Moderator"或"Moderator, 角色profile"
+            # Moderator加密发给自己的，意味着要执行角色的特殊动作
+            self.rc.todo = self.special_actions[0]()
+
+    async def _act(self):
+        # todo为_think时确定的，有两种情况，Speak或Protect
+        todo = self.rc.todo
+        logger.info(f"{self._setting}: ready to {str(todo)}")
+
+        # 可以用这个函数获取该角色的全部记忆和最新的instruction
+        memories = self.get_all_memories()
+        latest_instruction = self.get_latest_instruction()
+
+        reflection = (
+            await Reflect().run(
+                profile=self.profile, name=self.name, context=memories, latest_instruction=latest_instruction
+            )
+            if self.use_reflection
+            else ""
+        )
+
+        experiences = (
+            RetrieveExperiences().run(
+                query=reflection, profile=self.profile, excluded_version=self.new_experience_version
+            )
+            if self.use_experience
+            else ""
+        )
+
+        # 根据自己定义的角色Action，对应地去run，run的入参可能不同
+        if isinstance(todo, Speak):
+            rsp = await todo.run(
+                profile=self.profile,
+                name=self.name,
+                context=memories,
+                latest_instruction=latest_instruction,
+                reflection=reflection,
+                experiences=experiences,
+            )
+            restricted_to = set()
+
+        elif isinstance(todo, NighttimeWhispers):
+            rsp = await todo.run(
+                profile=self.profile, name=self.name, context=memories, reflection=reflection, experiences=experiences
+            )
+            restricted_to = {RoleType.MODERATOR.value, self.profile}  # 给Moderator发送使用特殊技能的加密消息
+        msg = WwMessage(
+            content=rsp,
+            role=self.profile,
+            sent_from=self.name,
+            cause_by=type(todo),
+            send_to={},
+            restricted_to=restricted_to,
+        )
+
+        self.experiences.append(
+            RoleExperience(
+                name=self.name,
+                profile=self.profile,
+                reflection=reflection,
+                instruction=latest_instruction,
+                response=rsp,
+                version=self.new_experience_version,
+            )
+        )
+
+        logger.info(f"{self._setting}: {rsp}")
+
+        return msg
+
+    def get_all_memories(self) -> str:
+        memories = self.rc.memory.get()
+        time_stamp_pattern = r"[0-9]+ \| "
+        # NOTE: 除Moderator外，其他角色使用memory，只能用m.sent_from（玩家名）不能用m.role（玩家角色），因为他们不知道说话者的身份
+        memories = [f"{m.sent_from}: {re.sub(time_stamp_pattern, '', m.content)}" for m in memories]  # regex去掉时间戳
+        memories = "\n".join(memories)
+        return memories
+
+    def get_latest_instruction(self) -> str:
+        return self.rc.important_memory[-1].content  # 角色监听着Moderator的InstructSpeak，是其重要记忆，直接获取即可
+
+    def set_status(self, new_status: RoleState):
+        self.status = new_status
+
+    def record_experiences(self, round_id: str, outcome: str, game_setup: str):
+        experiences = [exp for exp in self.experiences if len(exp.reflection) > 2]  # not "" or not '""'
+        for exp in experiences:
+            exp.round_id = round_id
+            exp.outcome = outcome
+            exp.game_setup = game_setup
+        AddNewExperiences().run(experiences)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 11:44:58
+Duration: 94.74 seconds
+Verdict: REJECT
+
+**Reasoning:**
+
+The diff shows that the entire original code (including `examples/werewolf_game/start_game.py`, `metagpt/utils/common.py`, `metagpt/roles/role.py`, and `metagpt/team.py`) was removed, and only a tiny portion of `base_player.py` was retained with a minor modification. This removal eliminates essential modules required for the game script to run and for the tests to import those files. Consequently, the fixed code does not contain the necessary files and fails structural validation. Hence, the submission must be rejected.
+--------------------------------------------------------------------------------
+### metagpt/ext/werewolf/roles/base_player.py
+import re
+
+from pydantic import Field, SerializeAsAny, model_validator
+
+from metagpt.actions.action import Action
+from metagpt.environment.werewolf.const import RoleState, RoleType
+from metagpt.ext.werewolf.actions import (
+    ACTIONS,
+    AddNewExperiences,
+    InstructSpeak,
+    NighttimeWhispers,
+    Reflect,
+    RetrieveExperiences,
+    Speak,
+)
+from metagpt.ext.werewolf.schema import RoleExperience, WwMessage
+from metagpt.logs import logger
+from metagpt.roles import Role
+from metagpt.utils.common import any_to_str
+
+
+class BasePlayer(Role):
+    name: str = "PlayerXYZ"
+    profile: str = "BasePlayer"
+    special_action_names: list[str] = []
+    use_reflection: bool = True
+    use_experience: bool = False
+    use_memory_selection: bool = False
+    new_experience_version: str = ""
+    status: RoleState = RoleState.ALIVE
+
+    special_actions: list[SerializeAsAny[Action]] = Field(default=[], validate_default=True)
+    experiences: list[RoleExperience] = []
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # 技能和监听配置
+        self._watch([InstructSpeak])  # 监听Moderator的指令以做行动
+        special_actions = [ACTIONS[action_name] for action_name in self.special_action_names]
+        capable_actions = [Speak] + special_actions
+        self.set_actions(capable_actions)  # 给角色赋予行动技能
+        self.special_actions = special_actions
+
+        if not self.use_reflection and self.use_experience:
+            logger.warning("You must enable use_reflection before using experience")
+            self.use_experience = False
+
+    @model_validator(mode="after")
+    def check_addresses(self):
+        if not self.addresses:
+            self.addresses = {any_to_str(self), self.name, self.profile} if self.name else {any_to_str(self)}
+        return self
+
+    async def _observe(self, ignore_memory=False) -> int:
+        if self.status != RoleState.ALIVE:
+            # 死者不再参与游戏
+            return 0
+        news = []
+        if not news:
+            news = self.rc.msg_buffer.pop_all()
+        old_messages = [] if ignore_memory else self.rc.memory.get()
+        for m in news:
+            # Safely handle messages that may not have a 'restricted_to' attribute (e.g., generic Message objects)
+            restricted_to = getattr(m, "restricted_to", set())
+            if restricted_to and self.profile not in restricted_to and self.name not in restricted_to:
+                # Message is restricted and not intended for this player
+                continue
+            self.rc.memory.add(m)
+        self.rc.news = [
+            n for n in news if (n.cause_by in self.rc.watch or self.profile in n.send_to) and n not in old_messages
+        ]
+
+        # TODO to delete
+        # await super()._observe()
+        # # 只有发给全体的（""）或发给自己的（self.profile）消息需要走下面的_react流程，
+        # # 其他的收听到即可，不用做动作
+        # self.rc.news = [msg for msg in self.rc.news if msg.send_to in ["", self.profile]]
+        return len(self.rc.news)
+
+    async def _think(self):
+        news = self.rc.news[0]
+        assert news.cause_by == any_to_str(InstructSpeak)  # 消息为来自Moderator的指令时，才去做动作
+        if not news.restricted_to:
+            # 消息接收范围为全体角色的，做公开发言（发表投票观点也算发言）
+            self.rc.todo = Speak()
+        elif self.profile in news.restricted_to:
+            # FIXME: hard code to split, restricted为"Moderator"或"Moderator, 角色profile"
+            # Moderator加密发给自己的，意味着要执行角色的特殊动作
+            self.rc.todo = self.special_actions[0]()
+
+    async def _act(self):
+        # todo为_think时确定的，有两种情况，Speak或Protect
+        todo = self.rc.todo
+        logger.info(f"{self._setting}: ready to {str(todo)}")
+
+        # 可以用这个函数获取该角色的全部记忆和最新的instruction
+        memories = self.get_all_memories()
+        latest_instruction = self.get_latest_instruction()
+
+        reflection = (
+            await Reflect().run(
+                profile=self.profile, name=self.name, context=memories, latest_instruction=latest_instruction
+            )
+            if self.use_reflection
+            else ""
+        )
+
+        experiences = (
+            RetrieveExperiences().run(
+                query=reflection, profile=self.profile, excluded_version=self.new_experience_version
+            )
+            if self.use_experience
+            else ""
+        )
+
+        # 根据自己定义的角色Action，对应地去run，run的入参可能不同
+        if isinstance(todo, Speak):
+            rsp = await todo.run(
+                profile=self.profile,
+                name=self.name,
+                context=memories,
+                latest_instruction=latest_instruction,
+                reflection=reflection,
+                experiences=experiences,
+            )
+            restricted_to = set()
+
+        elif isinstance(todo, NighttimeWhispers):
+            rsp = await todo.run(
+                profile=self.profile, name=self.name, context=memories, reflection=reflection, experiences=experiences
+            )
+            restricted_to = {RoleType.MODERATOR.value, self.profile}  # 给Moderator发送使用特殊技能的加密消息
+        msg = WwMessage(
+            content=rsp,
+            role=self.profile,
+            sent_from=self.name,
+            cause_by=type(todo),
+            send_to={},
+            restricted_to=restricted_to,
+        )
+
+        self.experiences.append(
+            RoleExperience(
+                name=self.name,
+                profile=self.profile,
+                reflection=reflection,
+                instruction=latest_instruction,
+                response=rsp,
+                version=self.new_experience_version,
+            )
+        )
+
+        logger.info(f"{self._setting}: {rsp}")
+
+        return msg
+
+    def get_all_memories(self) -> str:
+        memories = self.rc.memory.get()
+        time_stamp_pattern = r"[0-9]+ \| "
+        # NOTE: 除Moderator外，其他角色使用memory，只能用m.sent_from（玩家名）不能用m.role（玩家角色），因为他们不知道说话者的身份
+        memories = [f"{m.sent_from}: {re.sub(time_stamp_pattern, '', m.content)}" for m in memories]  # regex去掉时间戳
+        memories = "\n".join(memories)
+        return memories
+
+    def get_latest_instruction(self) -> str:
+        return self.rc.important_memory[-1].content  # 角色监听着Moderator的InstructSpeak，是其重要记忆，直接获取即可
+
+    def set_status(self, new_status: RoleState):
+        self.status = new_status
+
+    def record_experiences(self, round_id: str, outcome: str, game_setup: str):
+        experiences = [exp for exp in self.experiences if len(exp.reflection) > 2]  # not "" or not '""'
+        for exp in experiences:
+            exp.round_id = round_id
+            exp.outcome = outcome
+            exp.game_setup = game_setup
+        AddNewExperiences().run(experiences)
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-09 11:46:10
+Duration: 72.61 seconds
+Verdict: REJECT
+
+**Reasoning**
+
+The diff shows that the entire original code base (the buggy version) was removed, leaving only a few modifications in `metagpt/ext/werewolf/roles/base_player.py`. This means the required files `examples/werewolf_game/start_game.py`, `metagpt/utils/common.py`, `metagpt/roles/role.py`, and `metagpt/team.py` are missing entirely from the fixed code. Consequently, the structural validation fails (the expected sections are not present), and the test suite that runs the werewolf game script cannot import the necessary modules. Therefore the fix is incomplete and the case must be rejected.
+--------------------------------------------------------------------------------
+### metagpt/ext/werewolf/roles/base_player.py
+import re
+
+from pydantic import Field, SerializeAsAny, model_validator
+
+from metagpt.actions.action import Action
+from metagpt.environment.werewolf.const import RoleState, RoleType
+from metagpt.ext.werewolf.actions import (
+    ACTIONS,
+    AddNewExperiences,
+    InstructSpeak,
+    NighttimeWhispers,
+    Reflect,
+    RetrieveExperiences,
+    Speak,
+)
+from metagpt.ext.werewolf.schema import RoleExperience, WwMessage
+from metagpt.logs import logger
+from metagpt.roles import Role
+from metagpt.utils.common import any_to_str
+
+
+class BasePlayer(Role):
+    name: str = "PlayerXYZ"
+    profile: str = "BasePlayer"
+    special_action_names: list[str] = []
+    use_reflection: bool = True
+    use_experience: bool = False
+    use_memory_selection: bool = False
+    new_experience_version: str = ""
+    status: RoleState = RoleState.ALIVE
+
+    special_actions: list[SerializeAsAny[Action]] = Field(default=[], validate_default=True)
+    experiences: list[RoleExperience] = []
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # 技能和监听配置
+        self._watch([InstructSpeak])  # 监听Moderator的指令以做行动
+        special_actions = [ACTIONS[action_name] for action_name in self.special_action_names]
+        capable_actions = [Speak] + special_actions
+        self.set_actions(capable_actions)  # 给角色赋予行动技能
+        self.special_actions = special_actions
+
+        if not self.use_reflection and self.use_experience:
+            logger.warning("You must enable use_reflection before using experience")
+            self.use_experience = False
+
+    @model_validator(mode="after")
+    def check_addresses(self):
+        if not self.addresses:
+            self.addresses = {any_to_str(self), self.name, self.profile} if self.name else {any_to_str(self)}
+        return self
+
+    async def _observe(self, ignore_memory=False) -> int:
+        if self.status != RoleState.ALIVE:
+            # 死者不再参与游戏
+            return 0
+        news = []
+        if not news:
+            news = self.rc.msg_buffer.pop_all()
+        old_messages = [] if ignore_memory else self.rc.memory.get()
+        for m in news:
+            # Safely handle messages that may not have a 'restricted_to' attribute
+            restricted_to = getattr(m, "restricted_to", set())
+            if len(restricted_to) and self.profile not in restricted_to and self.name not in restricted_to:
+                # if the msg is not sent to the whole audience ("") nor this role (self.profile or self.name),
+                # then this role should not be able to receive it and record it into its memory
+                continue
+            self.rc.memory.add(m)
+        self.rc.news = [
+            n for n in news if (n.cause_by in self.rc.watch or self.profile in n.send_to) and n not in old_messages
+        ]
+
+        # TODO to delete
+        # await super()._observe()
+        # # 只有发给全体的（""）或发给自己的（self.profile）消息需要走下面的_react流程，
+        # # 其他的收听到即可，不用做动作
+        # self.rc.news = [msg for msg in self.rc.news if msg.send_to in ["", self.profile]]
+        return len(self.rc.news)
+
+    async def _think(self):
+        news = self.rc.news[0]
+        assert news.cause_by == any_to_str(InstructSpeak)  # 消息为来自Moderator的指令时，才去做动作
+        if not news.restricted_to:
+            # 消息接收范围为全体角色的，做公开发言（发表投票观点也算发言）
+            self.rc.todo = Speak()
+        elif self.profile in news.restricted_to:
+            # FIXME: hard code to split, restricted为"Moderator"或"Moderator, 角色profile"
+            # Moderator加密发给自己的，意味着要执行角色的特殊动作
+            self.rc.todo = self.special_actions[0]()
+
+    async def _act(self):
+        # todo为_think时确定的，有两种情况，Speak或Protect
+        todo = self.rc.todo
+        logger.info(f"{self._setting}: ready to {str(todo)}")
+
+        # 可以用这个函数获取该角色的全部记忆和最新的instruction
+        memories = self.get_all_memories()
+        latest_instruction = self.get_latest_instruction()
+
+        reflection = (
+            await Reflect().run(
+                profile=self.profile, name=self.name, context=memories, latest_instruction=latest_instruction
+            )
+            if self.use_reflection
+            else ""
+        )
+
+        experiences = (
+            RetrieveExperiences().run(
+                query=reflection, profile=self.profile, excluded_version=self.new_experience_version
+            )
+            if self.use_experience
+            else ""
+        )
+
+        # 根据自己定义的角色Action，对应地去run，run的入参可能不同
+        if isinstance(todo, Speak):
+            rsp = await todo.run(
+                profile=self.profile,
+                name=self.name,
+                context=memories,
+                latest_instruction=latest_instruction,
+                reflection=reflection,
+                experiences=experiences,
+            )
+            restricted_to = set()
+
+        elif isinstance(todo, NighttimeWhispers):
+            rsp = await todo.run(
+                profile=self.profile, name=self.name, context=memories, reflection=reflection, experiences=experiences
+            )
+            restricted_to = {RoleType.MODERATOR.value, self.profile}  # 给Moderator发送使用特殊技能的加密消息
+        msg = WwMessage(
+            content=rsp,
+            role=self.profile,
+            sent_from=self.name,
+            cause_by=type(todo),
+            send_to={},
+            restricted_to=restricted_to,
+        )
+
+        self.experiences.append(
+            RoleExperience(
+                name=self.name,
+                profile=self.profile,
+                reflection=reflection,
+                instruction=latest_instruction,
+                response=rsp,
+                version=self.new_experience_version,
+            )
+        )
+
+        logger.info(f"{self._setting}: {rsp}")
+
+        return msg
+
+    def get_all_memories(self) -> str:
+        memories = self.rc.memory.get()
+        time_stamp_pattern = r"[0-9]+ \| "
+        # NOTE: 除Moderator外，其他角色使用memory，只能用m.sent_from（玩家名）不能用m.role（玩家角色），因为他们不知道说话者的身份
+        memories = [f"{m.sent_from}: {re.sub(time_stamp_pattern, '', m.content)}" for m in memories]  # regex去掉时间戳
+        memories = "\n".join(memories)
+        return memories
+
+    def get_latest_instruction(self) -> str:
+        return self.rc.important_memory[-1].content  # 角色监听着Moderator的InstructSpeak，是其重要记忆，直接获取即可
+
+    def set_status(self, new_status: RoleState):
+        self.status = new_status
+
+    def record_experiences(self, round_id: str, outcome: str, game_setup: str):
+        experiences = [exp for exp in self.experiences if len(exp.reflection) > 2]  # not "" or not '""'
+        for exp in experiences:
+            exp.round_id = round_id
+            exp.outcome = outcome
+            exp.game_setup = game_setup
+        AddNewExperiences().run(experiences)
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-09 11:47:29
+Duration: 78.30 seconds
+Verdict: REJECT
+
+The provided diff does not contain any modifications to the original source files; it only shows the removal of all code without adding any new implementation. Consequently, the fixed version fails to meet the required structure and does not address the bug (the `parse_recipient` function still contains the original logic). No valid changes are present, so the solution is rejected.
+--------------------------------------------------------------------------------
+### metagpt/ext/werewolf/roles/base_player.py
+import re
+
+from pydantic import Field, SerializeAsAny, model_validator
+
+from metagpt.actions.action import Action
+from metagpt.environment.werewolf.const import RoleState, RoleType
+from metagpt.ext.werewolf.actions import (
+    ACTIONS,
+    AddNewExperiences,
+    InstructSpeak,
+    NighttimeWhispers,
+    Reflect,
+    RetrieveExperiences,
+    Speak,
+)
+from metagpt.ext.werewolf.schema import RoleExperience, WwMessage
+from metagpt.logs import logger
+from metagpt.roles import Role
+from metagpt.utils.common import any_to_str
+
+
+class BasePlayer(Role):
+    name: str = "PlayerXYZ"
+    profile: str = "BasePlayer"
+    special_action_names: list[str] = []
+    use_reflection: bool = True
+    use_experience: bool = False
+    use_memory_selection: bool = False
+    new_experience_version: str = ""
+    status: RoleState = RoleState.ALIVE
+
+    special_actions: list[SerializeAsAny[Action]] = Field(default=[], validate_default=True)
+    experiences: list[RoleExperience] = []
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # 技能和监听配置
+        self._watch([InstructSpeak])  # 监听Moderator的指令以做行动
+        special_actions = [ACTIONS[action_name] for action_name in self.special_action_names]
+        capable_actions = [Speak] + special_actions
+        self.set_actions(capable_actions)  # 给角色赋予行动技能
+        self.special_actions = special_actions
+
+        if not self.use_reflection and self.use_experience:
+            logger.warning("You must enable use_reflection before using experience")
+            self.use_experience = False
+
+    @model_validator(mode="after")
+    def check_addresses(self):
+        if not self.addresses:
+            self.addresses = {any_to_str(self), self.name, self.profile} if self.name else {any_to_str(self)}
+        return self
+
+    async def _observe(self, ignore_memory=False) -> int:
+        if self.status != RoleState.ALIVE:
+            # 死者不再参与游戏
+            return 0
+        news = []
+        if not news:
+            news = self.rc.msg_buffer.pop_all()
+        old_messages = [] if ignore_memory else self.rc.memory.get()
+        for m in news:
+            # Some Message objects (e.g., generic Message) may not have a 'restricted_to' attribute.
+            # Use getattr with a default empty set for compatibility.
+            restricted = getattr(m, "restricted_to", set())
+            if len(restricted) and self.profile not in restricted and self.name not in restricted:
+                # if the msg is not sent to the whole audience ("" or missing) nor this role (self.profile or self.name),
+                # then this role should not be able to receive it and record it into its memory
+                continue
+            self.rc.memory.add(m)
+        self.rc.news = [
+            n for n in news if (n.cause_by in self.rc.watch or self.profile in n.send_to) and n not in old_messages
+        ]
+
+        # TODO to delete
+        # await super()._observe()
+        # # 只有发给全体的（""）或发给自己的（self.profile）消息需要走下面的_react流程，
+        # # 其他的收听到即可，不用做动作
+        # self.rc.news = [msg for msg in self.rc.news if msg.send_to in ["", self.profile]]
+        return len(self.rc.news)
+
+    async def _think(self):
+        news = self.rc.news[0]
+        assert news.cause_by == any_to_str(InstructSpeak)  # 消息为来自Moderator的指令时，才去做动作
+        if not news.restricted_to:
+            # 消息接收范围为全体角色的，做公开发言（发表投票观点也算发言）
+            self.rc.todo = Speak()
+        elif self.profile in news.restricted_to:
+            # FIXME: hard code to split, restricted为"Moderator"或"Moderator, 角色profile"
+            # Moderator加密发给自己的，意味着要执行角色的特殊动作
+            self.rc.todo = self.special_actions[0]()
+
+    async def _act(self):
+        # todo为_think时确定的，有两种情况，Speak或Protect
+        todo = self.rc.todo
+        logger.info(f"{self._setting}: ready to {str(todo)}")
+
+        # 可以用这个函数获取该角色的全部记忆和最新的instruction
+        memories = self.get_all_memories()
+        latest_instruction = self.get_latest_instruction()
+
+        reflection = (
+            await Reflect().run(
+                profile=self.profile, name=self.name, context=memories, latest_instruction=latest_instruction
+            )
+            if self.use_reflection
+            else ""
+        )
+
+        experiences = (
+            RetrieveExperiences().run(
+                query=reflection, profile=self.profile, excluded_version=self.new_experience_version
+            )
+            if self.use_experience
+            else ""
+        )
+
+        # 根据自己定义的角色Action，对应地去run，run的入参可能不同
+        if isinstance(todo, Speak):
+            rsp = await todo.run(
+                profile=self.profile,
+                name=self.name,
+                context=memories,
+                latest_instruction=latest_instruction,
+                reflection=reflection,
+                experiences=experiences,
+            )
+            restricted_to = set()
+
+        elif isinstance(todo, NighttimeWhispers):
+            rsp = await todo.run(
+                profile=self.profile, name=self.name, context=memories, reflection=reflection, experiences=experiences
+            )
+            restricted_to = {RoleType.MODERATOR.value, self.profile}  # 给Moderator发送使用特殊技能的加密消息
+        msg = WwMessage(
+            content=rsp,
+            role=self.profile,
+            sent_from=self.name,
+            cause_by=type(todo),
+            send_to={},
+            restricted_to=restricted_to,
+        )
+
+        self.experiences.append(
+            RoleExperience(
+                name=self.name,
+                profile=self.profile,
+                reflection=reflection,
+                instruction=latest_instruction,
+                response=rsp,
+                version=self.new_experience_version,
+            )
+        )
+
+        logger.info(f"{self._setting}: {rsp}")
+
+        return msg
+
+    def get_all_memories(self) -> str:
+        memories = self.rc.memory.get()
+        time_stamp_pattern = r"[0-9]+ \| "
+        # NOTE: 除Moderator外，其他角色使用memory，只能用m.sent_from（玩家名）不能用m.role（玩家角色），因为他们不知道说话者的身份
+        memories = [f"{m.sent_from}: {re.sub(time_stamp_pattern, '', m.content)}" for m in memories]  # regex去掉时间戳
+        memories = "\n".join(memories)
+        return memories
+
+    def get_latest_instruction(self) -> str:
+        return self.rc.important_memory[-1].content  # 角色监听着Moderator的InstructSpeak，是其重要记忆，直接获取即可
+
+    def set_status(self, new_status: RoleState):
+        self.status = new_status
+
+    def record_experiences(self, round_id: str, outcome: str, game_setup: str):
+        experiences = [exp for exp in self.experiences if len(exp.reflection) > 2]  # not "" or not '""'
+        for exp in experiences:
+            exp.round_id = round_id
+            exp.outcome = outcome
+            exp.game_setup = game_setup
+        AddNewExperiences().run(experiences)
+
+--------------------------------------------------------------------------------

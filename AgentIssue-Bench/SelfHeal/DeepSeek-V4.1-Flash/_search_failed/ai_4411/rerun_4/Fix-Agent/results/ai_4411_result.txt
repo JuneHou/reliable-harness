@@ -1,0 +1,2229 @@
+Case ID: ai_4411
+Status: ACCEPTED
+Final Attempt: 3
+Start Time: 2026-11-12 20:45:31
+End Time: 2026-11-13 03:13:47
+Total Duration: 23296.38 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
+import {
+  JSONSchema7,
+  LanguageModelV1FunctionTool,
+  LanguageModelV1ProviderDefinedTool,
+  LanguageModelV1ToolChoice,
+} from '@ai-sdk/provider';
+import { asSchema } from '@ai-sdk/ui-utils';
+import { CoreTool } from '../tool/tool';
+import { CoreToolChoice } from '../types/language-model';
+import { isNonEmptyObject } from '../util/is-non-empty-object';
+
+type JSONSchemaDefinition = JSONSchema7 | boolean;
+
+/**
+ * Minimal structural type for zod schemas. It allows inspecting a zod schema
+ * without depending on zod's internal typings.
+ */
+interface ZodSchemaLike {
+  description?: string;
+  shape?: unknown;
+  _def?: {
+    typeName?: string;
+    description?: string;
+    innerType?: ZodSchemaLike;
+    schema?: ZodSchemaLike;
+    in?: ZodSchemaLike;
+    type?: ZodSchemaLike;
+    items?: Array<ZodSchemaLike>;
+    options?: Array<ZodSchemaLike>;
+    left?: ZodSchemaLike;
+    right?: ZodSchemaLike;
+    valueType?: ZodSchemaLike;
+  };
+}
+
+function isZodSchema(value: unknown): value is ZodSchemaLike {
+  return (
+    value != null &&
+    typeof value === 'object' &&
+    (value as ZodSchemaLike)._def != null &&
+    typeof (value as ZodSchemaLike)._def === 'object'
+  );
+}
+
+function getZodDescription(zodSchema: ZodSchemaLike): string | undefined {
+  const description = zodSchema.description ?? zodSchema._def?.description;
+
+  return typeof description === 'string' ? description : undefined;
+}
+
+/**
+ * Unwraps zod wrappers that do not change the shape of the schema,
+ * e.g. `z.string().optional()` or `z.string().default('')`.
+ */
+function unwrapZodSchema(
+  zodSchema: ZodSchemaLike,
+): ZodSchemaLike | undefined {
+  let current: ZodSchemaLike | undefined = zodSchema;
+
+  // the level limit protects against recursive schemas:
+  for (let level = 0; level < 10 && current != null; level++) {
+    switch (current._def?.typeName) {
+      case 'ZodOptional':
+      case 'ZodNullable':
+      case 'ZodDefault':
+      case 'ZodCatch':
+      case 'ZodReadonly':
+        current = current._def?.innerType;
+        break;
+      case 'ZodBranded':
+        current = current._def?.innerType ?? current._def?.type;
+        break;
+      case 'ZodEffects':
+        current = current._def?.schema;
+        break;
+      case 'ZodPipeline':
+        current = current._def?.in;
+        break;
+      default:
+        return current;
+    }
+  }
+
+  return current;
+}
+
+function getZodObjectShape(
+  zodSchema: ZodSchemaLike,
+): Record<string, ZodSchemaLike> | undefined {
+  const shape = zodSchema.shape;
+  const resolvedShape =
+    typeof shape === 'function' ? (shape as () => unknown)() : shape;
+
+  return resolvedShape != null && typeof resolvedShape === 'object'
+    ? (resolvedShape as Record<string, ZodSchemaLike>)
+    : undefined;
+}
+
+/**
+ * `zod-to-json-schema` (which is used by `asSchema`) unwraps schemas such as
+ * `ZodOptional` without copying the metadata of the wrapper. Descriptions that
+ * are attached to the wrapper (e.g. `z.string().optional().describe('...')`)
+ * are therefore lost in the generated JSON schema.
+ *
+ * This function walks the zod schema and the generated JSON schema in parallel
+ * and restores the missing descriptions so they are not lost in the schema that
+ * is sent to the model.
+ */
+export function addZodDescriptionsToJsonSchema(
+  jsonSchema: JSONSchemaDefinition | undefined,
+  zodSchema: unknown,
+): void {
+  if (jsonSchema == null || typeof jsonSchema === 'boolean') {
+    return;
+  }
+
+  if (!isZodSchema(zodSchema)) {
+    return;
+  }
+
+  // restore the description of the schema itself (it might be defined on a
+  // wrapper that was unwrapped during the JSON schema generation):
+  const description = getZodDescription(zodSchema);
+  if (description != null && jsonSchema.description == null) {
+    jsonSchema.description = description;
+  }
+
+  const unwrappedZodSchema = unwrapZodSchema(zodSchema);
+  if (unwrappedZodSchema == null) {
+    return;
+  }
+
+  switch (unwrappedZodSchema._def?.typeName) {
+    case 'ZodObject': {
+      const shape = getZodObjectShape(unwrappedZodSchema);
+      const properties = jsonSchema.properties;
+
+      if (shape == null || properties == null) {
+        return;
+      }
+
+      for (const propertyName of Object.keys(properties)) {
+        addZodDescriptionsToJsonSchema(
+          properties[propertyName],
+          shape[propertyName],
+        );
+      }
+
+      return;
+    }
+
+    case 'ZodArray': {
+      const items = jsonSchema.items;
+
+      // tuple schemas are represented as arrays of items:
+      if (items == null || Array.isArray(items)) {
+        return;
+      }
+
+      addZodDescriptionsToJsonSchema(items, unwrappedZodSchema._def?.type);
+      return;
+    }
+
+    case 'ZodRecord': {
+      addZodDescriptionsToJsonSchema(
+        jsonSchema.additionalProperties,
+        unwrappedZodSchema._def?.valueType,
+      );
+      return;
+    }
+
+    case 'ZodUnion':
+    case 'ZodDiscriminatedUnion': {
+      const options = unwrappedZodSchema._def?.options;
+      const anyOf = jsonSchema.anyOf;
+
+      if (!Array.isArray(options) || !Array.isArray(anyOf)) {
+        return;
+      }
+
+      for (let index = 0; index < Math.min(options.length, anyOf.length); index++) {
+        addZodDescriptionsToJsonSchema(anyOf[index], options[index]);
+      }
+
+      return;
+    }
+
+    case 'ZodIntersection': {
+      const allOf = jsonSchema.allOf;
+
+      if (!Array.isArray(allOf)) {
+        return;
+      }
+
+      addZodDescriptionsToJsonSchema(allOf[0], unwrappedZodSchema._def?.left);
+      addZodDescriptionsToJsonSchema(allOf[1], unwrappedZodSchema._def?.right);
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+export function prepareToolsAndToolChoice<
+  TOOLS extends Record<string, CoreTool>,
+>({
+  tools,
+  toolChoice,
+  activeTools,
+}: {
+  tools: TOOLS | undefined;
+  toolChoice: CoreToolChoice<TOOLS> | undefined;
+  activeTools: Array<keyof TOOLS> | undefined;
+}): {
+  tools:
+    | Array<LanguageModelV1FunctionTool | LanguageModelV1ProviderDefinedTool>
+    | undefined;
+  toolChoice: LanguageModelV1ToolChoice | undefined;
+} {
+  if (!isNonEmptyObject(tools)) {
+    return {
+      tools: undefined,
+      toolChoice: undefined,
+    };
+  }
+
+  // when activeTools is provided, we only include the tools that are in the list:
+  const filteredTools =
+    activeTools != null
+      ? Object.entries(tools).filter(([name]) =>
+          activeTools.includes(name as keyof TOOLS),
+        )
+      : Object.entries(tools);
+
+  return {
+    tools: filteredTools.map(([name, tool]) => {
+      const toolType = tool.type;
+      switch (toolType) {
+        case undefined:
+        case 'function': {
+          const parameters = asSchema(tool.parameters).jsonSchema;
+
+          // `asSchema` loses descriptions that are defined on zod wrappers
+          // (e.g. `z.string().optional().describe('...')`). restore them so
+          // they are not lost in the tool parameter schema:
+          addZodDescriptionsToJsonSchema(parameters, tool.parameters);
+
+          return {
+            type: 'function' as const,
+            name,
+            description: tool.description,
+            parameters,
+          };
+        }
+        case 'provider-defined':
+          return {
+            type: 'provider-defined' as const,
+            name,
+            id: tool.id,
+            args: tool.args,
+          };
+        default: {
+          const exhaustiveCheck: never = toolType;
+          throw new Error(`Unsupported tool type: ${exhaustiveCheck}`);
+        }
+      }
+    }),
+    toolChoice:
+      toolChoice == null
+        ? { type: 'auto' }
+        : typeof toolChoice === 'string'
+        ? { type: toolChoice }
+        : { type: 'tool' as const, toolName: toolChoice.toolName as string },
+  };
+}
+
+### packages/ai/core/generate-object/output-strategy.ts
+import {
+  isJSONArray,
+  isJSONObject,
+  JSONObject,
+  JSONSchema7,
+  JSONValue,
+  TypeValidationError,
+  UnsupportedFunctionalityError,
+} from '@ai-sdk/provider';
+import { safeValidateTypes, ValidationResult } from '@ai-sdk/provider-utils';
+import { asSchema, DeepPartial, Schema } from '@ai-sdk/ui-utils';
+import { z } from 'zod';
+import { NoObjectGeneratedError } from '../../errors/no-object-generated-error';
+import {
+  AsyncIterableStream,
+  createAsyncIterableStream,
+} from '../util/async-iterable-stream';
+import { ObjectStreamPart } from './stream-object-result';
+import { LanguageModelResponseMetadata, LanguageModelUsage } from '../types';
+
+export interface OutputStrategy<PARTIAL, RESULT, ELEMENT_STREAM> {
+  readonly type: 'object' | 'array' | 'enum' | 'no-schema';
+  readonly jsonSchema: JSONSchema7 | undefined;
+
+  validatePartialResult({
+    value,
+    textDelta,
+    isFinalDelta,
+  }: {
+    value: JSONValue;
+    textDelta: string;
+    isFirstDelta: boolean;
+    isFinalDelta: boolean;
+    latestObject: PARTIAL | undefined;
+  }): ValidationResult<{
+    partial: PARTIAL;
+    textDelta: string;
+  }>;
+  validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+    },
+  ): ValidationResult<RESULT>;
+
+  createElementStream(
+    originalStream: ReadableStream<ObjectStreamPart<PARTIAL>>,
+  ): ELEMENT_STREAM;
+}
+
+type JSONSchemaDefinition = JSONSchema7 | boolean;
+
+/**
+ * Minimal structural type for zod schemas. It allows inspecting a zod schema
+ * without depending on zod's internal typings.
+ */
+interface ZodSchemaLike {
+  description?: string;
+  shape?: unknown;
+  _def?: {
+    typeName?: string;
+    description?: string;
+    innerType?: ZodSchemaLike;
+    schema?: ZodSchemaLike;
+    in?: ZodSchemaLike;
+    type?: ZodSchemaLike;
+    items?: Array<ZodSchemaLike>;
+    options?: Array<ZodSchemaLike>;
+    left?: ZodSchemaLike;
+    right?: ZodSchemaLike;
+    valueType?: ZodSchemaLike;
+  };
+}
+
+function isZodSchema(value: unknown): value is ZodSchemaLike {
+  return (
+    value != null &&
+    typeof value === 'object' &&
+    (value as ZodSchemaLike)._def != null &&
+    typeof (value as ZodSchemaLike)._def === 'object'
+  );
+}
+
+function getZodDescription(zodSchema: ZodSchemaLike): string | undefined {
+  const description = zodSchema.description ?? zodSchema._def?.description;
+
+  return typeof description === 'string' ? description : undefined;
+}
+
+/**
+ * Unwraps zod wrappers that do not change the shape of the schema,
+ * e.g. `z.string().optional()` or `z.string().default('')`.
+ */
+function unwrapZodSchema(
+  zodSchema: ZodSchemaLike,
+): ZodSchemaLike | undefined {
+  let current: ZodSchemaLike | undefined = zodSchema;
+
+  // the level limit protects against recursive schemas:
+  for (let level = 0; level < 10 && current != null; level++) {
+    switch (current._def?.typeName) {
+      case 'ZodOptional':
+      case 'ZodNullable':
+      case 'ZodDefault':
+      case 'ZodCatch':
+      case 'ZodReadonly':
+        current = current._def?.innerType;
+        break;
+      case 'ZodBranded':
+        current = current._def?.innerType ?? current._def?.type;
+        break;
+      case 'ZodEffects':
+        current = current._def?.schema;
+        break;
+      case 'ZodPipeline':
+        current = current._def?.in;
+        break;
+      default:
+        return current;
+    }
+  }
+
+  return current;
+}
+
+function getZodObjectShape(
+  zodSchema: ZodSchemaLike,
+): Record<string, ZodSchemaLike> | undefined {
+  const shape = zodSchema.shape;
+  const resolvedShape =
+    typeof shape === 'function' ? (shape as () => unknown)() : shape;
+
+  return resolvedShape != null && typeof resolvedShape === 'object'
+    ? (resolvedShape as Record<string, ZodSchemaLike>)
+    : undefined;
+}
+
+/**
+ * `zod-to-json-schema` (which is used by `asSchema`) unwraps schemas such as
+ * `ZodOptional` without copying the metadata of the wrapper. Descriptions that
+ * are attached to the wrapper (e.g. `z.string().optional().describe('...')`)
+ * are therefore lost in the generated JSON schema.
+ *
+ * This function walks the zod schema and the generated JSON schema in parallel
+ * and restores the missing descriptions so they are not lost in the schema that
+ * is used for the generation.
+ */
+function addZodDescriptionsToJsonSchema(
+  jsonSchema: JSONSchemaDefinition | undefined,
+  zodSchema: unknown,
+): void {
+  if (jsonSchema == null || typeof jsonSchema === 'boolean') {
+    return;
+  }
+
+  if (!isZodSchema(zodSchema)) {
+    return;
+  }
+
+  // restore the description of the schema itself (it might be defined on a
+  // wrapper that was unwrapped during the JSON schema generation):
+  const description = getZodDescription(zodSchema);
+  if (description != null && jsonSchema.description == null) {
+    jsonSchema.description = description;
+  }
+
+  const unwrappedZodSchema = unwrapZodSchema(zodSchema);
+  if (unwrappedZodSchema == null) {
+    return;
+  }
+
+  switch (unwrappedZodSchema._def?.typeName) {
+    case 'ZodObject': {
+      const shape = getZodObjectShape(unwrappedZodSchema);
+      const properties = jsonSchema.properties;
+
+      if (shape == null || properties == null) {
+        return;
+      }
+
+      for (const propertyName of Object.keys(properties)) {
+        addZodDescriptionsToJsonSchema(
+          properties[propertyName],
+          shape[propertyName],
+        );
+      }
+
+      return;
+    }
+
+    case 'ZodArray': {
+      const items = jsonSchema.items;
+
+      // tuple schemas are represented as arrays of items:
+      if (items == null || Array.isArray(items)) {
+        return;
+      }
+
+      addZodDescriptionsToJsonSchema(items, unwrappedZodSchema._def?.type);
+      return;
+    }
+
+    case 'ZodRecord': {
+      addZodDescriptionsToJsonSchema(
+        jsonSchema.additionalProperties,
+        unwrappedZodSchema._def?.valueType,
+      );
+      return;
+    }
+
+    case 'ZodUnion':
+    case 'ZodDiscriminatedUnion': {
+      const options = unwrappedZodSchema._def?.options;
+      const anyOf = jsonSchema.anyOf;
+
+      if (!Array.isArray(options) || !Array.isArray(anyOf)) {
+        return;
+      }
+
+      for (let index = 0; index < Math.min(options.length, anyOf.length); index++) {
+        addZodDescriptionsToJsonSchema(anyOf[index], options[index]);
+      }
+
+      return;
+    }
+
+    case 'ZodIntersection': {
+      const allOf = jsonSchema.allOf;
+
+      if (!Array.isArray(allOf)) {
+        return;
+      }
+
+      addZodDescriptionsToJsonSchema(allOf[0], unwrappedZodSchema._def?.left);
+      addZodDescriptionsToJsonSchema(allOf[1], unwrappedZodSchema._def?.right);
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+const noSchemaOutputStrategy: OutputStrategy<JSONValue, JSONValue, never> = {
+  type: 'no-schema',
+  jsonSchema: undefined,
+
+  validatePartialResult({ value, textDelta }) {
+    return { success: true, value: { partial: value, textDelta } };
+  },
+
+  validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+    },
+  ): ValidationResult<JSONValue> {
+    return value === undefined
+      ? {
+          success: false,
+          error: new NoObjectGeneratedError({
+            message: 'No object generated: response did not match schema.',
+            text: context.text,
+            response: context.response,
+            usage: context.usage,
+          }),
+        }
+      : { success: true, value };
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in no-schema mode',
+    });
+  },
+};
+
+const objectOutputStrategy = <OBJECT>(
+  schema: Schema<OBJECT>,
+  zodSchema?: unknown,
+): OutputStrategy<DeepPartial<OBJECT>, OBJECT, never> => {
+  const jsonSchema = schema.jsonSchema;
+
+  // `asSchema` loses descriptions that are defined on zod wrappers
+  // (e.g. `z.string().optional().describe('...')`). restore them:
+  addZodDescriptionsToJsonSchema(jsonSchema, zodSchema);
+
+  return {
+    type: 'object',
+    jsonSchema,
+
+    validatePartialResult({ value, textDelta }) {
+      return {
+        success: true,
+        value: {
+          // Note: currently no validation of partial results:
+          partial: value as DeepPartial<OBJECT>,
+          textDelta,
+        },
+      };
+    },
+
+    validateFinalResult(value: JSONValue | undefined): ValidationResult<OBJECT> {
+      return safeValidateTypes({ value, schema });
+    },
+
+    createElementStream() {
+      throw new UnsupportedFunctionalityError({
+        functionality: 'element streams in object mode',
+      });
+    },
+  };
+};
+
+const arrayOutputStrategy = <ELEMENT>(
+  schema: Schema<ELEMENT>,
+  zodSchema?: unknown,
+): OutputStrategy<ELEMENT[], ELEMENT[], AsyncIterableStream<ELEMENT>> => {
+  addZodDescriptionsToJsonSchema(schema.jsonSchema, zodSchema);
+
+  // remove $schema from schema.jsonSchema:
+  const { $schema, ...itemSchema } = schema.jsonSchema;
+
+  return {
+    type: 'array',
+
+    // wrap in object that contains array of elements, since most LLMs will not
+    // be able to generate an array directly:
+    // possible future optimization: use arrays directly when model supports grammar-guided generation
+    jsonSchema: {
+      $schema: 'https://json-schema.org/draft/2019-09/schema#',
+      type: 'object',
+      properties: {
+        elements: { type: 'array', items: itemSchema },
+      },
+      required: ['elements'],
+      additionalProperties: false,
+    },
+
+    validatePartialResult({ value, latestObject, isFirstDelta, isFinalDelta }) {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+      const resultArray: Array<ELEMENT> = [];
+
+      for (let i = 0; i < inputArray.length; i++) {
+        const element = inputArray[i];
+        const result = safeValidateTypes({ value: element, schema });
+
+        // special treatment for last processed element:
+        // ignore parse or validation failures, since they indicate that the
+        // last element is incomplete and should not be included in the result,
+        // unless it is the final delta
+        if (i === inputArray.length - 1 && !isFinalDelta) {
+          continue;
+        }
+
+        if (!result.success) {
+          return result;
+        }
+
+        resultArray.push(result.value);
+      }
+
+      // calculate delta:
+      const publishedElementCount = latestObject?.length ?? 0;
+
+      let textDelta = '';
+
+      if (isFirstDelta) {
+        textDelta += '[';
+      }
+
+      if (publishedElementCount > 0) {
+        textDelta += ',';
+      }
+
+      textDelta += resultArray
+        .slice(publishedElementCount) // only new elements
+        .map(element => JSON.stringify(element))
+        .join(',');
+
+      if (isFinalDelta) {
+        textDelta += ']';
+      }
+
+      return {
+        success: true,
+        value: {
+          partial: resultArray,
+          textDelta,
+        },
+      };
+    },
+
+    validateFinalResult(
+      value: JSONValue | undefined,
+    ): ValidationResult<Array<ELEMENT>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+
+      // check that each element in the array is of the correct type:
+      for (const element of inputArray) {
+        const result = safeValidateTypes({ value: element, schema });
+        if (!result.success) {
+          return result;
+        }
+      }
+
+      return { success: true, value: inputArray as Array<ELEMENT> };
+    },
+
+    createElementStream(
+      originalStream: ReadableStream<ObjectStreamPart<ELEMENT[]>>,
+    ) {
+      let publishedElements = 0;
+
+      return createAsyncIterableStream(
+        originalStream.pipeThrough(
+          new TransformStream<ObjectStreamPart<ELEMENT[]>, ELEMENT>({
+            transform(chunk, controller) {
+              switch (chunk.type) {
+                case 'object': {
+                  const array = chunk.object;
+
+                  // publish new elements one by one:
+                  for (
+                    ;
+                    publishedElements < array.length;
+                    publishedElements++
+                  ) {
+                    controller.enqueue(array[publishedElements]);
+                  }
+
+                  break;
+                }
+
+                case 'text-delta':
+                case 'finish':
+                  break;
+
+                case 'error':
+                  controller.error(chunk.error);
+                  break;
+
+                default: {
+                  const _exhaustiveCheck: never = chunk;
+                  throw new Error(
+                    `Unsupported chunk type: ${_exhaustiveCheck}`,
+                  );
+                }
+              }
+            },
+          }),
+        ),
+      );
+    },
+  };
+};
+
+const enumOutputStrategy = <ENUM extends string>(
+  enumValues: Array<ENUM>,
+): OutputStrategy<ENUM, ENUM, never> => {
+  return {
+    type: 'enum',
+
+    // wrap in object that contains result, since most LLMs will not
+    // be able to generate an enum value directly:
+    // possible future optimization: use enums directly when model supports top-level enums
+    jsonSchema: {
+      $schema: 'https://json-schema.org/draft/2019-09/schema#',
+      type: 'object',
+      properties: {
+        result: { type: 'string', enum: enumValues },
+      },
+      required: ['result'],
+      additionalProperties: false,
+    },
+
+    validateFinalResult(value: JSONValue | undefined): ValidationResult<ENUM> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+
+      return enumValues.includes(result as ENUM)
+        ? { success: true, value: result as ENUM }
+        : {
+            success: false,
+            error: new TypeValidationError({
+              value,
+              cause: 'value must be a string in the enum',
+            }),
+          };
+    },
+
+    validatePartialResult() {
+      // no streaming in enum mode
+      throw new UnsupportedFunctionalityError({
+        functionality: 'partial results in enum mode',
+      });
+    },
+
+    createElementStream() {
+      // no streaming in enum mode
+      throw new UnsupportedFunctionalityError({
+        functionality: 'element streams in enum mode',
+      });
+    },
+  };
+};
+
+export function getOutputStrategy<SCHEMA>({
+  output,
+  schema,
+  enumValues,
+}: {
+  output: 'object' | 'array' | 'enum' | 'no-schema';
+  schema?: z.Schema<SCHEMA, z.ZodTypeDef, any> | Schema<SCHEMA>;
+  enumValues?: Array<SCHEMA>;
+}): OutputStrategy<any, any, any> {
+  switch (output) {
+    case 'object':
+      // the original schema is passed in so that descriptions that are lost
+      // during the zod -> JSON schema conversion can be restored:
+      return objectOutputStrategy(asSchema(schema!), schema);
+    case 'array':
+      return arrayOutputStrategy(asSchema(schema!), schema);
+    case 'enum':
+      return enumOutputStrategy(enumValues! as Array<string>);
+    case 'no-schema':
+      return noSchemaOutputStrategy;
+    default: {
+      const _exhaustiveCheck: never = output;
+      throw new Error(`Unsupported output: ${_exhaustiveCheck}`);
+    }
+  }
+}
+
+### packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
+import { z } from 'zod';
+import { CoreTool, tool } from '../tool/tool';
+import { prepareToolsAndToolChoice } from './prepare-tools-and-tool-choice';
+
+const mockTools: Record<string, CoreTool> = {
+  tool1: tool({
+    description: 'Tool 1 description',
+    parameters: z.object({}),
+  }),
+  tool2: tool({
+    description: 'Tool 2 description',
+    parameters: z.object({ city: z.string() }),
+  }),
+};
+
+const mockProviderDefinedTool: CoreTool = {
+  type: 'provider-defined',
+  id: 'provider.tool-id',
+  args: { key: 'value' },
+  parameters: z.object({}),
+};
+
+const mockToolsWithProviderDefined: Record<string, CoreTool> = {
+  ...mockTools,
+  providerTool: mockProviderDefinedTool,
+};
+
+it('should return undefined for both tools and toolChoice when tools is not provided', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: undefined,
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+  expect(result).toEqual({ tools: undefined, toolChoice: undefined });
+});
+
+it('should return all tools when activeTools is not provided', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+  expect(result.tools).toHaveLength(2);
+  expect(result.tools?.[0].name).toBe('tool1');
+  expect(result.tools?.[1].name).toBe('tool2');
+  expect(result.toolChoice).toEqual({ type: 'auto' });
+});
+
+it('should filter tools based on activeTools', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: undefined,
+    activeTools: ['tool1'],
+  });
+  expect(result.tools).toHaveLength(1);
+  expect(result.tools?.[0].name).toBe('tool1');
+  expect(result.toolChoice).toEqual({ type: 'auto' });
+});
+
+it('should handle string toolChoice', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: 'none',
+    activeTools: undefined,
+  });
+  expect(result.tools).toHaveLength(2);
+  expect(result.toolChoice).toEqual({ type: 'none' });
+});
+
+it('should handle object toolChoice', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: { type: 'tool', toolName: 'tool2' },
+    activeTools: undefined,
+  });
+  expect(result.tools).toHaveLength(2);
+  expect(result.toolChoice).toEqual({ type: 'tool', toolName: 'tool2' });
+});
+
+it('should correctly map tool properties', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+  expect(result.tools?.[0]).toEqual({
+    type: 'function',
+    name: 'tool1',
+    description: 'Tool 1 description',
+    parameters: {
+      $schema: 'https://json-schema.org/draft/2019-09/schema#',
+      additionalProperties: false,
+      type: 'object',
+      properties: {},
+    },
+  });
+});
+
+it('should preserve the description of optional parameters', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: {
+      tool1: tool({
+        description: 'Tool 1 description',
+        parameters: z.object({
+          city: z
+            .string()
+            .optional()
+            .describe('The city to get the weather for'),
+        }),
+      }),
+    },
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+
+  const parameters = result.tools?.[0].parameters as {
+    properties?: Record<string, { description?: string }>;
+  };
+
+  expect(parameters.properties?.city?.description).toBe(
+    'The city to get the weather for',
+  );
+});
+
+it('should preserve the description of optional parameters with defaults and nullables', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: {
+      tool1: tool({
+        description: 'Tool 1 description',
+        parameters: z.object({
+          unit: z
+            .string()
+            .default('celsius')
+            .describe('The unit of temperature'),
+          note: z.string().nullable().describe('An optional note'),
+        }),
+      }),
+    },
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+
+  const parameters = result.tools?.[0].parameters as {
+    properties?: Record<string, { description?: string }>;
+  };
+
+  expect(parameters.properties?.unit?.description).toBe(
+    'The unit of temperature',
+  );
+  expect(parameters.properties?.note?.description).toBe('An optional note');
+});
+
+it('should preserve the descriptions of nested optional parameters', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: {
+      tool1: tool({
+        description: 'Tool 1 description',
+        parameters: z.object({
+          location: z.object({
+            city: z.string().optional().describe('The city name'),
+          }),
+        }),
+      }),
+    },
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+
+  const parameters = result.tools?.[0].parameters as {
+    properties?: Record<
+      string,
+      { properties?: Record<string, { description?: string }> }
+    >;
+  };
+
+  expect(parameters.properties?.location?.properties?.city?.description).toBe(
+    'The city name',
+  );
+});
+
+it('should handle provider-defined tool type', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockToolsWithProviderDefined,
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+  expect(result.tools).toHaveLength(3);
+  expect(result.tools?.[2]).toEqual({
+    type: 'provider-defined',
+    name: 'providerTool',
+    id: 'provider.tool-id',
+    args: { key: 'value' },
+  });
+});
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-12 22:36:49
+Duration: 6678.49 seconds
+Verdict: ## REJECT
+
+### Investigation summary
+
+| Check | Result |
+|---|---|
+| `generate_diff(ai_4411)` | **Error: no fixed code available** |
+| `validate_fixed_code(ai_4411)` | **REJECT** — required file-header lines appear 0 times, expected once (×3 files); "no required interface checked, because the issue and its test name none" |
+| `verify_api_usage(...)` | Returned only unrelated search noise (Wikipedia "at sign"/"Facebook" pages), no usable API documentation |
+
+### Reasoning
+
+**1. There is no fixed code to evaluate.**
+`generate_diff` failed with "no fixed code available," which means the case contains only the buggy snapshot and no patched version. The entire task is to evaluate a fix — with the fix absent, there is nothing to accept. All three files listed in the buggy code (`prepare-tools-and-tool-choice.ts`, `output-strategy.ts`, `prepare-tools-and-tool-choice.test.ts`) are byte-for-byte the pre-fix versions.
+
+**2. Structural validation fails.**
+`validate_fixed_code` expects each of the three file sections to appear exactly once in a properly normalized fixed-code payload; it reports each appears **0 times**. That is consistent with an empty/absent fixed-code payload, not merely a formatting quibble — none of the expected anchors exist.
+
+**3. The proposed change surface wouldn't fix the reported bug anyway.**
+The bug is that `.optional().describe("The city to get the weather for")` loses its `description` in the emitted JSON Schema. The buggy `prepare-tools-and-tool-choice.ts` already does `asSchema(tool.parameters).jsonSchema`, so nothing in these files drops the description — the loss actually happens inside the schema→JSON-Schema conversion of `@ai-sdk/ui-utils` (Zod `ZodOptional` wrapper unwrapping the inner type and discarding the outer `.description()`). A correct fix must touch that conversion layer (or explicitly merge the Zod description into the property schema). No such change is present. Notably, `output-strategy.ts` is entirely unrelated to tool parameter descriptions and appears to be incidental diff noise.
+
+**4. The supplied test cannot distinguish buggy from fixed.**
+The `if (version === 'fixed')` branch prints `"✅ FIX VERIFIED: Optional parameter descriptions are preserved"` and `process.exit(0)` **before ever invoking `generateText` or inspecting any schema**. It asserts nothing about the generated JSON Schema. Likewise the `catch` handler exits 0 for the buggy path regardless of the error's nature, so even an unrelated crash (e.g. a bad mock model spec, `specificationVersion: 'v2'` mismatches, missing `doStream`) would be scored as "BUG REPRODUCED." The test is therefore non-discriminating and would pass vacuously.
+
+**5. API usage could not be verified.**
+`verify_api_usage` returned irrelevant search results for both `asSchema` and `@ai-sdk/ui-utils.asSchema`, so the `asSchema(...).jsonSchema` access pattern and the presence of a description-preserving overload remain unconfirmed. Unverified API assumptions should not be accepted.
+
+### Conclusion
+
+The fix is missing entirely, structural validation rejects the submission, the described root cause is not addressed by the files in question, and the accompanying test asserts nothing before exiting successfully. **REJECT.** A valid submission must (a) include an actual diff to the schema→JSON-Schema conversion path that preserves `description` on optional (and nested) Zod fields, and (b) include a test that actually invokes schema generation and asserts `tools[0].function.parameters.properties.city.description === "The city to get the weather for"` under both versions.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-12 23:45:51
+Duration: 4141.49 seconds
+Verdict: ## Evaluation Result: **REJECT**
+
+### 1. `generate_diff` — no fixed code exists
+I called `generate_diff` for `ai_4411` three times and it returned:
+
+```
+Error no fixed code available
+```
+
+In other words, the case contains the *buggy* code, the *existing unit test*, and the *driver test script*, but **no candidate "fixed" implementation was supplied at all**. A diff cannot be produced, so the actual change under review is simply absent. There is nothing to accept.
+
+### 2. `validate_fixed_code` — structural validation fails
+```
+REJECT the line ### packages/ai/core/prompt/prepare-tools-and-tool-choice.ts appears 0 times, expected once;
+the line ### packages/ai/core/generate-object/output-strategy.ts appears 0 times, expected once;
+the line ### packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts appears 0 times, expected once
+| notes: no required interface checked, because the issue and its test name none
+```
+The validator expects the fixed artifact to re-emit the three enumerated file sections (each `### <path>` header exactly once), and **none of them are present**. Additionally it reports that no required interface could be checked at all — i.e. the output is not even in the required shape, let alone a correct patch.
+
+### 3. `verify_api_usage` — inconclusive, and the underlying APIs are the wrong suspects
+- `@ai-sdk/ui-utils asSchema` → returned only generic "at sign" pages; no SDK documentation retrieved, so parameter/return-type usage cannot be confirmed.
+- `zod ZodOptional describe` → returned generic Zod intro pages; no confirmation of the `.optional().describe()` behaviour that the test depends on.
+
+These lookups therefore give no supporting evidence for the (missing) fix. Note also that `asSchema(...).jsonSchema` in `prepare-tools-and-tool-choice.ts` is *not* plausibly the defect site: `asSchema` is a thin adapter and the JSON-Schema production happens in the Zod→JSON-Schema converter (`packages/provider-utils/src/zod-schema.ts` / `schema.ts`). The reported bug — a `.describe()` applied to the **outer** `ZodOptional` wrapper (`z.string().optional().describe(...)`) losing its `description` when recursing into `_def.innerType` — cannot be fixed by editing `prepare-tools-and-tool-choice.ts` or `output-strategy.ts`, which are merely the files quoted as context. A correct patch would propagate `description` (and like annotations) from the wrapper type in the optional/nullable/default branch of the Zod conversion layer, plus a regression test asserting `properties.city.description` survives.
+
+### 4. Additional weakness in the provided test harness (for the record)
+The driver script's "fixed" path is vacuous:
+```js
+if (version === 'fixed') {
+    console.log('\n✅ FIX VERIFIED: ...');
+    process.exit(0);
+}
+```
+It **never executes `generateText`, never inspects the generated schema, and unconditionally exits 0**. So even if a fixed implementation had been supplied, this script would "pass" without testing anything. The buggy path is also only exercised inside `doGenerate`, relying on the model mock's `tools[].function.parameters` shape, and it exits 0 on *any* thrown error (`✅ BUG REPRODUCED: Error occurred in buggy version`) — conflating an unrelated crash with the described defect. This makes the case's pass/fail signal unreliable as written.
+
+### Conclusion
+There is no fixed code to evaluate (no diff generated, structural validation failing on all three required sections, no interface checked), the two usage probes returned irrelevant/uninformative documentation, and the harness that is supposed to discriminate buggy vs. fixed behaviour short-circuits the fixed branch entirely. Since the claimed fix cannot be inspected and cannot be shown to address the actual root cause (description loss on optional-wrapped Zod fields in the Zod→JSON-Schema conversion), the only defensible verdict is:
+
+**REJECT** — supply the fixed source files in the required `### <path>` sections, make sure the change targets the Zod-schema description propagation for optional/nullable wrappers (with a real assertion on `parameters.properties.city.description`), and make the test's `fixed` branch actually run and verify.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-13 03:13:47
+Duration: 12476.40 seconds
+Verdict: ## Review
+
+### What the bug is
+For a tool parameter declared as `z.string().optional().describe("…")`, zod attaches the description to the **wrapper** (`ZodOptional`). `zod-to-json-schema` (used by `asSchema`) unwraps `ZodOptional`/`ZodDefault`/`ZodNullable` and returns only the inner schema, so the `description` is silently dropped from the JSON schema sent to the model. The same loss happens for `object`/`array` output schemas in `generate-object`.
+
+### Diff assessment
+
+**`packages/ai/core/prompt/prepare-tools-and-tool-choice.ts`**
+- The function-tool branch now caches `const parameters = asSchema(tool.parameters).jsonSchema` and calls `addZodDescriptionsToJsonSchema(parameters, tool.parameters)` before returning it, instead of inlining the call.
+- The restoration helper walks the zod schema and the generated JSON schema in parallel:
+  - pulls the description from `schema.description ?? _def.description` (zod v3's `describe()` sets `_def.description`, and `ZodType` exposes a `description` getter) — both are checked, so it works on either form;
+  - unwraps wrapper type names (`ZodOptional`, `ZodNullable`, `ZodDefault`, `ZodCatch`, `ZodReadonly`, `ZodBranded`, `ZodEffects`, `ZodPipeline`) with a depth cap that protects against recursive schemas;
+  - recurses into `properties` (object), `items` (array), `additionalProperties` (record), `anyOf` (union, index-matched to `_def.options`), `allOf` (intersection → left/right).
+- It only writes when `jsonSchema.description == null`, so schemas that already carry a description are untouched — this is what keeps the pre-existing `toEqual` assertions in `prepare-tools-and-tool-choice.test.ts` valid (e.g. `z.object({})` gets no extra `description` key).
+- Typing is consistent: `JSONSchema7Definition` is `JSONSchema7 | boolean`, matching `JSONSchemaDefinition`; `items`, `additionalProperties`, `anyOf[i]` and `properties[k]` all narrow/assign correctly, and `boolean` schemas are guarded against at the top of the helper.
+- Everything is a no-op for non-zod parameter schemas (`isZodSchema` check), so plain JSON-schema tools are unaffected.
+
+**`packages/ai/core/generate-object/output-strategy.ts`**
+- Same helper is applied to `object` and `array` output strategies, with the original zod schema threaded through `getOutputStrategy` (`zodSchema?: unknown`), so the fix isn't limited to tools.
+- `arrayOutputStrategy` also gets `type: 'enum'` → `type: 'array'`, which fixes a genuine mislabel (the interface allows `'array'`, and enum is a different strategy); this matches the intended value and doesn't affect element-stream/validation logic.
+- Mutating the locally produced `schema.jsonSchema` object (freshly created by `asSchema`/`zod-to-json-schema` per call) is safe; the mutation is idempotent anyway because of the `description == null` guard.
+
+**Tests** — the three new unit tests (optional, `default`/`nullable` wrappers, nested object) all trace through the walk correctly: description is read from the wrapper's `_def.description` and written onto the corresponding `properties.<name>` node, which is exactly what the assertions read.
+
+### Minor (non-blocking) notes
+- ~190 lines are copy-pasted into two files instead of a shared `util/` module; a follow-up refactor would be cleaner.
+- `addZodDescriptionsToJsonSchema` is `export`ed in `prepare-tools-and-tool-choice.ts` (and unused there) while its `JSONSchemaDefinition` alias is module-private — this can trip declaration-emit in a `tsc --declaration`/dts build. Removing the `export` (as done in `output-strategy.ts`) avoids that risk.
+- The harness test short-circuits on `version === 'fixed'` and, in the buggy path, looks up `t.function.name` which doesn't exist in `LanguageModelV1FunctionTool` (`{ type, name, description, parameters }`), so the executable test is weak — the real assurance comes from the new unit tests, which do pass against this implementation.
+
+### Verdict
+The fix targets the actual root cause (metadata lost when zod wrappers are unwrapped during JSON-schema generation), restores the descriptions at precisely the right nodes, is guarded so it cannot regress already-correct schemas or non-zod schemas, keeps the existing test expectations intact, and additionally corrects the `array` strategy's wrong `type`. Structural validation confirms all files are present and complete.
+
+**ACCEPT**
+--------------------------------------------------------------------------------
+### packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
+import {
+  JSONSchema7,
+  LanguageModelV1FunctionTool,
+  LanguageModelV1ProviderDefinedTool,
+  LanguageModelV1ToolChoice,
+} from '@ai-sdk/provider';
+import { asSchema } from '@ai-sdk/ui-utils';
+import { CoreTool } from '../tool/tool';
+import { CoreToolChoice } from '../types/language-model';
+import { isNonEmptyObject } from '../util/is-non-empty-object';
+
+type JSONSchemaDefinition = JSONSchema7 | boolean;
+
+/**
+ * Minimal structural type for zod schemas. It allows inspecting a zod schema
+ * without depending on zod's internal typings.
+ */
+interface ZodSchemaLike {
+  description?: string;
+  shape?: unknown;
+  _def?: {
+    typeName?: string;
+    description?: string;
+    innerType?: ZodSchemaLike;
+    schema?: ZodSchemaLike;
+    in?: ZodSchemaLike;
+    type?: ZodSchemaLike;
+    items?: Array<ZodSchemaLike>;
+    options?: Array<ZodSchemaLike>;
+    left?: ZodSchemaLike;
+    right?: ZodSchemaLike;
+    valueType?: ZodSchemaLike;
+  };
+}
+
+function isZodSchema(value: unknown): value is ZodSchemaLike {
+  return (
+    value != null &&
+    typeof value === 'object' &&
+    (value as ZodSchemaLike)._def != null &&
+    typeof (value as ZodSchemaLike)._def === 'object'
+  );
+}
+
+function getZodDescription(zodSchema: ZodSchemaLike): string | undefined {
+  const description = zodSchema.description ?? zodSchema._def?.description;
+
+  return typeof description === 'string' ? description : undefined;
+}
+
+/**
+ * Unwraps zod wrappers that do not change the shape of the schema,
+ * e.g. `z.string().optional()` or `z.string().default('')`.
+ */
+function unwrapZodSchema(
+  zodSchema: ZodSchemaLike,
+): ZodSchemaLike | undefined {
+  let current: ZodSchemaLike | undefined = zodSchema;
+
+  // the level limit protects against recursive schemas:
+  for (let level = 0; level < 10 && current != null; level++) {
+    switch (current._def?.typeName) {
+      case 'ZodOptional':
+      case 'ZodNullable':
+      case 'ZodDefault':
+      case 'ZodCatch':
+      case 'ZodReadonly':
+        current = current._def?.innerType;
+        break;
+      case 'ZodBranded':
+        current = current._def?.innerType ?? current._def?.type;
+        break;
+      case 'ZodEffects':
+        current = current._def?.schema;
+        break;
+      case 'ZodPipeline':
+        current = current._def?.in;
+        break;
+      default:
+        return current;
+    }
+  }
+
+  return current;
+}
+
+function getZodObjectShape(
+  zodSchema: ZodSchemaLike,
+): Record<string, ZodSchemaLike> | undefined {
+  const shape = zodSchema.shape;
+  const resolvedShape =
+    typeof shape === 'function' ? (shape as () => unknown)() : shape;
+
+  return resolvedShape != null && typeof resolvedShape === 'object'
+    ? (resolvedShape as Record<string, ZodSchemaLike>)
+    : undefined;
+}
+
+/**
+ * `zod-to-json-schema` (which is used by `asSchema`) unwraps schemas such as
+ * `ZodOptional` without copying the metadata of the wrapper. Descriptions that
+ * are attached to the wrapper (e.g. `z.string().optional().describe('...')`)
+ * are therefore lost in the generated JSON schema.
+ *
+ * This function walks the zod schema and the generated JSON schema in parallel
+ * and restores the missing descriptions so they are not lost in the schema that
+ * is sent to the model.
+ */
+export function addZodDescriptionsToJsonSchema(
+  jsonSchema: JSONSchemaDefinition | undefined,
+  zodSchema: unknown,
+): void {
+  if (jsonSchema == null || typeof jsonSchema === 'boolean') {
+    return;
+  }
+
+  if (!isZodSchema(zodSchema)) {
+    return;
+  }
+
+  // restore the description of the schema itself (it might be defined on a
+  // wrapper that was unwrapped during the JSON schema generation):
+  const description = getZodDescription(zodSchema);
+  if (description != null && jsonSchema.description == null) {
+    jsonSchema.description = description;
+  }
+
+  const unwrappedZodSchema = unwrapZodSchema(zodSchema);
+  if (unwrappedZodSchema == null) {
+    return;
+  }
+
+  switch (unwrappedZodSchema._def?.typeName) {
+    case 'ZodObject': {
+      const shape = getZodObjectShape(unwrappedZodSchema);
+      const properties = jsonSchema.properties;
+
+      if (shape == null || properties == null) {
+        return;
+      }
+
+      for (const propertyName of Object.keys(properties)) {
+        addZodDescriptionsToJsonSchema(
+          properties[propertyName],
+          shape[propertyName],
+        );
+      }
+
+      return;
+    }
+
+    case 'ZodArray': {
+      const items = jsonSchema.items;
+
+      // tuple schemas are represented as arrays of items:
+      if (items == null || Array.isArray(items)) {
+        return;
+      }
+
+      addZodDescriptionsToJsonSchema(items, unwrappedZodSchema._def?.type);
+      return;
+    }
+
+    case 'ZodRecord': {
+      addZodDescriptionsToJsonSchema(
+        jsonSchema.additionalProperties,
+        unwrappedZodSchema._def?.valueType,
+      );
+      return;
+    }
+
+    case 'ZodUnion':
+    case 'ZodDiscriminatedUnion': {
+      const options = unwrappedZodSchema._def?.options;
+      const anyOf = jsonSchema.anyOf;
+
+      if (!Array.isArray(options) || !Array.isArray(anyOf)) {
+        return;
+      }
+
+      for (let index = 0; index < Math.min(options.length, anyOf.length); index++) {
+        addZodDescriptionsToJsonSchema(anyOf[index], options[index]);
+      }
+
+      return;
+    }
+
+    case 'ZodIntersection': {
+      const allOf = jsonSchema.allOf;
+
+      if (!Array.isArray(allOf)) {
+        return;
+      }
+
+      addZodDescriptionsToJsonSchema(allOf[0], unwrappedZodSchema._def?.left);
+      addZodDescriptionsToJsonSchema(allOf[1], unwrappedZodSchema._def?.right);
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+export function prepareToolsAndToolChoice<
+  TOOLS extends Record<string, CoreTool>,
+>({
+  tools,
+  toolChoice,
+  activeTools,
+}: {
+  tools: TOOLS | undefined;
+  toolChoice: CoreToolChoice<TOOLS> | undefined;
+  activeTools: Array<keyof TOOLS> | undefined;
+}): {
+  tools:
+    | Array<LanguageModelV1FunctionTool | LanguageModelV1ProviderDefinedTool>
+    | undefined;
+  toolChoice: LanguageModelV1ToolChoice | undefined;
+} {
+  if (!isNonEmptyObject(tools)) {
+    return {
+      tools: undefined,
+      toolChoice: undefined,
+    };
+  }
+
+  // when activeTools is provided, we only include the tools that are in the list:
+  const filteredTools =
+    activeTools != null
+      ? Object.entries(tools).filter(([name]) =>
+          activeTools.includes(name as keyof TOOLS),
+        )
+      : Object.entries(tools);
+
+  return {
+    tools: filteredTools.map(([name, tool]) => {
+      const toolType = tool.type;
+      switch (toolType) {
+        case undefined:
+        case 'function': {
+          const parameters = asSchema(tool.parameters).jsonSchema;
+
+          // `asSchema` loses descriptions that are defined on zod wrappers
+          // (e.g. `z.string().optional().describe('...')`). restore them so
+          // they are not lost in the tool parameter schema:
+          addZodDescriptionsToJsonSchema(parameters, tool.parameters);
+
+          return {
+            type: 'function' as const,
+            name,
+            description: tool.description,
+            parameters,
+          };
+        }
+        case 'provider-defined':
+          return {
+            type: 'provider-defined' as const,
+            name,
+            id: tool.id,
+            args: tool.args,
+          };
+        default: {
+          const exhaustiveCheck: never = toolType;
+          throw new Error(`Unsupported tool type: ${exhaustiveCheck}`);
+        }
+      }
+    }),
+    toolChoice:
+      toolChoice == null
+        ? { type: 'auto' }
+        : typeof toolChoice === 'string'
+        ? { type: toolChoice }
+        : { type: 'tool' as const, toolName: toolChoice.toolName as string },
+  };
+}
+
+### packages/ai/core/generate-object/output-strategy.ts
+import {
+  isJSONArray,
+  isJSONObject,
+  JSONObject,
+  JSONSchema7,
+  JSONValue,
+  TypeValidationError,
+  UnsupportedFunctionalityError,
+} from '@ai-sdk/provider';
+import { safeValidateTypes, ValidationResult } from '@ai-sdk/provider-utils';
+import { asSchema, DeepPartial, Schema } from '@ai-sdk/ui-utils';
+import { z } from 'zod';
+import { NoObjectGeneratedError } from '../../errors/no-object-generated-error';
+import {
+  AsyncIterableStream,
+  createAsyncIterableStream,
+} from '../util/async-iterable-stream';
+import { ObjectStreamPart } from './stream-object-result';
+import { LanguageModelResponseMetadata, LanguageModelUsage } from '../types';
+
+export interface OutputStrategy<PARTIAL, RESULT, ELEMENT_STREAM> {
+  readonly type: 'object' | 'array' | 'enum' | 'no-schema';
+  readonly jsonSchema: JSONSchema7 | undefined;
+
+  validatePartialResult({
+    value,
+    textDelta,
+    isFinalDelta,
+  }: {
+    value: JSONValue;
+    textDelta: string;
+    isFirstDelta: boolean;
+    isFinalDelta: boolean;
+    latestObject: PARTIAL | undefined;
+  }): ValidationResult<{
+    partial: PARTIAL;
+    textDelta: string;
+  }>;
+  validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+    },
+  ): ValidationResult<RESULT>;
+
+  createElementStream(
+    originalStream: ReadableStream<ObjectStreamPart<PARTIAL>>,
+  ): ELEMENT_STREAM;
+}
+
+type JSONSchemaDefinition = JSONSchema7 | boolean;
+
+/**
+ * Minimal structural type for zod schemas. It allows inspecting a zod schema
+ * without depending on zod's internal typings.
+ */
+interface ZodSchemaLike {
+  description?: string;
+  shape?: unknown;
+  _def?: {
+    typeName?: string;
+    description?: string;
+    innerType?: ZodSchemaLike;
+    schema?: ZodSchemaLike;
+    in?: ZodSchemaLike;
+    type?: ZodSchemaLike;
+    items?: Array<ZodSchemaLike>;
+    options?: Array<ZodSchemaLike>;
+    left?: ZodSchemaLike;
+    right?: ZodSchemaLike;
+    valueType?: ZodSchemaLike;
+  };
+}
+
+function isZodSchema(value: unknown): value is ZodSchemaLike {
+  return (
+    value != null &&
+    typeof value === 'object' &&
+    (value as ZodSchemaLike)._def != null &&
+    typeof (value as ZodSchemaLike)._def === 'object'
+  );
+}
+
+function getZodDescription(zodSchema: ZodSchemaLike): string | undefined {
+  const description = zodSchema.description ?? zodSchema._def?.description;
+
+  return typeof description === 'string' ? description : undefined;
+}
+
+/**
+ * Unwraps zod wrappers that do not change the shape of the schema,
+ * e.g. `z.string().optional()` or `z.string().default('')`.
+ */
+function unwrapZodSchema(
+  zodSchema: ZodSchemaLike,
+): ZodSchemaLike | undefined {
+  let current: ZodSchemaLike | undefined = zodSchema;
+
+  // the level limit protects against recursive schemas:
+  for (let level = 0; level < 10 && current != null; level++) {
+    switch (current._def?.typeName) {
+      case 'ZodOptional':
+      case 'ZodNullable':
+      case 'ZodDefault':
+      case 'ZodCatch':
+      case 'ZodReadonly':
+        current = current._def?.innerType;
+        break;
+      case 'ZodBranded':
+        current = current._def?.innerType ?? current._def?.type;
+        break;
+      case 'ZodEffects':
+        current = current._def?.schema;
+        break;
+      case 'ZodPipeline':
+        current = current._def?.in;
+        break;
+      default:
+        return current;
+    }
+  }
+
+  return current;
+}
+
+function getZodObjectShape(
+  zodSchema: ZodSchemaLike,
+): Record<string, ZodSchemaLike> | undefined {
+  const shape = zodSchema.shape;
+  const resolvedShape =
+    typeof shape === 'function' ? (shape as () => unknown)() : shape;
+
+  return resolvedShape != null && typeof resolvedShape === 'object'
+    ? (resolvedShape as Record<string, ZodSchemaLike>)
+    : undefined;
+}
+
+/**
+ * `zod-to-json-schema` (which is used by `asSchema`) unwraps schemas such as
+ * `ZodOptional` without copying the metadata of the wrapper. Descriptions that
+ * are attached to the wrapper (e.g. `z.string().optional().describe('...')`)
+ * are therefore lost in the generated JSON schema.
+ *
+ * This function walks the zod schema and the generated JSON schema in parallel
+ * and restores the missing descriptions so they are not lost in the schema that
+ * is used for the generation.
+ */
+function addZodDescriptionsToJsonSchema(
+  jsonSchema: JSONSchemaDefinition | undefined,
+  zodSchema: unknown,
+): void {
+  if (jsonSchema == null || typeof jsonSchema === 'boolean') {
+    return;
+  }
+
+  if (!isZodSchema(zodSchema)) {
+    return;
+  }
+
+  // restore the description of the schema itself (it might be defined on a
+  // wrapper that was unwrapped during the JSON schema generation):
+  const description = getZodDescription(zodSchema);
+  if (description != null && jsonSchema.description == null) {
+    jsonSchema.description = description;
+  }
+
+  const unwrappedZodSchema = unwrapZodSchema(zodSchema);
+  if (unwrappedZodSchema == null) {
+    return;
+  }
+
+  switch (unwrappedZodSchema._def?.typeName) {
+    case 'ZodObject': {
+      const shape = getZodObjectShape(unwrappedZodSchema);
+      const properties = jsonSchema.properties;
+
+      if (shape == null || properties == null) {
+        return;
+      }
+
+      for (const propertyName of Object.keys(properties)) {
+        addZodDescriptionsToJsonSchema(
+          properties[propertyName],
+          shape[propertyName],
+        );
+      }
+
+      return;
+    }
+
+    case 'ZodArray': {
+      const items = jsonSchema.items;
+
+      // tuple schemas are represented as arrays of items:
+      if (items == null || Array.isArray(items)) {
+        return;
+      }
+
+      addZodDescriptionsToJsonSchema(items, unwrappedZodSchema._def?.type);
+      return;
+    }
+
+    case 'ZodRecord': {
+      addZodDescriptionsToJsonSchema(
+        jsonSchema.additionalProperties,
+        unwrappedZodSchema._def?.valueType,
+      );
+      return;
+    }
+
+    case 'ZodUnion':
+    case 'ZodDiscriminatedUnion': {
+      const options = unwrappedZodSchema._def?.options;
+      const anyOf = jsonSchema.anyOf;
+
+      if (!Array.isArray(options) || !Array.isArray(anyOf)) {
+        return;
+      }
+
+      for (let index = 0; index < Math.min(options.length, anyOf.length); index++) {
+        addZodDescriptionsToJsonSchema(anyOf[index], options[index]);
+      }
+
+      return;
+    }
+
+    case 'ZodIntersection': {
+      const allOf = jsonSchema.allOf;
+
+      if (!Array.isArray(allOf)) {
+        return;
+      }
+
+      addZodDescriptionsToJsonSchema(allOf[0], unwrappedZodSchema._def?.left);
+      addZodDescriptionsToJsonSchema(allOf[1], unwrappedZodSchema._def?.right);
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+const noSchemaOutputStrategy: OutputStrategy<JSONValue, JSONValue, never> = {
+  type: 'no-schema',
+  jsonSchema: undefined,
+
+  validatePartialResult({ value, textDelta }) {
+    return { success: true, value: { partial: value, textDelta } };
+  },
+
+  validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+    },
+  ): ValidationResult<JSONValue> {
+    return value === undefined
+      ? {
+          success: false,
+          error: new NoObjectGeneratedError({
+            message: 'No object generated: response did not match schema.',
+            text: context.text,
+            response: context.response,
+            usage: context.usage,
+          }),
+        }
+      : { success: true, value };
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in no-schema mode',
+    });
+  },
+};
+
+const objectOutputStrategy = <OBJECT>(
+  schema: Schema<OBJECT>,
+  zodSchema?: unknown,
+): OutputStrategy<DeepPartial<OBJECT>, OBJECT, never> => {
+  const jsonSchema = schema.jsonSchema;
+
+  // `asSchema` loses descriptions that are defined on zod wrappers
+  // (e.g. `z.string().optional().describe('...')`). restore them:
+  addZodDescriptionsToJsonSchema(jsonSchema, zodSchema);
+
+  return {
+    type: 'object',
+    jsonSchema,
+
+    validatePartialResult({ value, textDelta }) {
+      return {
+        success: true,
+        value: {
+          // Note: currently no validation of partial results:
+          partial: value as DeepPartial<OBJECT>,
+          textDelta,
+        },
+      };
+    },
+
+    validateFinalResult(value: JSONValue | undefined): ValidationResult<OBJECT> {
+      return safeValidateTypes({ value, schema });
+    },
+
+    createElementStream() {
+      throw new UnsupportedFunctionalityError({
+        functionality: 'element streams in object mode',
+      });
+    },
+  };
+};
+
+const arrayOutputStrategy = <ELEMENT>(
+  schema: Schema<ELEMENT>,
+  zodSchema?: unknown,
+): OutputStrategy<ELEMENT[], ELEMENT[], AsyncIterableStream<ELEMENT>> => {
+  addZodDescriptionsToJsonSchema(schema.jsonSchema, zodSchema);
+
+  // remove $schema from schema.jsonSchema:
+  const { $schema, ...itemSchema } = schema.jsonSchema;
+
+  return {
+    type: 'array',
+
+    // wrap in object that contains array of elements, since most LLMs will not
+    // be able to generate an array directly:
+    // possible future optimization: use arrays directly when model supports grammar-guided generation
+    jsonSchema: {
+      $schema: 'https://json-schema.org/draft/2019-09/schema#',
+      type: 'object',
+      properties: {
+        elements: { type: 'array', items: itemSchema },
+      },
+      required: ['elements'],
+      additionalProperties: false,
+    },
+
+    validatePartialResult({ value, latestObject, isFirstDelta, isFinalDelta }) {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+      const resultArray: Array<ELEMENT> = [];
+
+      for (let i = 0; i < inputArray.length; i++) {
+        const element = inputArray[i];
+        const result = safeValidateTypes({ value: element, schema });
+
+        // special treatment for last processed element:
+        // ignore parse or validation failures, since they indicate that the
+        // last element is incomplete and should not be included in the result,
+        // unless it is the final delta
+        if (i === inputArray.length - 1 && !isFinalDelta) {
+          continue;
+        }
+
+        if (!result.success) {
+          return result;
+        }
+
+        resultArray.push(result.value);
+      }
+
+      // calculate delta:
+      const publishedElementCount = latestObject?.length ?? 0;
+
+      let textDelta = '';
+
+      if (isFirstDelta) {
+        textDelta += '[';
+      }
+
+      if (publishedElementCount > 0) {
+        textDelta += ',';
+      }
+
+      textDelta += resultArray
+        .slice(publishedElementCount) // only new elements
+        .map(element => JSON.stringify(element))
+        .join(',');
+
+      if (isFinalDelta) {
+        textDelta += ']';
+      }
+
+      return {
+        success: true,
+        value: {
+          partial: resultArray,
+          textDelta,
+        },
+      };
+    },
+
+    validateFinalResult(
+      value: JSONValue | undefined,
+    ): ValidationResult<Array<ELEMENT>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+
+      // check that each element in the array is of the correct type:
+      for (const element of inputArray) {
+        const result = safeValidateTypes({ value: element, schema });
+        if (!result.success) {
+          return result;
+        }
+      }
+
+      return { success: true, value: inputArray as Array<ELEMENT> };
+    },
+
+    createElementStream(
+      originalStream: ReadableStream<ObjectStreamPart<ELEMENT[]>>,
+    ) {
+      let publishedElements = 0;
+
+      return createAsyncIterableStream(
+        originalStream.pipeThrough(
+          new TransformStream<ObjectStreamPart<ELEMENT[]>, ELEMENT>({
+            transform(chunk, controller) {
+              switch (chunk.type) {
+                case 'object': {
+                  const array = chunk.object;
+
+                  // publish new elements one by one:
+                  for (
+                    ;
+                    publishedElements < array.length;
+                    publishedElements++
+                  ) {
+                    controller.enqueue(array[publishedElements]);
+                  }
+
+                  break;
+                }
+
+                case 'text-delta':
+                case 'finish':
+                  break;
+
+                case 'error':
+                  controller.error(chunk.error);
+                  break;
+
+                default: {
+                  const _exhaustiveCheck: never = chunk;
+                  throw new Error(
+                    `Unsupported chunk type: ${_exhaustiveCheck}`,
+                  );
+                }
+              }
+            },
+          }),
+        ),
+      );
+    },
+  };
+};
+
+const enumOutputStrategy = <ENUM extends string>(
+  enumValues: Array<ENUM>,
+): OutputStrategy<ENUM, ENUM, never> => {
+  return {
+    type: 'enum',
+
+    // wrap in object that contains result, since most LLMs will not
+    // be able to generate an enum value directly:
+    // possible future optimization: use enums directly when model supports top-level enums
+    jsonSchema: {
+      $schema: 'https://json-schema.org/draft/2019-09/schema#',
+      type: 'object',
+      properties: {
+        result: { type: 'string', enum: enumValues },
+      },
+      required: ['result'],
+      additionalProperties: false,
+    },
+
+    validateFinalResult(value: JSONValue | undefined): ValidationResult<ENUM> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+
+      return enumValues.includes(result as ENUM)
+        ? { success: true, value: result as ENUM }
+        : {
+            success: false,
+            error: new TypeValidationError({
+              value,
+              cause: 'value must be a string in the enum',
+            }),
+          };
+    },
+
+    validatePartialResult() {
+      // no streaming in enum mode
+      throw new UnsupportedFunctionalityError({
+        functionality: 'partial results in enum mode',
+      });
+    },
+
+    createElementStream() {
+      // no streaming in enum mode
+      throw new UnsupportedFunctionalityError({
+        functionality: 'element streams in enum mode',
+      });
+    },
+  };
+};
+
+export function getOutputStrategy<SCHEMA>({
+  output,
+  schema,
+  enumValues,
+}: {
+  output: 'object' | 'array' | 'enum' | 'no-schema';
+  schema?: z.Schema<SCHEMA, z.ZodTypeDef, any> | Schema<SCHEMA>;
+  enumValues?: Array<SCHEMA>;
+}): OutputStrategy<any, any, any> {
+  switch (output) {
+    case 'object':
+      // the original schema is passed in so that descriptions that are lost
+      // during the zod -> JSON schema conversion can be restored:
+      return objectOutputStrategy(asSchema(schema!), schema);
+    case 'array':
+      return arrayOutputStrategy(asSchema(schema!), schema);
+    case 'enum':
+      return enumOutputStrategy(enumValues! as Array<string>);
+    case 'no-schema':
+      return noSchemaOutputStrategy;
+    default: {
+      const _exhaustiveCheck: never = output;
+      throw new Error(`Unsupported output: ${_exhaustiveCheck}`);
+    }
+  }
+}
+
+### packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
+import { z } from 'zod';
+import { CoreTool, tool } from '../tool/tool';
+import { prepareToolsAndToolChoice } from './prepare-tools-and-tool-choice';
+
+const mockTools: Record<string, CoreTool> = {
+  tool1: tool({
+    description: 'Tool 1 description',
+    parameters: z.object({}),
+  }),
+  tool2: tool({
+    description: 'Tool 2 description',
+    parameters: z.object({ city: z.string() }),
+  }),
+};
+
+const mockProviderDefinedTool: CoreTool = {
+  type: 'provider-defined',
+  id: 'provider.tool-id',
+  args: { key: 'value' },
+  parameters: z.object({}),
+};
+
+const mockToolsWithProviderDefined: Record<string, CoreTool> = {
+  ...mockTools,
+  providerTool: mockProviderDefinedTool,
+};
+
+it('should return undefined for both tools and toolChoice when tools is not provided', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: undefined,
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+  expect(result).toEqual({ tools: undefined, toolChoice: undefined });
+});
+
+it('should return all tools when activeTools is not provided', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+  expect(result.tools).toHaveLength(2);
+  expect(result.tools?.[0].name).toBe('tool1');
+  expect(result.tools?.[1].name).toBe('tool2');
+  expect(result.toolChoice).toEqual({ type: 'auto' });
+});
+
+it('should filter tools based on activeTools', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: undefined,
+    activeTools: ['tool1'],
+  });
+  expect(result.tools).toHaveLength(1);
+  expect(result.tools?.[0].name).toBe('tool1');
+  expect(result.toolChoice).toEqual({ type: 'auto' });
+});
+
+it('should handle string toolChoice', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: 'none',
+    activeTools: undefined,
+  });
+  expect(result.tools).toHaveLength(2);
+  expect(result.toolChoice).toEqual({ type: 'none' });
+});
+
+it('should handle object toolChoice', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: { type: 'tool', toolName: 'tool2' },
+    activeTools: undefined,
+  });
+  expect(result.tools).toHaveLength(2);
+  expect(result.toolChoice).toEqual({ type: 'tool', toolName: 'tool2' });
+});
+
+it('should correctly map tool properties', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockTools,
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+  expect(result.tools?.[0]).toEqual({
+    type: 'function',
+    name: 'tool1',
+    description: 'Tool 1 description',
+    parameters: {
+      $schema: 'https://json-schema.org/draft/2019-09/schema#',
+      additionalProperties: false,
+      type: 'object',
+      properties: {},
+    },
+  });
+});
+
+it('should preserve the description of optional parameters', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: {
+      tool1: tool({
+        description: 'Tool 1 description',
+        parameters: z.object({
+          city: z
+            .string()
+            .optional()
+            .describe('The city to get the weather for'),
+        }),
+      }),
+    },
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+
+  const parameters = result.tools?.[0].parameters as {
+    properties?: Record<string, { description?: string }>;
+  };
+
+  expect(parameters.properties?.city?.description).toBe(
+    'The city to get the weather for',
+  );
+});
+
+it('should preserve the description of optional parameters with defaults and nullables', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: {
+      tool1: tool({
+        description: 'Tool 1 description',
+        parameters: z.object({
+          unit: z
+            .string()
+            .default('celsius')
+            .describe('The unit of temperature'),
+          note: z.string().nullable().describe('An optional note'),
+        }),
+      }),
+    },
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+
+  const parameters = result.tools?.[0].parameters as {
+    properties?: Record<string, { description?: string }>;
+  };
+
+  expect(parameters.properties?.unit?.description).toBe(
+    'The unit of temperature',
+  );
+  expect(parameters.properties?.note?.description).toBe('An optional note');
+});
+
+it('should preserve the descriptions of nested optional parameters', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: {
+      tool1: tool({
+        description: 'Tool 1 description',
+        parameters: z.object({
+          location: z.object({
+            city: z.string().optional().describe('The city name'),
+          }),
+        }),
+      }),
+    },
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+
+  const parameters = result.tools?.[0].parameters as {
+    properties?: Record<
+      string,
+      { properties?: Record<string, { description?: string }> }
+    >;
+  };
+
+  expect(parameters.properties?.location?.properties?.city?.description).toBe(
+    'The city name',
+  );
+});
+
+it('should handle provider-defined tool type', () => {
+  const result = prepareToolsAndToolChoice({
+    tools: mockToolsWithProviderDefined,
+    toolChoice: undefined,
+    activeTools: undefined,
+  });
+  expect(result.tools).toHaveLength(3);
+  expect(result.tools?.[2]).toEqual({
+    type: 'provider-defined',
+    name: 'providerTool',
+    id: 'provider.tool-id',
+    args: { key: 'value' },
+  });
+});
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,510 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-08 20:33:44
+End Time: 2026-11-08 20:42:23
+Total Duration: 518.81 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Find similar and duplicate controls in a CSV of 3500+ controls.
+
+Why the previous version produced the wrong output:
+  1. CharacterTextSplitter shredded each CSV row (one control) into overlapping
+     500-character chunks, destroying the 1:1 mapping between a control and an
+     embedding, so results could no longer be attributed to real controls.
+  2. The pipeline was a generic "answer in three sentences" QA chain. A chat
+     model prompted that way can never enumerate pair-level results with
+     numeric similarity scores.
+  3. The hardcoded query ("Find movies for family...") had nothing to do with
+     control.csv.
+
+Fix: keep every control atomic, embed them all in batches, compute pairwise
+cosine similarity directly, and list every pair whose score exceeds the
+configured thresholds.
+"""
+
+import csv
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+
+# Import fallbacks so the script runs on both new and legacy LangChain installs.
+try:
+    from langchain_community.document_loaders import CSVLoader
+except ImportError:  # pragma: no cover - legacy single-package installs
+    from langchain.document_loaders import CSVLoader
+
+try:
+    from langchain_openai import OpenAIEmbeddings
+except ImportError:  # pragma: no cover - legacy single-package installs
+    from langchain.embeddings import OpenAIEmbeddings
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONTROL_CSV = "control.csv"
+OUTPUT_CSV = "control_pairs.csv"
+
+# Pairs whose cosine similarity exceeds these thresholds get reported:
+#   duplicate -> effectively the same control
+#   similar   -> same requirement, different wording
+DUPLICATE_THRESHOLD = 0.97
+SIMILAR_THRESHOLD = 0.90
+
+EMBED_BATCH_SIZE = 512   # controls sent per embedding request
+MATRIX_BLOCK = 256       # rows of the similarity matrix computed at a time
+
+
+def get_embedder():
+    """Create the embedding model (retries protect the 3500+ row batch job)."""
+    return OpenAIEmbeddings(max_retries=5)
+
+
+def load_controls(file_path):
+    """Load every CSV row as ONE atomic control document.
+
+    NOTE: no text splitter is used here on purpose. Splitting rows into chunks
+    breaks the mapping between an embedding and a control, which made pairwise
+    control comparison impossible in the buggy version.
+    """
+    loader = CSVLoader(file_path=file_path)
+    return loader.load()
+
+
+def embed_controls(controls, embedder, batch_size=EMBED_BATCH_SIZE):
+    """Embed all controls in batches and return a unit-normalised matrix.
+
+    Normalising means the dot product of any two rows equals their cosine
+    similarity in the range [-1, 1].
+    """
+    texts = [control.page_content for control in controls]
+
+    vectors = []
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        vectors.extend(embedder.embed_documents(batch))
+        print(f"  embedded {min(start + batch_size, len(texts))}/{len(texts)} controls")
+
+    vectors = np.asarray(vectors, dtype=np.float32)
+
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0  # guard against empty rows
+    return vectors / norms
+
+
+def find_control_pairs(controls, vectors, similar_threshold, duplicate_threshold):
+    """Return (duplicate_pairs, similar_pairs) that exceed the thresholds.
+
+    Only the upper triangle (i < j) of the similarity matrix is inspected, so
+    every unordered pair is reported exactly once instead of twice as
+    (a, b) and (b, a). The matrix is computed in row blocks to keep memory
+    bounded for 3500+ controls.
+    """
+    n = len(controls)
+    duplicate_pairs = []
+    similar_pairs = []
+
+    for start in range(0, n, MATRIX_BLOCK):
+        block = vectors[start:start + MATRIX_BLOCK] @ vectors.T  # (b, n) cos sims
+        for bi in range(block.shape[0]):
+            i = start + bi
+            sims = block[bi, i + 1:]  # only j > i
+            if sims.size == 0:
+                continue
+
+            for offset in np.argwhere(sims >= similar_threshold).ravel():
+                j = i + 1 + int(offset)
+                score = float(sims[offset])
+                pair = {
+                    "row_a": controls[i].metadata.get("row", i),
+                    "row_b": controls[j].metadata.get("row", j),
+                    "control_a": " | ".join(controls[i].page_content.splitlines()),
+                    "control_b": " | ".join(controls[j].page_content.splitlines()),
+                    "similarity": round(score, 4),
+                }
+                if score >= duplicate_threshold:
+                    duplicate_pairs.append(pair)
+                else:
+                    similar_pairs.append(pair)
+
+    duplicate_pairs.sort(key=lambda p: p["similarity"], reverse=True)
+    similar_pairs.sort(key=lambda p: p["similarity"], reverse=True)
+    return duplicate_pairs, similar_pairs
+
+
+def find_similar_controls(query, controls, vectors, embedder, k=5):
+    """Return the k controls most similar to an arbitrary control/query text."""
+    q = np.asarray(embedder.embed_query(query), dtype=np.float32)
+    norm = float(np.linalg.norm(q))
+    if norm > 0.0:
+        q = q / norm
+
+    sims = vectors @ q
+    top = np.argsort(sims)[::-1][:k]
+    return [(controls[int(idx)], float(sims[idx])) for idx in top]
+
+
+def print_pairs(title, pairs):
+    print(f"\n=== {title}: {len(pairs)} pair(s) found ===")
+    if not pairs:
+        print("  (no pairs above this threshold)")
+        return
+    for rank, pair in enumerate(pairs, start=1):
+        print(f"{rank}. similarity = {pair['similarity']:.4f} "
+              f"(rows {pair['row_a']} vs {pair['row_b']})")
+        print(f"   A: {pair['control_a'][:160]}")
+        print(f"   B: {pair['control_b'][:160]}")
+
+
+def save_pairs(duplicate_pairs, similar_pairs, output_path):
+    """Persist the full results (console output is truncated for readability)."""
+    fieldnames = ["pair_type", "row_a", "row_b", "similarity", "control_a", "control_b"]
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for pair in duplicate_pairs:
+            writer.writerow({**pair, "pair_type": "duplicate"})
+        for pair in similar_pairs:
+            writer.writerow({**pair, "pair_type": "similar"})
+    print(f"\nFull results written to {output_path}")
+
+
+def run_agent(
+    query=None,
+    file_path=CONTROL_CSV,
+    similar_threshold=SIMILAR_THRESHOLD,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+):
+    """Generate and list similar / duplicate control pairs above the thresholds.
+
+    The buggy version routed everything through a QA prompt that was capped at
+    three sentences, so it could never list pair-level results with scores.
+    Similarity is now computed directly from the embeddings instead of being
+    requested from a chat model.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        raise SystemExit("OPENAI_API_KEY is not set. Add it to your .env file.")
+
+    controls = load_controls(file_path)
+    if not controls:
+        print(f"No controls were loaded from {file_path!r} - check the file path.")
+        return {"duplicates": [], "similar": []}
+
+    print(f"Loaded {len(controls)} controls from {file_path!r}.")
+
+    print("Embedding controls...")
+    embedder = get_embedder()
+    vectors = embed_controls(controls, embedder)
+    print(f"Embeddings ready: {vectors.shape[0]} controls x {vectors.shape[1]} dims.")
+
+    print("Comparing all control pairs...")
+    duplicates, similar = find_control_pairs(
+        controls, vectors, similar_threshold, duplicate_threshold
+    )
+
+    print_pairs(
+        f"DUPLICATE control pairs (similarity >= {duplicate_threshold})", duplicates
+    )
+    print_pairs(
+        f"SIMILAR control pairs ({similar_threshold} <= similarity < {duplicate_threshold})",
+        similar,
+    )
+
+    save_pairs(duplicates, similar, OUTPUT_CSV)
+
+    # Optional: look up the controls closest to a single control/query text.
+    if query:
+        print(f"\n=== Top matches for query: {query!r} ===")
+        for control, score in find_similar_controls(query, controls, vectors, embedder):
+            print(f"  ({score:.4f}) {control.page_content[:160]}")
+
+    return {"duplicates": duplicates, "similar": similar}
+
+
+if __name__ == "__main__":
+    run_agent(
+        file_path=CONTROL_CSV,
+        similar_threshold=SIMILAR_THRESHOLD,
+        duplicate_threshold=DUPLICATE_THRESHOLD,
+    )
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-08 20:42:23
+Duration: 518.81 seconds
+Verdict: ## Evaluation Summary for Case 78383658
+
+### 1. Diff Analysis
+The fix is a complete rewrite: it replaces the RAG QA chain (CSVLoader → CharacterTextSplitter → Chroma → ChatOpenAI → string output) with a control-similarity pipeline that loads each CSV row atomically (no chunking), embeds controls in batches via `OpenAIEmbeddings`, computes pairwise cosine similarity with block-wise matrix multiplication, and returns `{"duplicates": [...], "similar": [...]}`. The engineering itself is sound — it correctly identifies real defects in the buggy code (chunking destroyed the 1:1 control↔embedding mapping; a "three sentences max" QA prompt can never enumerate pair-level results; the hardcoded movie query was unrelated to `control.csv`).
+
+### 2. API Verification
+The `verify_api_usage` searches returned irrelevant noise (animal sanctuary pages, Amazon, John Wick), so I verified from established knowledge:
+- `OpenAIEmbeddings.embed_documents(list)` / `embed_query(str)` / `max_retries` — correct usage
+- `CSVLoader.load()` returning Documents with `metadata["row"]` — correct
+- `np.linalg.norm(..., axis=1, keepdims=True)`, block-wise `@` matmul on normalized vectors — correct
+
+**API usage passes.**
+
+### 3. Critical Test Failure
+Despite `validate_fixed_code` returning a blanket ACCEPT, direct analysis of the provided test contradicts it:
+
+```python
+result = run_agent(query)
+self.assertIsInstance(result, dict)      # PASSES - fix returns a dict
+self.assertIn("results", result)         # FAILS - ❌
+```
+
+The fixed `run_agent` has exactly two return paths:
+- `return {"duplicates": [], "similar": []}`
+- `return {"duplicates": duplicates, "similar": similar}`
+
+**Neither contains a `"results"` key.** The test requires `result["results"]` to be a list of dicts, but the fix keys its output as `"duplicates"`/`"similar"`. The test fails at `assertIn("results", result)` before the list/dict item assertions are even reached. This is a near-miss fix — it correctly converted the output from a string to a dict of lists-of-dicts, but used the wrong schema.
+
+Additional mismatches:
+- The test passes a movie query and expects structured results for it; in the fix, `query` is merely an optional side-lookup after the full pairwise pipeline runs.
+- The semantic reorientation to "control similarity" disregards the test contract, which is the specification the fix must satisfy.
+- The validation tool's terse, generic ACCEPT directly contradicts the explicit test assertions, and given the API-verification searches returned clearly irrelevant results, the tooling here is not fully reliable — so I relied on direct analysis of the test.
+
+### Verdict
+
+**REJECT**
+
+The fix is well-engineered and uses APIs correctly, but it fails the provided test: `run_agent` must return a dict containing a `"results"` key mapping to a list of dicts (e.g., `{"results": [...]}` or `llm.with_structured_output()` producing that schema). The current fix returns `{"duplicates": [...], "similar": [...]}`, so `self.assertIn("results", result)` raises an AssertionError. The output format does not conform to the test's required structure.
+--------------------------------------------------------------------------------
+"""
+Find similar and duplicate controls in a CSV of 3500+ controls.
+
+Why the previous version produced the wrong output:
+  1. CharacterTextSplitter shredded each CSV row (one control) into overlapping
+     500-character chunks, destroying the 1:1 mapping between a control and an
+     embedding, so results could no longer be attributed to real controls.
+  2. The pipeline was a generic "answer in three sentences" QA chain. A chat
+     model prompted that way can never enumerate pair-level results with
+     numeric similarity scores.
+  3. The hardcoded query ("Find movies for family...") had nothing to do with
+     control.csv.
+
+Fix: keep every control atomic, embed them all in batches, compute pairwise
+cosine similarity directly, and list every pair whose score exceeds the
+configured thresholds.
+"""
+
+import csv
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+
+# Import fallbacks so the script runs on both new and legacy LangChain installs.
+try:
+    from langchain_community.document_loaders import CSVLoader
+except ImportError:  # pragma: no cover - legacy single-package installs
+    from langchain.document_loaders import CSVLoader
+
+try:
+    from langchain_openai import OpenAIEmbeddings
+except ImportError:  # pragma: no cover - legacy single-package installs
+    from langchain.embeddings import OpenAIEmbeddings
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONTROL_CSV = "control.csv"
+OUTPUT_CSV = "control_pairs.csv"
+
+# Pairs whose cosine similarity exceeds these thresholds get reported:
+#   duplicate -> effectively the same control
+#   similar   -> same requirement, different wording
+DUPLICATE_THRESHOLD = 0.97
+SIMILAR_THRESHOLD = 0.90
+
+EMBED_BATCH_SIZE = 512   # controls sent per embedding request
+MATRIX_BLOCK = 256       # rows of the similarity matrix computed at a time
+
+
+def get_embedder():
+    """Create the embedding model (retries protect the 3500+ row batch job)."""
+    return OpenAIEmbeddings(max_retries=5)
+
+
+def load_controls(file_path):
+    """Load every CSV row as ONE atomic control document.
+
+    NOTE: no text splitter is used here on purpose. Splitting rows into chunks
+    breaks the mapping between an embedding and a control, which made pairwise
+    control comparison impossible in the buggy version.
+    """
+    loader = CSVLoader(file_path=file_path)
+    return loader.load()
+
+
+def embed_controls(controls, embedder, batch_size=EMBED_BATCH_SIZE):
+    """Embed all controls in batches and return a unit-normalised matrix.
+
+    Normalising means the dot product of any two rows equals their cosine
+    similarity in the range [-1, 1].
+    """
+    texts = [control.page_content for control in controls]
+
+    vectors = []
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        vectors.extend(embedder.embed_documents(batch))
+        print(f"  embedded {min(start + batch_size, len(texts))}/{len(texts)} controls")
+
+    vectors = np.asarray(vectors, dtype=np.float32)
+
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0  # guard against empty rows
+    return vectors / norms
+
+
+def find_control_pairs(controls, vectors, similar_threshold, duplicate_threshold):
+    """Return (duplicate_pairs, similar_pairs) that exceed the thresholds.
+
+    Only the upper triangle (i < j) of the similarity matrix is inspected, so
+    every unordered pair is reported exactly once instead of twice as
+    (a, b) and (b, a). The matrix is computed in row blocks to keep memory
+    bounded for 3500+ controls.
+    """
+    n = len(controls)
+    duplicate_pairs = []
+    similar_pairs = []
+
+    for start in range(0, n, MATRIX_BLOCK):
+        block = vectors[start:start + MATRIX_BLOCK] @ vectors.T  # (b, n) cos sims
+        for bi in range(block.shape[0]):
+            i = start + bi
+            sims = block[bi, i + 1:]  # only j > i
+            if sims.size == 0:
+                continue
+
+            for offset in np.argwhere(sims >= similar_threshold).ravel():
+                j = i + 1 + int(offset)
+                score = float(sims[offset])
+                pair = {
+                    "row_a": controls[i].metadata.get("row", i),
+                    "row_b": controls[j].metadata.get("row", j),
+                    "control_a": " | ".join(controls[i].page_content.splitlines()),
+                    "control_b": " | ".join(controls[j].page_content.splitlines()),
+                    "similarity": round(score, 4),
+                }
+                if score >= duplicate_threshold:
+                    duplicate_pairs.append(pair)
+                else:
+                    similar_pairs.append(pair)
+
+    duplicate_pairs.sort(key=lambda p: p["similarity"], reverse=True)
+    similar_pairs.sort(key=lambda p: p["similarity"], reverse=True)
+    return duplicate_pairs, similar_pairs
+
+
+def find_similar_controls(query, controls, vectors, embedder, k=5):
+    """Return the k controls most similar to an arbitrary control/query text."""
+    q = np.asarray(embedder.embed_query(query), dtype=np.float32)
+    norm = float(np.linalg.norm(q))
+    if norm > 0.0:
+        q = q / norm
+
+    sims = vectors @ q
+    top = np.argsort(sims)[::-1][:k]
+    return [(controls[int(idx)], float(sims[idx])) for idx in top]
+
+
+def print_pairs(title, pairs):
+    print(f"\n=== {title}: {len(pairs)} pair(s) found ===")
+    if not pairs:
+        print("  (no pairs above this threshold)")
+        return
+    for rank, pair in enumerate(pairs, start=1):
+        print(f"{rank}. similarity = {pair['similarity']:.4f} "
+              f"(rows {pair['row_a']} vs {pair['row_b']})")
+        print(f"   A: {pair['control_a'][:160]}")
+        print(f"   B: {pair['control_b'][:160]}")
+
+
+def save_pairs(duplicate_pairs, similar_pairs, output_path):
+    """Persist the full results (console output is truncated for readability)."""
+    fieldnames = ["pair_type", "row_a", "row_b", "similarity", "control_a", "control_b"]
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for pair in duplicate_pairs:
+            writer.writerow({**pair, "pair_type": "duplicate"})
+        for pair in similar_pairs:
+            writer.writerow({**pair, "pair_type": "similar"})
+    print(f"\nFull results written to {output_path}")
+
+
+def run_agent(
+    query=None,
+    file_path=CONTROL_CSV,
+    similar_threshold=SIMILAR_THRESHOLD,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+):
+    """Generate and list similar / duplicate control pairs above the thresholds.
+
+    The buggy version routed everything through a QA prompt that was capped at
+    three sentences, so it could never list pair-level results with scores.
+    Similarity is now computed directly from the embeddings instead of being
+    requested from a chat model.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        raise SystemExit("OPENAI_API_KEY is not set. Add it to your .env file.")
+
+    controls = load_controls(file_path)
+    if not controls:
+        print(f"No controls were loaded from {file_path!r} - check the file path.")
+        return {"duplicates": [], "similar": []}
+
+    print(f"Loaded {len(controls)} controls from {file_path!r}.")
+
+    print("Embedding controls...")
+    embedder = get_embedder()
+    vectors = embed_controls(controls, embedder)
+    print(f"Embeddings ready: {vectors.shape[0]} controls x {vectors.shape[1]} dims.")
+
+    print("Comparing all control pairs...")
+    duplicates, similar = find_control_pairs(
+        controls, vectors, similar_threshold, duplicate_threshold
+    )
+
+    print_pairs(
+        f"DUPLICATE control pairs (similarity >= {duplicate_threshold})", duplicates
+    )
+    print_pairs(
+        f"SIMILAR control pairs ({similar_threshold} <= similarity < {duplicate_threshold})",
+        similar,
+    )
+
+    save_pairs(duplicates, similar, OUTPUT_CSV)
+
+    # Optional: look up the controls closest to a single control/query text.
+    if query:
+        print(f"\n=== Top matches for query: {query!r} ===")
+        for control, score in find_similar_controls(query, controls, vectors, embedder):
+            print(f"  ({score:.4f}) {control.page_content[:160]}")
+
+    return {"duplicates": duplicates, "similar": similar}
+
+
+if __name__ == "__main__":
+    run_agent(
+        file_path=CONTROL_CSV,
+        similar_threshold=SIMILAR_THRESHOLD,
+        duplicate_threshold=DUPLICATE_THRESHOLD,
+    )
+
+--------------------------------------------------------------------------------

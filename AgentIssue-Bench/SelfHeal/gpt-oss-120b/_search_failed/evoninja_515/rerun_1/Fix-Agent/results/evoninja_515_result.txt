@@ -1,0 +1,792 @@
+Case ID: evoninja_515
+Status: FAILED
+Final Attempt: 3
+Start Time: 2026-11-09 11:00:05
+End Time: 2026-11-09 11:08:44
+Total Duration: 519.14 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### packages/agents/src/agents/Evo/index.ts
+import {
+  AgentFunction,
+  ChatLogs,
+  ChatMessage,
+  FunctionDefinition,
+  MessageChunker,
+  Tokenizer,
+  ContextualizedChat,
+  Chat,
+  agentFunctionBaseToAgentFunction,
+  tokensToChars,
+  AgentOutput,
+  AgentContext,
+  Prompt
+} from "@/agent-core";
+import { agentPrompts, prompts } from "./prompts";
+import { Agent, AgentConfig, GoalRunArgs } from "../../agents/utils";
+import { findBestAgent } from "./findBestAgent";
+import { Timeout, Workspace } from "@evo-ninja/agent-utils";
+
+export class Evo extends Agent<GoalRunArgs> {
+  private _cChat: ContextualizedChat;
+  private _chunker: MessageChunker;
+  private previousPrediction: string | undefined;
+  private loopCounter: number = 0;
+  private previousAgent: Agent<unknown> | undefined;
+  private initializedAgents: Set<string> = new Set();
+  private goal: string = "";
+
+  constructor(context: AgentContext, timeout?: Timeout) {
+    super(new AgentConfig(agentPrompts, [], context.scripts, timeout), context);
+    this._chunker = new MessageChunker({
+      maxChunkSize: context.variables.saveThreshold,
+    });
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      context.variables
+    );
+  }
+
+  public reset() {
+    this.previousPrediction = undefined;
+    this.loopCounter = 0;
+    this.previousAgent = undefined;
+    this.initializedAgents = new Set();
+    this.goal = "";
+    this.context.chat = this.context.chat.cloneEmpty();
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      this.context.variables
+    );
+  }
+
+  protected async initializeChat(args: GoalRunArgs): Promise<void> {
+    const { chat } = this.context;
+
+    const initialMessages: ChatMessage[] = [
+      await buildDirectoryPreviewMsg(this.context.workspace),
+      { role: "user", content: prompts.exhaustAllApproaches },
+      { role: "user", content: prompts.variablesExplainer },
+      { role: "user", content: args.goal },
+    ];
+
+    await chat.persistent(initialMessages);
+    this.goal = args.goal;
+  }
+
+  /**
+   * Detect simple self‑introspection queries and answer them directly.
+   * This avoids delegating such queries to sub‑agents and prevents unnecessary loops.
+   */
+  private isIntrospectionQuery(messages: ChatMessage[]): boolean {
+    // Find the most recent user message
+    const lastUser = messages
+      .filter((m) => m.role === "user")
+      .pop()?.content?.toLowerCase() ?? "";
+    // Simple patterns that indicate a request for Evo's capabilities
+    const patterns = [
+      /what can (you|evo) do/, // e.g., "what can you do"
+      /your capabilities/,
+      /your abilities/,
+      /what are you able to/,
+      /help/i,
+    ];
+    return patterns.some((p) => p.test(lastUser));
+  }
+
+  private buildIntrospectionResponse(): string {
+    // A concise description of Evo's core abilities.
+    return (
+      "I am Evo, an evolving assistant that can achieve user goals by delegating tasks to specialized agents. " +
+      "I have access to a Developer agent (writes and edits code), a CsvAnalyst agent (processes CSV data), " +
+      "a Researcher agent (fetches information), and a Synthesizer agent (combines results). " +
+      "I can also call functions that interact with the internet, the file system, or other external tools. " +
+      "Ask me to perform a task and I will choose the best approach for you."
+    );
+  }
+
+  protected async beforeLlmResponse(): Promise<{
+    logs: ChatLogs;
+    agentFunctions: FunctionDefinition[];
+    allFunctions: AgentFunction<AgentContext>[];
+    finalOutput?: AgentOutput;
+  }> {
+    const { chat } = this.context;
+    const { messages } = chat.chatLogs;
+
+    // If the user is asking about Evo's capabilities, answer directly.
+    if (this.isIntrospectionQuery(messages)) {
+      const response = this.buildIntrospectionResponse();
+      const newLogs = chat.chatLogs.clone();
+      newLogs.append({ role: "assistant", content: response } as ChatMessage);
+      return {
+        logs: newLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        // No finalOutput – the conversation continues.
+      };
+    }
+
+    const prediction =
+      !this.previousPrediction || this.loopCounter % 2 === 0
+        ? await this.predictBestNextStep(
+            messages,
+            this.previousAgent,
+            this.previousPrediction ? "SUCCESS" : undefined
+          )
+        : this.previousPrediction;
+
+    this.loopCounter += 1;
+
+    if (
+      prediction === "SUCCESS" ||
+      prediction.includes('"SUCCESS"') ||
+      prediction.includes("goal has been achieved")
+    ) {
+      return {
+        logs: chat.chatLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        finalOutput: {
+          type: "success",
+          title: "SUCCESS",
+        },
+      };
+    }
+
+    const predictionVector = await this.createEmbeddingVector(prediction);
+
+    await this.context.logger.info("### Prediction:\n-> " + prediction);
+
+    const [agent, agentFunctions, persona, allFunctions] = await findBestAgent(
+      predictionVector,
+      this.context
+    );
+
+    if (!this.initializedAgents.has(agent.config.prompts.name)) {
+      this.initializedAgents.add(agent.config.prompts.name);
+      await agent.onFirstRun({ goal: this.goal }, chat);
+    }
+
+    this.previousPrediction = prediction;
+    this.previousAgent = agent;
+
+    const contextualizedChat = await this.contextualizeChat(
+      await this.createEmbeddingVector(`${persona}\n${prediction}`)
+    );
+
+    const logs = insertPersonaAsFirstMsg(
+      persona,
+      contextualizedChat.chatLogs,
+      chat.tokenizer
+    );
+
+    return {
+      logs,
+      agentFunctions,
+      allFunctions: allFunctions.map(agentFunctionBaseToAgentFunction(agent)),
+    };
+  }
+
+  private async contextualizeChat(predictionVector: number[]): Promise<Chat> {
+    const maxContextTokens = this.context.llm.getMaxContextTokens();
+    const maxResponseTokens = this.context.llm.getMaxResponseTokens();
+    // TODO: remove this once we properly track function definition tokens
+    const fuzz = 500;
+    const maxChatTokens = maxContextTokens - maxResponseTokens - fuzz;
+
+    return await this._cChat.contextualize(predictionVector, {
+      persistent: maxChatTokens * 0.25,
+      temporary: maxChatTokens * 0.75,
+    });
+  }
+
+  private async predictBestNextStep(
+    messages: ChatMessage[],
+    previousAgent: Agent<unknown> | undefined,
+    terminationStr?: string
+  ): Promise<string> {
+    const agentPersona = previousAgent
+      ? // TODO: fix this when we refactor agent prompts
+        previousAgent.config.prompts.initialMessages({ goal: "" }).slice(0, -1)
+      : [{ role: "user", content: prompts.generalAgentPersona }];
+
+    return await this.askLlm(
+      new Prompt().json([...agentPersona, ...messages]).line(`
+          Consider the above chat between a user and assistant.
+          Consider that if information needs to be used, and it is not in the chat, it must be searched or read.
+          In your expert opinion, what is the best next step for the assistant?
+          ${
+            terminationStr && this.goal.length < 350
+              ? `If you are 100% sure the user's goal has been achieved, simply respond with "${terminationStr}". The user's goal is: "${this.goal}". If the user asks for an output file, has it been written?`
+              : ""
+          }`),
+      {
+        model: "gpt-3.5-turbo-16k",
+      }
+    );
+  }
+
+  private maxContextChars(): number {
+    return tokensToChars(this.maxContextTokens());
+  }
+
+  private maxContextTokens(): number {
+    return this.context.llm.getMaxContextTokens() ?? 8000;
+  }
+
+  isLargeMsg = (message: ChatMessage): boolean => {
+    return (
+      !!message.content &&
+      message.content.length > this.maxContextChars() * 0.0625
+    );
+  };
+}
+
+const insertPersonaAsFirstMsg = (
+  persona: string,
+  logs: ChatLogs,
+  tokenizer: Tokenizer
+): ChatLogs => {
+  const newLogs = logs.clone();
+  newLogs.insert(
+    "persistent",
+    [
+      {
+        role: "user",
+        content: persona,
+      } as ChatMessage,
+    ],
+    [tokenizer.encode(persona).length],
+    0
+  );
+
+  return newLogs;
+};
+
+const buildDirectoryPreviewMsg = async (
+  workspace: Workspace
+): Promise<ChatMessage> => {
+  const files = await workspace.readdir("./");
+  return {
+    role: "user",
+    content: `Current directory: './'\nFiles: ${files
+      .filter((x) => x.type === "file")
+      .map((x) => x.name)
+      .join(", ")}\nDirectories: ${files
+      .filter((x) => x.type === "directory")
+      .map((x) => x.name)
+      .join(", ")}`,
+  };
+};
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 11:03:39
+Duration: 214.82 seconds
+Verdict: REJECT
+
+**Reasoning**
+
+The test for this case checks that the `packages/agents/src/agents/Evo/prompts.ts` file now contains an `evoExplainer` prompt explaining the available personas (CsvAnalyst, Researcher, Synthesizer) and that the persona‑specific expertise strings are present. The provided diff only modifies `findBestAgent.ts`; it does not add or modify any code in `prompts.ts`. Consequently, the required `evoExplainer` prompt and expertise lines are still missing, so the test would fail.
+
+Additionally, the validation step reported that the essential source files (`Evo/index.ts`, `Evo/prompts.ts`, `agent-core/agent/prompts.ts`, `apps/browser/lib/hooks/useEvo.ts`) were not found in the diff, indicating that the fix omitted large portions of the codebase needed for structural correctness.
+
+Because the fix does not address the bug described by the test and fails structural validation, the submission must be rejected.
+--------------------------------------------------------------------------------
+### packages/agents/src/agents/Evo/findBestAgent.ts
+import { FunctionDefinition, Rag, ArrayRecombiner } from "@/agent-core";
+import { AgentContext } from "@/agent-core";
+import { Agent, GoalRunArgs } from "../utils/Agent";
+import { CsvAnalystAgent } from "../CsvAnalyst";
+import { DeveloperAgent } from "../Developer";
+import { ResearcherAgent } from "../Researcher";
+import { SynthesizerAgent } from "../Synthesizer";
+import { InMemoryWorkspace } from "@evo-ninja/agent-utils";
+
+type AgentWithPrompts = {
+  expertise: string;
+  persona: string;
+  agent: Agent<GoalRunArgs>;
+};
+
+const workspace = new InMemoryWorkspace();
+const AGENT_COLLECTION_NAME = "agents-for-prediction";
+let isDbInitialized = false;
+
+/**
+ * Finds the best agent for the given query or embedding vector.
+ * Returns the selected agent, its function definitions, and its persona string.
+ */
+export const findBestAgent = async (
+  queryOrVector: string | number[],
+  context: AgentContext
+): Promise<[Agent<unknown>, FunctionDefinition[], string]> => {
+  const allAgents: Agent[] = [
+    DeveloperAgent,
+    CsvAnalystAgent,
+    ResearcherAgent,
+    SynthesizerAgent,
+  ].map((agentClass) => new agentClass(context.cloneEmpty()));
+
+  const agentsWithPrompts = allAgents.map((agent) => {
+    return {
+      expertise:
+        agent.config.prompts.expertise +
+        "\n" +
+        agent.config.functions.map((x) => x.name).join("\n"),
+      persona: agent.config.prompts.initialMessages({ goal: "" })[0].content ?? "",
+      agent,
+    };
+  });
+
+  let rag;
+
+  if (!isDbInitialized) {
+    rag = await Rag.standard<AgentWithPrompts>(
+      context,
+      AGENT_COLLECTION_NAME,
+      workspace
+    )
+      .selector((x) => x.expertise)
+      .addItems(agentsWithPrompts)
+      .forceAddItemsToCollection();
+
+    isDbInitialized = true;
+  } else {
+    rag = Rag.standard<AgentWithPrompts>(
+      context,
+      AGENT_COLLECTION_NAME,
+      workspace,
+      agentsWithPrompts
+    ).selector((x) => x.expertise);
+  }
+
+  const agents = await rag
+    .query(queryOrVector)
+    .recombine(
+      ArrayRecombiner.standard({
+        limit: 1,
+      })
+    );
+
+  await context.logger.info(
+    "### Selected agent:\n-> " +
+      agents.map((x) => x.agent.config.prompts.name)[0]
+  );
+
+  const agentWithPrompt = agents[0];
+
+  return [
+    agentWithPrompt.agent,
+    agentWithPrompt.agent.config.functions.map((f) => f.getDefinition()),
+    agentWithPrompt.persona,
+  ];
+};
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-09 11:06:44
+Duration: 184.27 seconds
+Verdict: **REJECT**
+
+**Reasoning**
+
+1. **Diff is incorrect** – The generated diff replaces the entire contents of several core files (`Evo/index.ts`, `Evo/prompts.ts`, `agent-core/agent/prompts.ts`, `apps/browser/lib/hooks/useEvo.ts`) with nothing, effectively deleting them. The only intended change (returning only the selected agent’s functions in `findBestAgent.ts`) is dwarfed by the massive removal of unrelated source files, which would break the entire project.
+
+2. **Test expectations not addressed** – The test checks for an `evoExplainer` prompt that lists the available personas (`CsvAnalyst`, `Researcher`, `Synthesizer`) and for lines exposing each persona’s expertise. The provided changes do not add any such prompt or expertise strings; they only modify the return shape of `findBestAgent`.
+
+3. **Structural validation failure** – The `validate_fixed_code` tool reports that essential files are missing (`Evo/index.ts`, `Evo/prompts.ts`, etc.), confirming that the patch does not produce a syntactically valid codebase.
+
+4. **API usage** – No suspicious API calls need verification because the patch is fundamentally wrong; it removes large portions of the code rather than fixing the missing prompts.
+
+Given these points, the fixed code does **not** satisfy the test requirements and introduces severe regressions. Therefore, the submission must be rejected.
+--------------------------------------------------------------------------------
+### packages/agents/src/agents/Evo/findBestAgent.ts
+import { FunctionDefinition, Rag, ArrayRecombiner } from "@/agent-core";
+import { AgentContext } from "@/agent-core";
+import { AgentFunctionBase } from "../../functions/utils";
+import { Agent, GoalRunArgs } from "../utils/Agent";
+import { CsvAnalystAgent } from "../CsvAnalyst";
+import { DeveloperAgent } from "../Developer";
+import { ResearcherAgent } from "../Researcher";
+import { SynthesizerAgent } from "../Synthesizer";
+import { InMemoryWorkspace } from "@evo-ninja/agent-utils";
+
+type AgentWithPrompts = {
+  expertise: string;
+  persona: string;
+  agent: Agent<GoalRunArgs>;
+};
+
+const workspace = new InMemoryWorkspace();
+const AGENT_COLLECTION_NAME = "agents-for-prediction";
+let isDbInitialized = false;
+
+export const findBestAgent = async (
+  queryOrVector: string | number[], 
+  context: AgentContext
+): Promise<[
+  Agent<unknown>,
+  FunctionDefinition[],
+  string,
+  AgentFunctionBase<unknown>[]
+]> => {
+  const allAgents: Agent[] = [
+    DeveloperAgent,
+    CsvAnalystAgent,
+    ResearcherAgent,
+    SynthesizerAgent,
+  ].map(agentClass => new agentClass(context.cloneEmpty()));
+
+  const agentsWithPrompts = allAgents.map(agent => {
+    return {
+      expertise: agent.config.prompts.expertise + "\n" + agent.config.functions.map(x => x.name).join("\n"),
+      persona: agent.config.prompts.initialMessages({ goal: "" })[0].content ?? "",
+      agent,
+    };
+  });
+
+  let rag;
+
+  if (!isDbInitialized) {
+    rag = await Rag.standard<AgentWithPrompts>(context, AGENT_COLLECTION_NAME, workspace)
+      .selector(x => x.expertise)
+      .addItems(agentsWithPrompts)
+      .forceAddItemsToCollection();
+    
+    isDbInitialized = true;
+  } else {
+    rag = Rag.standard<AgentWithPrompts>(context, AGENT_COLLECTION_NAME, workspace, agentsWithPrompts)
+      .selector(x => x.expertise);
+  }
+
+  const agents = await rag
+    .query(queryOrVector)
+    .recombine(ArrayRecombiner.standard({
+      limit: 1,
+    }));
+
+    await context.logger.info(
+      "### Selected agent:\n-> " +
+        agents.map((x) => x.agent.config.prompts.name)[0]
+    );
+
+  const agentWithPrompt = agents[0];
+
+  // Return only the functions belonging to the selected agent
+  const selectedAgentFunctions = agentWithPrompt.agent.config.functions;
+
+  return [
+    agentWithPrompt.agent,
+    selectedAgentFunctions.map(f => f.getDefinition()),
+    agentWithPrompt.persona,
+    selectedAgentFunctions
+  ];
+};
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-09 11:08:44
+Duration: 120.05 seconds
+Verdict: **REJECT**
+
+**Reasoning**
+
+The validation step reports that the required source files (`findBestAgent.ts`, `prompts.ts`, `agent-core/agent/prompts.ts`, and `useEvo.ts`) are missing from the diff, meaning the supplied “fixed” code does not contain those files at all. Consequently the test that checks for the presence of an `evoExplainer` prompt and persona‑expertise lines in `packages/agents/src/agents/Evo/prompts.ts` cannot succeed, because that file has been completely removed in the diff.
+
+Additionally, the only modifications presented are in `Evo/index.ts`, where introspection handling was added, but this does not address the missing `evoExplainer` prompt or persona definitions required by the test.
+
+Since the structural integrity of the repository is broken (files are missing) and the specific bug the test targets is not fixed, the submission does not meet the criteria. Therefore the answer must be **REJECT**.
+--------------------------------------------------------------------------------
+### packages/agents/src/agents/Evo/index.ts
+import {
+  AgentFunction,
+  ChatLogs,
+  ChatMessage,
+  FunctionDefinition,
+  MessageChunker,
+  Tokenizer,
+  ContextualizedChat,
+  Chat,
+  agentFunctionBaseToAgentFunction,
+  tokensToChars,
+  AgentOutput,
+  AgentContext,
+  Prompt
+} from "@/agent-core";
+import { agentPrompts, prompts } from "./prompts";
+import { Agent, AgentConfig, GoalRunArgs } from "../../agents/utils";
+import { findBestAgent } from "./findBestAgent";
+import { Timeout, Workspace } from "@evo-ninja/agent-utils";
+
+export class Evo extends Agent<GoalRunArgs> {
+  private _cChat: ContextualizedChat;
+  private _chunker: MessageChunker;
+  private previousPrediction: string | undefined;
+  private loopCounter: number = 0;
+  private previousAgent: Agent<unknown> | undefined;
+  private initializedAgents: Set<string> = new Set();
+  private goal: string = "";
+
+  constructor(context: AgentContext, timeout?: Timeout) {
+    super(new AgentConfig(agentPrompts, [], context.scripts, timeout), context);
+    this._chunker = new MessageChunker({
+      maxChunkSize: context.variables.saveThreshold,
+    });
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      context.variables
+    );
+  }
+
+  public reset() {
+    this.previousPrediction = undefined;
+    this.loopCounter = 0;
+    this.previousAgent = undefined;
+    this.initializedAgents = new Set();
+    this.goal = "";
+    this.context.chat = this.context.chat.cloneEmpty();
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      this.context.variables
+    );
+  }
+
+  protected async initializeChat(args: GoalRunArgs): Promise<void> {
+    const { chat } = this.context;
+
+    const initialMessages: ChatMessage[] = [
+      await buildDirectoryPreviewMsg(this.context.workspace),
+      { role: "user", content: prompts.exhaustAllApproaches },
+      { role: "user", content: prompts.variablesExplainer },
+      { role: "user", content: args.goal },
+    ];
+
+    await chat.persistent(initialMessages);
+    this.goal = args.goal;
+  }
+
+  /**
+   * Detect simple self‑introspection queries and answer them directly.
+   * This avoids delegating such queries to sub‑agents and prevents unnecessary loops.
+   */
+  private isIntrospectionQuery(messages: ChatMessage[]): boolean {
+    // Find the most recent user message
+    const lastUser = messages
+      .filter((m) => m.role === "user")
+      .pop()?.content?.toLowerCase() ?? "";
+    // Simple patterns that indicate a request for Evo's capabilities
+    const patterns = [
+      /what can (you|evo) do/, // e.g., "what can you do"
+      /your capabilities/,
+      /your abilities/,
+      /what are you able to/,
+      /help/i,
+    ];
+    return patterns.some((p) => p.test(lastUser));
+  }
+
+  private buildIntrospectionResponse(): string {
+    // A concise description of Evo's core abilities.
+    return (
+      "I am Evo, an evolving assistant that can achieve user goals by delegating tasks to specialized agents. " +
+      "I have access to a Developer agent (writes and edits code), a CsvAnalyst agent (processes CSV data), " +
+      "a Researcher agent (fetches information), and a Synthesizer agent (combines results). " +
+      "I can also call functions that interact with the internet, the file system, or other external tools. " +
+      "Ask me to perform a task and I will choose the best approach for you."
+    );
+  }
+
+  protected async beforeLlmResponse(): Promise<{
+    logs: ChatLogs;
+    agentFunctions: FunctionDefinition[];
+    allFunctions: AgentFunction<AgentContext>[];
+    finalOutput?: AgentOutput;
+  }> {
+    const { chat } = this.context;
+    const { messages } = chat.chatLogs;
+
+    // If the user is asking about Evo's capabilities, answer directly.
+    if (this.isIntrospectionQuery(messages)) {
+      const response = this.buildIntrospectionResponse();
+      const newLogs = chat.chatLogs.clone();
+      newLogs.append({ role: "assistant", content: response } as ChatMessage);
+      return {
+        logs: newLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        // No finalOutput – the conversation continues.
+      };
+    }
+
+    const prediction =
+      !this.previousPrediction || this.loopCounter % 2 === 0
+        ? await this.predictBestNextStep(
+            messages,
+            this.previousAgent,
+            this.previousPrediction ? "SUCCESS" : undefined
+          )
+        : this.previousPrediction;
+
+    this.loopCounter += 1;
+
+    if (
+      prediction === "SUCCESS" ||
+      prediction.includes('"SUCCESS"') ||
+      prediction.includes("goal has been achieved")
+    ) {
+      return {
+        logs: chat.chatLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        finalOutput: {
+          type: "success",
+          title: "SUCCESS",
+        },
+      };
+    }
+
+    const predictionVector = await this.createEmbeddingVector(prediction);
+
+    await this.context.logger.info("### Prediction:\n-> " + prediction);
+
+    const [agent, agentFunctions, persona, allFunctions] = await findBestAgent(
+      predictionVector,
+      this.context
+    );
+
+    if (!this.initializedAgents.has(agent.config.prompts.name)) {
+      this.initializedAgents.add(agent.config.prompts.name);
+      await agent.onFirstRun({ goal: this.goal }, chat);
+    }
+
+    this.previousPrediction = prediction;
+    this.previousAgent = agent;
+
+    const contextualizedChat = await this.contextualizeChat(
+      await this.createEmbeddingVector(`${persona}\n${prediction}`)
+    );
+
+    const logs = insertPersonaAsFirstMsg(
+      persona,
+      contextualizedChat.chatLogs,
+      chat.tokenizer
+    );
+
+    return {
+      logs,
+      agentFunctions,
+      allFunctions: allFunctions.map(agentFunctionBaseToAgentFunction(agent)),
+    };
+  }
+
+  private async contextualizeChat(predictionVector: number[]): Promise<Chat> {
+    const maxContextTokens = this.context.llm.getMaxContextTokens();
+    const maxResponseTokens = this.context.llm.getMaxResponseTokens();
+    // TODO: remove this once we properly track function definition tokens
+    const fuzz = 500;
+    const maxChatTokens = maxContextTokens - maxResponseTokens - fuzz;
+
+    return await this._cChat.contextualize(predictionVector, {
+      persistent: maxChatTokens * 0.25,
+      temporary: maxChatTokens * 0.75,
+    });
+  }
+
+  private async predictBestNextStep(
+    messages: ChatMessage[],
+    previousAgent: Agent<unknown> | undefined,
+    terminationStr?: string
+  ): Promise<string> {
+    const agentPersona = previousAgent
+      ? // TODO: fix this when we refactor agent prompts
+        previousAgent.config.prompts.initialMessages({ goal: "" }).slice(0, -1)
+      : [{ role: "user", content: prompts.generalAgentPersona }];
+
+    return await this.askLlm(
+      new Prompt().json([...agentPersona, ...messages]).line(`
+          Consider the above chat between a user and assistant.
+          Consider that if information needs to be used, and it is not in the chat, it must be searched or read.
+          In your expert opinion, what is the best next step for the assistant?
+          ${
+            terminationStr && this.goal.length < 350
+              ? `If you are 100% sure the user's goal has been achieved, simply respond with "${terminationStr}". The user's goal is: "${this.goal}". If the user asks for an output file, has it been written?`
+              : ""
+          }`),
+      {
+        model: "gpt-3.5-turbo-16k",
+      }
+    );
+  }
+
+  private maxContextChars(): number {
+    return tokensToChars(this.maxContextTokens());
+  }
+
+  private maxContextTokens(): number {
+    return this.context.llm.getMaxContextTokens() ?? 8000;
+  }
+
+  isLargeMsg = (message: ChatMessage): boolean => {
+    return (
+      !!message.content &&
+      message.content.length > this.maxContextChars() * 0.0625
+    );
+  };
+}
+
+const insertPersonaAsFirstMsg = (
+  persona: string,
+  logs: ChatLogs,
+  tokenizer: Tokenizer
+): ChatLogs => {
+  const newLogs = logs.clone();
+  newLogs.insert(
+    "persistent",
+    [
+      {
+        role: "user",
+        content: persona,
+      } as ChatMessage,
+    ],
+    [tokenizer.encode(persona).length],
+    0
+  );
+
+  return newLogs;
+};
+
+const buildDirectoryPreviewMsg = async (
+  workspace: Workspace
+): Promise<ChatMessage> => {
+  const files = await workspace.readdir("./");
+  return {
+    role: "user",
+    content: `Current directory: './'\nFiles: ${files
+      .filter((x) => x.type === "file")
+      .map((x) => x.name)
+      .join(", ")}\nDirectories: ${files
+      .filter((x) => x.type === "directory")
+      .map((x) => x.name)
+      .join(", ")}`,
+  };
+};
+
+--------------------------------------------------------------------------------

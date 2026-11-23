@@ -1,0 +1,255 @@
+Case ID: 79149108
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 19:33:13
+End Time: 2026-11-05 19:37:57
+Total Duration: 283.82 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+from flask import Flask, render_template, request
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+import tiktoken
+
+app = Flask(__name__)
+
+MODEL = "llama3.2"
+MODEL_MAX_TOKENS = 128000
+
+# BUG FIX 1 (the real cause of "it keeps following the first prompt"):
+# the conversation history must contain BOTH sides of the dialogue
+# (user turns *and* the model's own answers), and it must be built from real
+# chat message objects. The old code only ever appended ("user", text) tuples
+# and never stored the model's reply, so after a few requests the model was
+# given a list of consecutive "user" messages with no assistant turns.
+# Ollama/llama3.2 merges consecutive user messages, so the very first
+# instruction dominates and later "stop" instructions look like a
+# continuation of the same request -> the model keeps answering the old prompt.
+# The CLI works because it always sends the full turn history (user + assistant).
+messages = [
+    SystemMessage(
+        content=(
+            "You are a helpful assistant. Answer only the most recent user "
+            "message and follow the latest instruction, even when it asks you "
+            "to stop, change topic or end the conversation."
+        )
+    )
+]
+
+# BUG FIX 2: temperature 1.1 makes llama3.2 wildly creative / ignore
+# instructions. Use a low value so instructions are actually followed.
+llm = ChatOllama(
+    model=MODEL,
+    temperature=0.2,
+    stream=True,
+)
+
+
+def get_number_of_tokens(messages):
+    """Count tokens of the whole history (works with message objects)."""
+    try:
+        encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        return sum(len(encoding.encode(str(m.content))) for m in messages)
+    except Exception:
+        return sum(len(str(m.content)) for m in messages) // 4
+
+
+def trim_history():
+    """Drop the oldest turn (keeping the system prompt) until we fit the limit.
+
+    BUG FIX 3: the old loop computed the token count once and then deleted
+    messages[1] forever, so it could never terminate (or crashed with
+    IndexError). The count has to be recomputed on every iteration.
+    """
+    while len(messages) > 2 and get_number_of_tokens(messages) >= MODEL_MAX_TOKENS:
+        del messages[1]
+
+
+@app.route('/ask_gpt', methods=['POST'])
+def ask_gpt():
+    user_text = (request.form.get('text') or '').strip()
+    if not user_text:
+        return "", 400
+
+    messages.append(HumanMessage(content=user_text))
+    trim_history()
+
+    try:
+        ai_msg = llm.invoke(messages)
+    except Exception as exc:  # don't leave a dangling user turn behind
+        messages.pop()
+        return f"Model error: {exc}", 500
+
+    # BUG FIX 4: store the model's answer, otherwise the next request has no
+    # assistant turn and the model repeats the first prompt again.
+    messages.append(AIMessage(content=ai_msg.content))
+    trim_history()
+
+    return ai_msg.content
+
+
+@app.route('/reset', methods=['POST'])
+def reset():
+    """Start a new conversation (so the old prompt is not carried over)."""
+    del messages[1:]
+    return "ok"
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 19:37:57
+Duration: 283.82 seconds
+Verdict: I have enough information. The API verification tool returned only generic framework descriptions rather than parameter-level docs, so I based my assessment on code analysis plus the successful structural validation.
+
+## Analysis of the Fix
+
+### 1. Root-cause correctness (the actual bug)
+
+The buggy `ask_gpt` had three compounding defects:
+
+| Defect | Original | Fixed |
+|---|---|---|
+| **Infinite loop / IndexError** | `number_of_tokens` computed **once**, then `del messages[1]` forever — the while condition never re-evaluated | `trim_history()` recomputes `get_number_of_tokens(messages)` on **every** iteration, and guards with `len(messages) > 2` |
+| **Missing assistant turns** | Only `("user", text)` tuples appended; model replies never stored, so history degenerated into consecutive user messages (which Ollama coalesces, making the first instruction dominate — exactly the reported "keeps following the first prompt") | Appends `HumanMessage(...)` and then `AIMessage(content=ai_msg.content)` |
+| **Wrong object type** | Plain tuples passed to `ChatOllama.invoke()` and `get_number_of_tokens` unpacked `for role, content in messages` | Real `BaseMessage` objects; token counting uses `m.content` |
+
+All three are fixed coherently.
+
+### 2. API usage checks
+- `ChatOllama.invoke(messages)` with a `list[BaseMessage]` — correct; `invoke` is a `Runnable` entry point and accepts message lists. (The pre-existing `stream=True` kwarg is unchanged from the buggy version, so it was already accepted at import time — not a regression.)
+- `SystemMessage` / `HumanMessage` / `AIMessage` imported from `langchain_core.messages` — correct module path.
+- `ai_msg.content` returned from a Flask view — a `str`, valid response body.
+- `request.form.get('text')` — correctly used instead of direct `request.form['text']`, avoiding `BadRequestKeyError` on malformed posts.
+- `tiktoken.encoding_for_model` still wrapped in `try/except Exception` with a `//4` char fallback — correct, and `except Exception` is *better* than the original bare `except:`.
+
+### 3. Test-harness compatibility (this is where most fixes break)
+- The test does `from run_fixed import app, messages` and then `messages.clear()`. The fixed code **never rebinds** the module-level `messages` — all mutations are in-place (`append`, `del messages[1]`, `del messages[1:]`). So the test's imported reference stays live. ✔
+- `trim_history` never deletes index 0, so the system prompt survives (and after `clear()`, index-0 trimming logic still behaves safely).
+- Each successful turn adds exactly 2 entries → 5 turns yields 10 ≥ `len(conversation)` (5). Assertion holds. ✔
+- Error path (`return f"Model error: {exc}", 500`) still yields a **non-empty** decoded string, so it can't cause a spurious `len(result.strip()) > 0` failure. ✔
+- Empty-text guard returns `("", 400)` but the test never posts empty text. ✔
+
+### 4. Minor, non-blocking nits
+- `del messages[1]` may break user/assistant alternation (can leave an assistant message first); at 128k tokens this is effectively unreachable, but deleting in pairs would be cleaner.
+- `/reset` assumes the system prompt is at index 0; after an external `messages.clear()` it would delete all but the oldest message. Untested, harmless.
+- No locking on the shared module-level list (pre-existing; test is sequential).
+- The `temperature` 1.1 → 0.2 change is a tuning opinion, not strictly a bug fix, but it's harmless and arguably helps instruction-following.
+
+## Verdict
+
+**ACCEPT**
+
+The fix addresses the genuine root causes (non-terminating trim loop, missing assistant turns, tuple-vs-message type mismatch), preserves the module-level `messages` identity that the test relies on, keeps all return values non-empty strings, and preserves the external contract (`/ask_gpt`, `/`, port 5000). Structural validation passed, and the only issues remaining are minor robustness nits that don't affect the test or the reported bug.
+--------------------------------------------------------------------------------
+from flask import Flask, render_template, request
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+import tiktoken
+
+app = Flask(__name__)
+
+MODEL = "llama3.2"
+MODEL_MAX_TOKENS = 128000
+
+# BUG FIX 1 (the real cause of "it keeps following the first prompt"):
+# the conversation history must contain BOTH sides of the dialogue
+# (user turns *and* the model's own answers), and it must be built from real
+# chat message objects. The old code only ever appended ("user", text) tuples
+# and never stored the model's reply, so after a few requests the model was
+# given a list of consecutive "user" messages with no assistant turns.
+# Ollama/llama3.2 merges consecutive user messages, so the very first
+# instruction dominates and later "stop" instructions look like a
+# continuation of the same request -> the model keeps answering the old prompt.
+# The CLI works because it always sends the full turn history (user + assistant).
+messages = [
+    SystemMessage(
+        content=(
+            "You are a helpful assistant. Answer only the most recent user "
+            "message and follow the latest instruction, even when it asks you "
+            "to stop, change topic or end the conversation."
+        )
+    )
+]
+
+# BUG FIX 2: temperature 1.1 makes llama3.2 wildly creative / ignore
+# instructions. Use a low value so instructions are actually followed.
+llm = ChatOllama(
+    model=MODEL,
+    temperature=0.2,
+    stream=True,
+)
+
+
+def get_number_of_tokens(messages):
+    """Count tokens of the whole history (works with message objects)."""
+    try:
+        encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        return sum(len(encoding.encode(str(m.content))) for m in messages)
+    except Exception:
+        return sum(len(str(m.content)) for m in messages) // 4
+
+
+def trim_history():
+    """Drop the oldest turn (keeping the system prompt) until we fit the limit.
+
+    BUG FIX 3: the old loop computed the token count once and then deleted
+    messages[1] forever, so it could never terminate (or crashed with
+    IndexError). The count has to be recomputed on every iteration.
+    """
+    while len(messages) > 2 and get_number_of_tokens(messages) >= MODEL_MAX_TOKENS:
+        del messages[1]
+
+
+@app.route('/ask_gpt', methods=['POST'])
+def ask_gpt():
+    user_text = (request.form.get('text') or '').strip()
+    if not user_text:
+        return "", 400
+
+    messages.append(HumanMessage(content=user_text))
+    trim_history()
+
+    try:
+        ai_msg = llm.invoke(messages)
+    except Exception as exc:  # don't leave a dangling user turn behind
+        messages.pop()
+        return f"Model error: {exc}", 500
+
+    # BUG FIX 4: store the model's answer, otherwise the next request has no
+    # assistant turn and the model repeats the first prompt again.
+    messages.append(AIMessage(content=ai_msg.content))
+    trim_history()
+
+    return ai_msg.content
+
+
+@app.route('/reset', methods=['POST'])
+def reset():
+    """Start a new conversation (so the old prompt is not carried over)."""
+    del messages[1:]
+    return "ok"
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+
+--------------------------------------------------------------------------------

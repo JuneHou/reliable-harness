@@ -1,0 +1,388 @@
+Case ID: 76897509
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 18:11:43
+End Time: 2026-11-04 19:09:38
+Total Duration: 3474.61 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import random
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.cache import InMemoryCache
+from langchain.chains import ConversationalRetrievalChain
+from langchain.document_loaders import PyPDFLoader
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.globals import set_llm_cache
+from langchain.llms import OpenAI
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.vectorstores.base import VectorStoreRetriever
+
+# _get_chat_history is the private helper ConversationalRetrievalChain uses to
+# flatten the chat history. Import it (with a fallback) so the overridden
+# _get_docs keeps the original question-condensing behaviour.
+try:
+    from langchain.chains.conversational_retrieval.base import _get_chat_history
+except Exception:  # pragma: no cover - fallback for other package layouts
+    def _get_chat_history(chat_history: List[Any]) -> str:
+        buffer = ""
+        for dialogue_turn in chat_history:
+            if isinstance(dialogue_turn, tuple):
+                human, ai = dialogue_turn
+                buffer += f"Human: {human}\nAssistant: {ai}\n"
+            else:
+                buffer += dialogue_turn + "\n"
+        return buffer
+
+
+_ = load_dotenv(find_dotenv())
+set_llm_cache(InMemoryCache())
+
+OPENAI_API_KEY_POOL = [
+    os.getenv('OPENAI_API_KEY'),
+]
+
+
+def get_random_key(key_pool):
+    return random.choice([k for k in key_pool if k is not None])
+
+
+def get_relevant_documents_with_filter(
+    retriever,
+    question: str,
+    metadata_filter: Optional[Dict[str, Any]] = None,
+) -> List[Document]:
+    """Run retrieval, optionally restricted by a metadata filter.
+
+    The stock chain simply dropped the "filter" key from its input, so
+    retrieval always ran over every document in the store. Here the filter is
+    actually forwarded to the vector store.
+    """
+    if metadata_filter:
+        # Preferred path: recent LangChain versions merge extra kwargs into
+        # the retriever's search_kwargs, so `filter` reaches Chroma directly.
+        try:
+            return retriever.get_relevant_documents(question, filter=metadata_filter)
+        except TypeError:
+            # Older versions do not accept the extra kwarg; fall back to
+            # temporarily injecting the filter into the retriever's
+            # search_kwargs (restored afterwards so it stays per-query).
+            if isinstance(retriever, VectorStoreRetriever):
+                search_kwargs = retriever.search_kwargs
+                had_filter = "filter" in search_kwargs
+                previous_filter = search_kwargs.get("filter")
+                search_kwargs["filter"] = metadata_filter
+                try:
+                    return retriever.get_relevant_documents(question)
+                finally:
+                    if had_filter:
+                        search_kwargs["filter"] = previous_filter
+                    else:
+                        search_kwargs.pop("filter", None)
+    return retriever.get_relevant_documents(question)
+
+
+class FilteredConversationalRetrievalChain(ConversationalRetrievalChain):
+    """ConversationalRetrievalChain with per-query metadata filtering.
+
+    A "filter" key may now be passed in the chain input, e.g.:
+
+        qa({"question": q, "chat_history": [...],
+            "filter": {"source": "paper2.pdf"}})
+
+    Only documents whose metadata matches the filter are retrieved, so the
+    answer is produced from the selected documents only, and the *same* chain
+    instance can be reused with a different filter on every query (no need to
+    rebuild the chain per document filter).
+    """
+
+    def _get_docs(self, inputs: Dict[str, Any], **kwargs: Any) -> List[Document]:
+        question = inputs["question"]
+        get_chat_history = getattr(self, "get_chat_history", None) or _get_chat_history
+        chat_history_str = get_chat_history(inputs["chat_history"])
+        if chat_history_str:
+            new_question = self.question_generator.run(
+                {"question": question, "chat_history": chat_history_str}
+            )
+        else:
+            new_question = question
+
+        # This is the fix: read the filter from the chain input (it was
+        # silently ignored before) and apply it to the retrieval.
+        metadata_filter = inputs.get("filter")
+
+        docs = get_relevant_documents_with_filter(
+            self.retriever, new_question, metadata_filter
+        )
+
+        reduce_docs = getattr(self, "_reduce_tokens_below_limit", None)
+        if callable(reduce_docs):
+            docs = reduce_docs(docs)
+        return docs
+
+
+def run_agent(query, pdf_paths, metadata_filter=None):
+    all_texts = []
+    embeddings = OpenAIEmbeddings(openai_api_key=get_random_key(OPENAI_API_KEY_POOL))
+
+    for pdf_path in pdf_paths:
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        texts = text_splitter.split_documents(documents)
+
+        for text in texts:
+            text.metadata["source"] = pdf_path
+
+        all_texts.extend(texts)
+
+    db = Chroma.from_documents(all_texts, embeddings)
+
+    qa = FilteredConversationalRetrievalChain.from_llm(
+        OpenAI(openai_api_key=get_random_key(OPENAI_API_KEY_POOL), cache=True, temperature=0),
+        VectorStoreRetriever(vectorstore=db),
+        verbose=True,
+        return_source_documents=True)
+
+    # The filter is applied at query time: only information from the matching
+    # documents (here paper2.pdf) may be used to answer the query.
+    chain_input = {"question": query, "chat_history": []}
+    if metadata_filter:
+        chain_input["filter"] = metadata_filter
+
+    result = qa(chain_input)
+
+    return result
+
+
+if __name__ == "__main__":
+    query = "What is Theia"
+    pdf_paths = ["paper1.pdf", "paper2.pdf"]
+
+    result = run_agent(query, pdf_paths, metadata_filter={"source": "paper2.pdf"})
+
+    print(result['answer'])
+
+    # The source documents now come exclusively from paper2.pdf, which shows
+    # that the query-time filter is applied correctly.
+    for doc in result.get("source_documents", []):
+        print(f"[source] {doc.metadata.get('source')}")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 19:09:38
+Duration: 3474.61 seconds
+Verdict: # Evaluation of Case 76897509
+
+## Summary of the Diff
+
+**Root cause of the bug:** `ConversationalRetrievalChain` only accepts `input_keys = ["question", "chat_history"]`. The buggy code passes `"filter"` in the chain input, which the stock chain **silently drops** — `_get_docs` calls `retriever.get_relevant_documents(new_question)` with no filter, so retrieval ran over *both* PDFs instead of being restricted to `paper2.pdf`.
+
+**What the fix does:** Introduces `FilteredConversationalRetrievalChain`, a subclass overriding `_get_docs` to read `inputs["filter"]` and forward it to the retriever via `get_relevant_documents_with_filter()` (with a `TypeError` fallback that temporarily injects the filter into `search_kwargs` and restores it afterwards).
+
+## What's Good (verified)
+
+- **Mechanism is correct.** API verification confirms `VectorStoreRetriever` supports filtering (via kwargs / `search_kwargs`), and `Chroma.similarity_search` accepts a `filter` kwarg — so the filter genuinely reaches Chroma. `_get_chat_history` exists at `langchain.chains.conversational_retrieval.base`, and `from_llm` on the subclass works (classmethod uses `cls`).
+- **Faithful override.** The `_get_docs` override replicates question-condensing, uses `getattr` guards (`get_chat_history`, `_reduce_tokens_below_limit`), and with empty `chat_history` the `question_generator` path is skipped — no runtime hazards.
+- **Structure passes.** `validate_fixed_code` returned ACCEPT — the test's structural assertions (dict result, `'answer'`, `'source_documents'`) are satisfied, and the 2-arg call `run_agent(query, pdf_paths)` is signature-compatible.
+
+## The Fatal Flaw
+
+**The fix changes `run_agent`'s contract by removing the default filter.**
+
+- Buggy code: the filter `{'source': 'paper2.pdf'}` was **hardcoded inside** `run_agent` — the bug was that the chain *ignored* it, not that it shouldn't exist.
+- Fixed code: `def run_agent(query, pdf_paths, metadata_filter=None)` — the filter is only applied when **explicitly passed**. The candidate's own `__main__` had to be rewritten to `run_agent(query, pdf_paths, metadata_filter={"source": "paper2.pdf"})` — an admission that the default behavior changed.
+
+The test calls `run_agent(query, pdf_paths)` — the **2-arg form, mirroring the original `__main__`** — so `metadata_filter=None` → no `"filter"` key → `inputs.get("filter")` is `None` → plain unfiltered retrieval. **On the exact code path the test exercises, the fixed code is behaviorally identical to the buggy code** (ignored filter ≡ no filter).
+
+## Why the Test Fails
+
+The test loads *both* papers and asserts the answer indicates no information found (`"don't know" / "not sure" / "cannot find" / "no information" / "unclear"`). This encodes the intended fixed behavior: with retrieval restricted to `paper2.pdf` — which lacks the Theia content present in `paper1.pdf` — the LLM must honestly report it cannot find the information. The buggy code fails precisely because unfiltered retrieval pulls Theia content from `paper1.pdf` and produces a substantive answer. The candidate reproduces that same unfiltered retrieval, so the central assertion fails exactly as it does for the buggy code.
+
+Note that `validate_fixed_code`'s ACCEPT covers "expected structure and output format" — the structural assertions do pass — but it cannot vouch for the behavioral answer-content assertion, which is the part this fix breaks.
+
+## Verdict
+
+**REJECT**
+
+The filter-forwarding machinery (`FilteredConversationalRetrievalChain`) is well-engineered and API-correct, but it's wired in behind an **opt-in parameter defaulting to `None`**, whereas the tested contract requires the filter to be active by default. A correct fix would preserve `run_agent`'s 2-arg semantics — e.g., `metadata_filter={"source": "paper2.pdf"}` as the default, or passing `search_kwargs={"filter": {"source": "paper2.pdf"}}` to the `VectorStoreRetriever` inside `run_agent` — so that the tested call path actually performs filtered retrieval and produces the expected "no information found" answer.
+--------------------------------------------------------------------------------
+import os
+import random
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.cache import InMemoryCache
+from langchain.chains import ConversationalRetrievalChain
+from langchain.document_loaders import PyPDFLoader
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.globals import set_llm_cache
+from langchain.llms import OpenAI
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.vectorstores.base import VectorStoreRetriever
+
+# _get_chat_history is the private helper ConversationalRetrievalChain uses to
+# flatten the chat history. Import it (with a fallback) so the overridden
+# _get_docs keeps the original question-condensing behaviour.
+try:
+    from langchain.chains.conversational_retrieval.base import _get_chat_history
+except Exception:  # pragma: no cover - fallback for other package layouts
+    def _get_chat_history(chat_history: List[Any]) -> str:
+        buffer = ""
+        for dialogue_turn in chat_history:
+            if isinstance(dialogue_turn, tuple):
+                human, ai = dialogue_turn
+                buffer += f"Human: {human}\nAssistant: {ai}\n"
+            else:
+                buffer += dialogue_turn + "\n"
+        return buffer
+
+
+_ = load_dotenv(find_dotenv())
+set_llm_cache(InMemoryCache())
+
+OPENAI_API_KEY_POOL = [
+    os.getenv('OPENAI_API_KEY'),
+]
+
+
+def get_random_key(key_pool):
+    return random.choice([k for k in key_pool if k is not None])
+
+
+def get_relevant_documents_with_filter(
+    retriever,
+    question: str,
+    metadata_filter: Optional[Dict[str, Any]] = None,
+) -> List[Document]:
+    """Run retrieval, optionally restricted by a metadata filter.
+
+    The stock chain simply dropped the "filter" key from its input, so
+    retrieval always ran over every document in the store. Here the filter is
+    actually forwarded to the vector store.
+    """
+    if metadata_filter:
+        # Preferred path: recent LangChain versions merge extra kwargs into
+        # the retriever's search_kwargs, so `filter` reaches Chroma directly.
+        try:
+            return retriever.get_relevant_documents(question, filter=metadata_filter)
+        except TypeError:
+            # Older versions do not accept the extra kwarg; fall back to
+            # temporarily injecting the filter into the retriever's
+            # search_kwargs (restored afterwards so it stays per-query).
+            if isinstance(retriever, VectorStoreRetriever):
+                search_kwargs = retriever.search_kwargs
+                had_filter = "filter" in search_kwargs
+                previous_filter = search_kwargs.get("filter")
+                search_kwargs["filter"] = metadata_filter
+                try:
+                    return retriever.get_relevant_documents(question)
+                finally:
+                    if had_filter:
+                        search_kwargs["filter"] = previous_filter
+                    else:
+                        search_kwargs.pop("filter", None)
+    return retriever.get_relevant_documents(question)
+
+
+class FilteredConversationalRetrievalChain(ConversationalRetrievalChain):
+    """ConversationalRetrievalChain with per-query metadata filtering.
+
+    A "filter" key may now be passed in the chain input, e.g.:
+
+        qa({"question": q, "chat_history": [...],
+            "filter": {"source": "paper2.pdf"}})
+
+    Only documents whose metadata matches the filter are retrieved, so the
+    answer is produced from the selected documents only, and the *same* chain
+    instance can be reused with a different filter on every query (no need to
+    rebuild the chain per document filter).
+    """
+
+    def _get_docs(self, inputs: Dict[str, Any], **kwargs: Any) -> List[Document]:
+        question = inputs["question"]
+        get_chat_history = getattr(self, "get_chat_history", None) or _get_chat_history
+        chat_history_str = get_chat_history(inputs["chat_history"])
+        if chat_history_str:
+            new_question = self.question_generator.run(
+                {"question": question, "chat_history": chat_history_str}
+            )
+        else:
+            new_question = question
+
+        # This is the fix: read the filter from the chain input (it was
+        # silently ignored before) and apply it to the retrieval.
+        metadata_filter = inputs.get("filter")
+
+        docs = get_relevant_documents_with_filter(
+            self.retriever, new_question, metadata_filter
+        )
+
+        reduce_docs = getattr(self, "_reduce_tokens_below_limit", None)
+        if callable(reduce_docs):
+            docs = reduce_docs(docs)
+        return docs
+
+
+def run_agent(query, pdf_paths, metadata_filter=None):
+    all_texts = []
+    embeddings = OpenAIEmbeddings(openai_api_key=get_random_key(OPENAI_API_KEY_POOL))
+
+    for pdf_path in pdf_paths:
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        texts = text_splitter.split_documents(documents)
+
+        for text in texts:
+            text.metadata["source"] = pdf_path
+
+        all_texts.extend(texts)
+
+    db = Chroma.from_documents(all_texts, embeddings)
+
+    qa = FilteredConversationalRetrievalChain.from_llm(
+        OpenAI(openai_api_key=get_random_key(OPENAI_API_KEY_POOL), cache=True, temperature=0),
+        VectorStoreRetriever(vectorstore=db),
+        verbose=True,
+        return_source_documents=True)
+
+    # The filter is applied at query time: only information from the matching
+    # documents (here paper2.pdf) may be used to answer the query.
+    chain_input = {"question": query, "chat_history": []}
+    if metadata_filter:
+        chain_input["filter"] = metadata_filter
+
+    result = qa(chain_input)
+
+    return result
+
+
+if __name__ == "__main__":
+    query = "What is Theia"
+    pdf_paths = ["paper1.pdf", "paper2.pdf"]
+
+    result = run_agent(query, pdf_paths, metadata_filter={"source": "paper2.pdf"})
+
+    print(result['answer'])
+
+    # The source documents now come exclusively from paper2.pdf, which shows
+    # that the query-time filter is applied correctly.
+    for doc in result.get("source_documents", []):
+        print(f"[source] {doc.metadata.get('source')}")
+
+--------------------------------------------------------------------------------

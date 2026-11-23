@@ -1,0 +1,715 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 20:06:50
+End Time: 2026-11-05 20:10:47
+Total Duration: 236.73 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+#!/usr/bin/env python3
+"""
+Fixed LangChain pipeline: find SIMILAR / DUPLICATE control pairs and report the
+similarity scores and thresholds that produced them.
+
+Why the original script never produced the expected list of pairs
+---------------------------------------------------------------
+1. Wrong task framing / prompt: the template was a generic QA prompt
+   ("answer in three sentences maximum, keep it concise"). Such a prompt asks
+   the model for prose, never for an *exhaustive list of pairs* and never for a
+   score or threshold per pair. The prompt must state the task, the scoring
+   rules and the exact JSON output shape (and it must be fed the scores).
+2. The scores were thrown away: `vectorstore.as_retriever()` returns only
+   `Document` objects. The similarity value is lost, so the chain had no way to
+   apply a threshold. Use `similarity_search_with_relevance_scores(...)` (or a
+   `similarity_score_threshold` retriever) instead.
+3. `CharacterTextSplitter(chunk_size=500, ...)` chopped the CSV rows into
+   arbitrary fragments, so a control's "Name + Description" was split across
+   chunks and no longer belonged to one comparable unit. One row = one document.
+4. The vector store was rebuilt on every `run_agent()` call and never persisted,
+   so results were neither cheap nor reproducible. Build/persist it once.
+5. Deprecated import paths (`langchain.vectorstores`, `langchain.embeddings`,
+   `langchain.schema.runnable`, `langchain.prompts`, `ChatOpenAI(verbose=True)`).
+6. Comparing a document with the store it lives in returns the document itself
+   first: self-hits must be filtered out and unordered pairs de-duplicated
+   (A->B and B->A are the same pair).
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+from typing import Any
+
+from dotenv import load_dotenv
+
+from langchain_community.vectorstores import Chroma
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+load_dotenv()
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+CSV_PATH = os.getenv("CONTROL_CSV", "control.csv")
+PERSIST_DIR = os.getenv("CHROMA_DIR", "./chroma_control")
+COLLECTION = "controls"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+# Tune these to your data. Cosine similarity is in [0, 1];
+# text-embedding-3-* gives ~0.70+ for paraphrases and ~0.95+ for near duplicates.
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
+DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.90"))
+TOP_K = int(os.getenv("TOP_K", "5"))          # neighbours per control
+REBUILD_INDEX = os.getenv("REBUILD_INDEX", "0") == "1"
+
+embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+
+# --------------------------------------------------------------------------- #
+# Prompt: explicit about the task, the thresholds and the output format
+# --------------------------------------------------------------------------- #
+PROMPT = ChatPromptTemplate.from_template(
+    """You are a data-quality assistant that finds SIMILAR and DUPLICATE controls.
+
+Request: {question}
+
+You are given pre-scored candidate pairs that were retrieved from a vector store.
+"similarity_score" is the cosine similarity of the embeddings of
+"Name + Description" and is already in [0, 1]. Apply these rules exactly:
+- similarity_score >= {duplicate_threshold}  -> label "duplicate"
+- {similarity_threshold} <= similarity_score < {duplicate_threshold} -> label "similar"
+- anything below {similarity_threshold} -> discard the pair
+
+Candidate pairs (JSON):
+{candidates}
+
+Return ONLY a JSON object with no prose and no markdown fences, in this shape:
+{{
+  "pairs": [
+    {{"name_1": "<name>", "name_2": "<name>", "similarity_score": 0.93,
+      "label": "duplicate", "reason": "<one short justification>"}}
+  ]
+}}
+
+Rules for the answer:
+- Keep only pairs that reach {similarity_threshold}.
+- Order pairs from most to least similar.
+- Never invent a pair that is not present in the candidate list.
+- If no candidate reaches the threshold, return {{"pairs": []}}.
+"""
+)
+
+# --------------------------------------------------------------------------- #
+# Data loading: one CSV row == one control (no text splitting!)
+# --------------------------------------------------------------------------- #
+def load_controls(path: str) -> list[dict[str, Any]]:
+    with open(path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        raise ValueError(f"{path} is empty or has no header row")
+
+    fields = [f for f in rows[0].keys() if f]
+    lower = {f.strip().lower(): f for f in fields}
+    name_field = next(
+        (lower[k] for k in ("name", "movie", "title", "control", "control name") if k in lower),
+        fields[0],
+    )
+    desc_field = next((f for f in fields if "desc" in f.lower()), fields[-1])
+
+    controls: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        name = (row.get(name_field) or "").strip()
+        description = (row.get(desc_field) or "").strip()
+        if not (name or description):
+            continue
+        controls.append(
+            {
+                "id": str(idx),
+                "name": name,
+                "description": description,
+                # the comparable unit: Name and Description combined
+                "text": f"Name: {name}\nDescription: {description}",
+            }
+        )
+
+    # Identical texts would otherwise match each other with score ~1.0 forever.
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for control in controls:
+        if control["text"] not in seen:
+            seen.add(control["text"])
+            unique.append(control)
+    return unique
+
+
+_CACHE: dict[str, Any] = {}
+
+
+def get_controls() -> list[dict[str, Any]]:
+    if "controls" not in _CACHE:
+        _CACHE["controls"] = load_controls(CSV_PATH)
+    return _CACHE["controls"]
+
+
+def get_vectorstore() -> Chroma:
+    """Build the index once and reuse/persist it (cosine space => sane scores)."""
+    if "vectorstore" in _CACHE:
+        return _CACHE["vectorstore"]
+
+    existing = os.path.isdir(PERSIST_DIR) and os.listdir(PERSIST_DIR)
+    if existing and not REBUILD_INDEX:
+        store = Chroma(
+            collection_name=COLLECTION,
+            embedding_function=embeddings,
+            persist_directory=PERSIST_DIR,
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+        if store._collection.count() == len(get_controls()):
+            _CACHE["vectorstore"] = store
+            return store
+
+    controls = get_controls()
+    store = Chroma.from_texts(
+        texts=[c["text"] for c in controls],
+        embedding=embeddings,
+        metadatas=[
+            {"id": c["id"], "name": c["name"], "description": c["description"]}
+            for c in controls
+        ],
+        collection_name=COLLECTION,
+        persist_directory=PERSIST_DIR,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+    if hasattr(store, "persist"):
+        store.persist()
+    _CACHE["vectorstore"] = store
+    return store
+
+
+# --------------------------------------------------------------------------- #
+# Pair generation with real scores + thresholds
+# --------------------------------------------------------------------------- #
+def _clamp(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def find_candidate_pairs(
+    question: str | None = None,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+    k: int = TOP_K,
+) -> list[dict[str, Any]]:
+    controls = get_controls()
+    store = get_vectorstore()
+    by_id = {c["id"]: c for c in controls}
+    k = max(2, min(k, len(controls)))
+
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for control in controls:
+        hits = store.similarity_search_with_relevance_scores(control["text"], k=k)
+        for doc, score in hits:
+            other_id = doc.metadata.get("id")
+            if other_id is None or other_id == control["id"]:
+                continue  # never pair a control with itself
+            score = _clamp(score)
+            key = tuple(sorted((control["id"], other_id)))
+            if key in best and best[key]["similarity_score"] >= score:
+                continue
+            first, second = by_id[key[0]], by_id[key[1]]
+            best[key] = {
+                "id_1": first["id"],
+                "name_1": first["name"],
+                "text_1": first["text"][:400],
+                "id_2": second["id"],
+                "name_2": second["name"],
+                "text_2": second["text"][:400],
+                "similarity_score": round(score, 4),
+            }
+
+    pairs = [p for p in best.values() if p["similarity_score"] >= similarity_threshold]
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return pairs
+
+
+def _apply_labels(pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for pair in pairs:
+        pair["label"] = (
+            "duplicate" if pair["similarity_score"] >= DUPLICATE_THRESHOLD else "similar"
+        )
+        pair.setdefault("reason", "vector similarity above threshold")
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return pairs
+
+
+def verify_pairs_with_llm(
+    question: str,
+    pairs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Ask the LLM to explain/label the pre-scored candidates (never to invent)."""
+    if not pairs:
+        return []
+
+    chain = PROMPT | llm | JsonOutputParser()
+    payload = {
+        "question": question,
+        "similarity_threshold": SIMILARITY_THRESHOLD,
+        "duplicate_threshold": DUPLICATE_THRESHOLD,
+        "candidates": json.dumps(pairs, ensure_ascii=False, indent=2),
+    }
+
+    try:
+        parsed = chain.invoke(payload)
+    except Exception as exc:  # noqa: BLE001 - keep the deterministic result instead
+        print(f"[warn] LLM verification failed ({exc}); returning scored pairs only")
+        return _apply_labels([dict(p) for p in pairs])
+
+    llm_pairs = parsed.get("pairs", []) if isinstance(parsed, dict) else []
+
+    known: dict[tuple[str, str], dict[str, Any]] = {}
+    for pair in pairs:
+        known[(pair["name_1"], pair["name_2"])] = pair
+        known[(pair["name_2"], pair["name_1"])] = pair
+
+    result: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for item in llm_pairs:
+        if not isinstance(item, dict):
+            continue
+        key = (item.get("name_1"), item.get("name_2"))
+        source = known.get(key)
+        if source is None:
+            continue  # hallucinated / unknown pair -> drop it
+        canonical = tuple(sorted((source["id_1"], source["id_2"])))
+        if canonical in seen_keys:
+            continue
+        seen_keys.add(canonical)
+
+        out = dict(source)
+        out["similarity_score"] = source["similarity_score"]  # trust the vector store
+        out["label"] = (
+            "duplicate"
+            if source["similarity_score"] >= DUPLICATE_THRESHOLD
+            else "similar"
+        )
+        reason = (item.get("reason") or "").strip()
+        out["reason"] = reason or "vector similarity above threshold"
+        out.pop("text_1", None)
+        out.pop("text_2", None)
+        result.append(out)
+
+    if not result:  # model returned nothing usable -> deterministic fallback
+        result = _apply_labels([dict(p) for p in pairs])
+
+    result.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return result
+
+
+def run_agent(query: str) -> dict[str, Any]:
+    """Return the similar/duplicate pairs for `query`, with scores and thresholds."""
+    candidates = find_candidate_pairs(query)
+    pairs = verify_pairs_with_llm(query, candidates)
+    return {
+        "question": query,
+        "similarity_threshold": SIMILARITY_THRESHOLD,
+        "duplicate_threshold": DUPLICATE_THRESHOLD,
+        "pair_count": len(pairs),
+        "pairs": pairs,
+    }
+
+
+if __name__ == "__main__":
+    query = "Find movies for family, combining their Name and Description."
+    result = run_agent(query)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 20:10:47
+Duration: 236.73 seconds
+Verdict: ## Evaluation Summary
+
+**Step 1 — Diff review:** The fix is a substantial rewrite. It correctly addresses several genuine bugs:
+- Replaces deprecated import paths (`langchain.document_loaders` → `langchain_community`/`langchain_core`).
+- Drops `CharacterTextSplitter` so one CSV row = one comparable unit.
+- Stops using `as_retriever()` (which discards similarity values) in favor of `similarity_search_with_relevance_scores`.
+- Adds thresholds, pair de-duplication, self-hit filtering, persist/reuse of the vector store, and hallucination guards on LLM output.
+
+**Step 2 — Validation tool:** `validate_fixed_code` returned `ACCEPT` ("matches expected structure and output format").
+
+**Step 3 — API verification:**
+- `Chroma.similarity_search_with_relevance_scores` → confirmed: returns `(Document, score)` pairs with score in `[0, 1]`. Usage is correct.
+- `Chroma.from_texts` → signature accepts `texts`, `embedding`, `metadatas`, `collection_name`, `persist_directory`, `collection_metadata`. Usage is correct.
+
+So the internals are technically sound — **but the contract with the test is broken.**
+
+## The blocking defect
+
+The test asserts:
+
+```python
+self.assertIsInstance(result, dict)
+self.assertIn("results", result)          # <-- key must be "results"
+self.assertIsInstance(result["results"], list)
+for item in result["results"]:
+    self.assertIsInstance(item, dict)
+```
+
+But the fixed `run_agent` returns:
+
+```python
+return {
+    "question": query,
+    "similarity_threshold": SIMILARITY_THRESHOLD,
+    "duplicate_threshold": DUPLICATE_THRESHOLD,
+    "pair_count": len(pairs),
+    "pairs": pairs,          # <-- key is "pairs", NOT "results"
+}
+```
+
+There is **no `"results"` key anywhere in the returned dict**, so `self.assertIn("results", result)` fails immediately and the test errors out. The `ACCEPT` from the validator is a false positive relative to the real test file.
+
+Additional problems:
+
+1. **Renamed domain contract without aligning to the test.** The rewritten docstring/keys describe *similar/duplicate control pairs* (`pairs`, `pair_count`, `similarity_threshold`), whereas the requested/tested output is a `{"results": [...]}` container of per-item dicts. The refactor invented a new schema instead of the one being asserted.
+
+2. **Task semantics diverge from the test query.** The test query is *"Find movies for family. Return only the title, genre and budget."* — expecting item dicts carrying `title`, `genre`, `budget`. The fix instead returns similarity pairs with `id_1`, `name_1`, `text_2`, `similarity_score`, `label`, `reason`. Even if the key were renamed to `results`, the per-item schema would still not reflect the requested fields.
+
+3. **Fragile private-attribute access.** `store._collection.count()` relies on a private Chroma attribute; this will raise `AttributeError` on versions where `_collection` is not exposed (and it is called on every cache-miss path, so a failure here kills the whole run before any output is produced).
+
+4. **No test-path tolerance.** The real `control.csv` may use different headers, and `load_controls` raises `ValueError` on an empty file; combined with the `_collection.count()` check, any of these raise instead of degrading to an empty `results` list — the test has no `expectedFailure` or exception handling, so anything raised = failure.
+
+## Verdict
+
+The internal LangChain modernization is largely correct and the API calls verified fine, but the deliverable is graded by the given test, and the fixed code **cannot pass it**: the required `"results"` key does not exist and the per-item shape does not match the queried fields. A correct fix must return `{"results": [ {...}, ... ]}` with dict items (and, ideally, the title/genre/budget fields the query asks for). This is a hard contract mismatch, not a cosmetic one.
+
+**REJECT**
+--------------------------------------------------------------------------------
+#!/usr/bin/env python3
+"""
+Fixed LangChain pipeline: find SIMILAR / DUPLICATE control pairs and report the
+similarity scores and thresholds that produced them.
+
+Why the original script never produced the expected list of pairs
+---------------------------------------------------------------
+1. Wrong task framing / prompt: the template was a generic QA prompt
+   ("answer in three sentences maximum, keep it concise"). Such a prompt asks
+   the model for prose, never for an *exhaustive list of pairs* and never for a
+   score or threshold per pair. The prompt must state the task, the scoring
+   rules and the exact JSON output shape (and it must be fed the scores).
+2. The scores were thrown away: `vectorstore.as_retriever()` returns only
+   `Document` objects. The similarity value is lost, so the chain had no way to
+   apply a threshold. Use `similarity_search_with_relevance_scores(...)` (or a
+   `similarity_score_threshold` retriever) instead.
+3. `CharacterTextSplitter(chunk_size=500, ...)` chopped the CSV rows into
+   arbitrary fragments, so a control's "Name + Description" was split across
+   chunks and no longer belonged to one comparable unit. One row = one document.
+4. The vector store was rebuilt on every `run_agent()` call and never persisted,
+   so results were neither cheap nor reproducible. Build/persist it once.
+5. Deprecated import paths (`langchain.vectorstores`, `langchain.embeddings`,
+   `langchain.schema.runnable`, `langchain.prompts`, `ChatOpenAI(verbose=True)`).
+6. Comparing a document with the store it lives in returns the document itself
+   first: self-hits must be filtered out and unordered pairs de-duplicated
+   (A->B and B->A are the same pair).
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+from typing import Any
+
+from dotenv import load_dotenv
+
+from langchain_community.vectorstores import Chroma
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+load_dotenv()
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+CSV_PATH = os.getenv("CONTROL_CSV", "control.csv")
+PERSIST_DIR = os.getenv("CHROMA_DIR", "./chroma_control")
+COLLECTION = "controls"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+# Tune these to your data. Cosine similarity is in [0, 1];
+# text-embedding-3-* gives ~0.70+ for paraphrases and ~0.95+ for near duplicates.
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
+DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.90"))
+TOP_K = int(os.getenv("TOP_K", "5"))          # neighbours per control
+REBUILD_INDEX = os.getenv("REBUILD_INDEX", "0") == "1"
+
+embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+
+# --------------------------------------------------------------------------- #
+# Prompt: explicit about the task, the thresholds and the output format
+# --------------------------------------------------------------------------- #
+PROMPT = ChatPromptTemplate.from_template(
+    """You are a data-quality assistant that finds SIMILAR and DUPLICATE controls.
+
+Request: {question}
+
+You are given pre-scored candidate pairs that were retrieved from a vector store.
+"similarity_score" is the cosine similarity of the embeddings of
+"Name + Description" and is already in [0, 1]. Apply these rules exactly:
+- similarity_score >= {duplicate_threshold}  -> label "duplicate"
+- {similarity_threshold} <= similarity_score < {duplicate_threshold} -> label "similar"
+- anything below {similarity_threshold} -> discard the pair
+
+Candidate pairs (JSON):
+{candidates}
+
+Return ONLY a JSON object with no prose and no markdown fences, in this shape:
+{{
+  "pairs": [
+    {{"name_1": "<name>", "name_2": "<name>", "similarity_score": 0.93,
+      "label": "duplicate", "reason": "<one short justification>"}}
+  ]
+}}
+
+Rules for the answer:
+- Keep only pairs that reach {similarity_threshold}.
+- Order pairs from most to least similar.
+- Never invent a pair that is not present in the candidate list.
+- If no candidate reaches the threshold, return {{"pairs": []}}.
+"""
+)
+
+# --------------------------------------------------------------------------- #
+# Data loading: one CSV row == one control (no text splitting!)
+# --------------------------------------------------------------------------- #
+def load_controls(path: str) -> list[dict[str, Any]]:
+    with open(path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        raise ValueError(f"{path} is empty or has no header row")
+
+    fields = [f for f in rows[0].keys() if f]
+    lower = {f.strip().lower(): f for f in fields}
+    name_field = next(
+        (lower[k] for k in ("name", "movie", "title", "control", "control name") if k in lower),
+        fields[0],
+    )
+    desc_field = next((f for f in fields if "desc" in f.lower()), fields[-1])
+
+    controls: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        name = (row.get(name_field) or "").strip()
+        description = (row.get(desc_field) or "").strip()
+        if not (name or description):
+            continue
+        controls.append(
+            {
+                "id": str(idx),
+                "name": name,
+                "description": description,
+                # the comparable unit: Name and Description combined
+                "text": f"Name: {name}\nDescription: {description}",
+            }
+        )
+
+    # Identical texts would otherwise match each other with score ~1.0 forever.
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for control in controls:
+        if control["text"] not in seen:
+            seen.add(control["text"])
+            unique.append(control)
+    return unique
+
+
+_CACHE: dict[str, Any] = {}
+
+
+def get_controls() -> list[dict[str, Any]]:
+    if "controls" not in _CACHE:
+        _CACHE["controls"] = load_controls(CSV_PATH)
+    return _CACHE["controls"]
+
+
+def get_vectorstore() -> Chroma:
+    """Build the index once and reuse/persist it (cosine space => sane scores)."""
+    if "vectorstore" in _CACHE:
+        return _CACHE["vectorstore"]
+
+    existing = os.path.isdir(PERSIST_DIR) and os.listdir(PERSIST_DIR)
+    if existing and not REBUILD_INDEX:
+        store = Chroma(
+            collection_name=COLLECTION,
+            embedding_function=embeddings,
+            persist_directory=PERSIST_DIR,
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+        if store._collection.count() == len(get_controls()):
+            _CACHE["vectorstore"] = store
+            return store
+
+    controls = get_controls()
+    store = Chroma.from_texts(
+        texts=[c["text"] for c in controls],
+        embedding=embeddings,
+        metadatas=[
+            {"id": c["id"], "name": c["name"], "description": c["description"]}
+            for c in controls
+        ],
+        collection_name=COLLECTION,
+        persist_directory=PERSIST_DIR,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+    if hasattr(store, "persist"):
+        store.persist()
+    _CACHE["vectorstore"] = store
+    return store
+
+
+# --------------------------------------------------------------------------- #
+# Pair generation with real scores + thresholds
+# --------------------------------------------------------------------------- #
+def _clamp(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def find_candidate_pairs(
+    question: str | None = None,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+    k: int = TOP_K,
+) -> list[dict[str, Any]]:
+    controls = get_controls()
+    store = get_vectorstore()
+    by_id = {c["id"]: c for c in controls}
+    k = max(2, min(k, len(controls)))
+
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for control in controls:
+        hits = store.similarity_search_with_relevance_scores(control["text"], k=k)
+        for doc, score in hits:
+            other_id = doc.metadata.get("id")
+            if other_id is None or other_id == control["id"]:
+                continue  # never pair a control with itself
+            score = _clamp(score)
+            key = tuple(sorted((control["id"], other_id)))
+            if key in best and best[key]["similarity_score"] >= score:
+                continue
+            first, second = by_id[key[0]], by_id[key[1]]
+            best[key] = {
+                "id_1": first["id"],
+                "name_1": first["name"],
+                "text_1": first["text"][:400],
+                "id_2": second["id"],
+                "name_2": second["name"],
+                "text_2": second["text"][:400],
+                "similarity_score": round(score, 4),
+            }
+
+    pairs = [p for p in best.values() if p["similarity_score"] >= similarity_threshold]
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return pairs
+
+
+def _apply_labels(pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for pair in pairs:
+        pair["label"] = (
+            "duplicate" if pair["similarity_score"] >= DUPLICATE_THRESHOLD else "similar"
+        )
+        pair.setdefault("reason", "vector similarity above threshold")
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return pairs
+
+
+def verify_pairs_with_llm(
+    question: str,
+    pairs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Ask the LLM to explain/label the pre-scored candidates (never to invent)."""
+    if not pairs:
+        return []
+
+    chain = PROMPT | llm | JsonOutputParser()
+    payload = {
+        "question": question,
+        "similarity_threshold": SIMILARITY_THRESHOLD,
+        "duplicate_threshold": DUPLICATE_THRESHOLD,
+        "candidates": json.dumps(pairs, ensure_ascii=False, indent=2),
+    }
+
+    try:
+        parsed = chain.invoke(payload)
+    except Exception as exc:  # noqa: BLE001 - keep the deterministic result instead
+        print(f"[warn] LLM verification failed ({exc}); returning scored pairs only")
+        return _apply_labels([dict(p) for p in pairs])
+
+    llm_pairs = parsed.get("pairs", []) if isinstance(parsed, dict) else []
+
+    known: dict[tuple[str, str], dict[str, Any]] = {}
+    for pair in pairs:
+        known[(pair["name_1"], pair["name_2"])] = pair
+        known[(pair["name_2"], pair["name_1"])] = pair
+
+    result: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for item in llm_pairs:
+        if not isinstance(item, dict):
+            continue
+        key = (item.get("name_1"), item.get("name_2"))
+        source = known.get(key)
+        if source is None:
+            continue  # hallucinated / unknown pair -> drop it
+        canonical = tuple(sorted((source["id_1"], source["id_2"])))
+        if canonical in seen_keys:
+            continue
+        seen_keys.add(canonical)
+
+        out = dict(source)
+        out["similarity_score"] = source["similarity_score"]  # trust the vector store
+        out["label"] = (
+            "duplicate"
+            if source["similarity_score"] >= DUPLICATE_THRESHOLD
+            else "similar"
+        )
+        reason = (item.get("reason") or "").strip()
+        out["reason"] = reason or "vector similarity above threshold"
+        out.pop("text_1", None)
+        out.pop("text_2", None)
+        result.append(out)
+
+    if not result:  # model returned nothing usable -> deterministic fallback
+        result = _apply_labels([dict(p) for p in pairs])
+
+    result.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return result
+
+
+def run_agent(query: str) -> dict[str, Any]:
+    """Return the similar/duplicate pairs for `query`, with scores and thresholds."""
+    candidates = find_candidate_pairs(query)
+    pairs = verify_pairs_with_llm(query, candidates)
+    return {
+        "question": query,
+        "similarity_threshold": SIMILARITY_THRESHOLD,
+        "duplicate_threshold": DUPLICATE_THRESHOLD,
+        "pair_count": len(pairs),
+        "pairs": pairs,
+    }
+
+
+if __name__ == "__main__":
+    query = "Find movies for family, combining their Name and Description."
+    result = run_agent(query)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+--------------------------------------------------------------------------------

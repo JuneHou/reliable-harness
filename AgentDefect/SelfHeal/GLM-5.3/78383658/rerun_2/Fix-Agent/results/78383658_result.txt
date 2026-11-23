@@ -1,0 +1,446 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-08 23:06:51
+End Time: 2026-11-08 23:12:22
+Total Duration: 330.77 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Find similar and duplicate control pairs (with similarity scores) in a CSV of
+3500+ controls using LangChain + OpenAI embeddings.
+
+Why the previous version produced the wrong output:
+  * CharacterTextSplitter chunked the controls, destroying the 1:1 mapping
+    between a control and its embedding (one control could be split across
+    several chunks, and several controls could land in one chunk).
+  * The RAG chain retrieved a handful of chunks and asked an LLM to answer a
+    question "in three sentences". An LLM cannot enumerate every pair among
+    3500+ controls nor compute exact similarity scores, so the output could
+    never be the expected list of similar/duplicate pairs with scores.
+
+The fix embeds each control as a whole, computes real pairwise cosine
+similarity, and lists every pair whose score exceeds the configured
+thresholds (duplicates = very high similarity, similar = high similarity).
+"""
+
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import CSVLoader  # current import path
+from langchain_openai import OpenAIEmbeddings               # current import path
+
+load_dotenv()
+
+# ---- Configuration ---------------------------------------------------------
+DEFAULT_CSV_PATH = "control.csv"
+DEFAULT_SIMILAR_THRESHOLD = 0.80    # pairs above this are "similar"
+DEFAULT_DUPLICATE_THRESHOLD = 0.90  # pairs above this are "duplicates"
+EMBEDDING_MODEL = "text-embedding-3-small"  # current, non-deprecated model
+EMBED_BATCH_SIZE = 1000
+BLOCK_SIZE = 512  # rows per similarity block, keeps memory bounded for 3500+ controls
+
+
+# ---- Helpers ----------------------------------------------------------------
+def _control_text(doc, text_column=None):
+    """Whole control text (no chunking!) - optionally a single CSV column."""
+    if text_column:
+        target = text_column.strip().lower()
+        for line in doc.page_content.splitlines():
+            if ":" in line:
+                key, _, value = line.partition(":")
+                if key.strip().lower() == target:
+                    return value.strip()
+        raise ValueError(
+            f"Column '{text_column}' not found in control row: {doc.page_content[:80]}"
+        )
+    # Collapse CSVLoader's "column: value" lines into one string per control
+    return " ".join(doc.page_content.split())
+
+
+def _load_controls(csv_path, text_column=None):
+    """Load one Document per CSV row -> one embedding per control."""
+    docs = CSVLoader(file_path=csv_path).load()
+    if len(docs) < 2:
+        raise ValueError(
+            f"Need at least 2 controls to compare, found {len(docs)} in '{csv_path}'."
+        )
+    texts = []
+    row_ids = []
+    for idx, doc in enumerate(docs):
+        text = _control_text(doc, text_column)
+        if text:  # skip empty rows instead of producing junk 1.0-similarity pairs
+            texts.append(text)
+            row_ids.append(doc.metadata.get("row", idx))
+    if len(texts) < 2:
+        raise ValueError("No non-empty control texts found to compare.")
+    print(f"Loaded {len(texts)} controls from '{csv_path}' (chunking disabled).")
+    return texts, row_ids
+
+
+def _embed_controls(texts):
+    """Embed each control as a whole, in batches."""
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, check_embedding_ctx_length=False)
+    vectors = []
+    for start in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[start:start + EMBED_BATCH_SIZE]
+        vectors.extend(embeddings.embed_documents(batch))
+        print(f"Embedded {start + len(batch)}/{len(texts)} controls...")
+    matrix = np.asarray(vectors, dtype=np.float32)
+    # Normalize once so the dot product of any two rows == cosine similarity
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    return matrix / norms
+
+
+def _pairwise_cosine(unit_matrix):
+    """Blocked all-pairs cosine similarity (3500+ rows stay memory-safe)."""
+    n = unit_matrix.shape[0]
+    sim = np.empty((n, n), dtype=np.float32)
+    for start in range(0, n, BLOCK_SIZE):
+        end = min(start + BLOCK_SIZE, n)
+        sim[start:end] = unit_matrix[start:end] @ unit_matrix.T
+    return sim
+
+
+# ---- Core task: generate and list similar / duplicate pairs -----------------
+def find_control_pairs(
+    csv_path=DEFAULT_CSV_PATH,
+    text_column=None,
+    similar_threshold=DEFAULT_SIMILAR_THRESHOLD,
+    duplicate_threshold=DEFAULT_DUPLICATE_THRESHOLD,
+    max_pairs=None,
+):
+    """
+    Returns a list of dicts (highest score first):
+        {
+            "type": "duplicate" | "similar",
+            "score": float,
+            "row_a": int, "row_b": int,          # CSV row numbers
+            "control_a": str, "control_b": str,  # control texts
+        }
+    """
+    # Precondition checks
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Control file not found: '{csv_path}'")
+    if not 0.0 < similar_threshold < 1.0 or not 0.0 < duplicate_threshold <= 1.0:
+        raise ValueError("Thresholds must be in the range (0, 1].")
+    if duplicate_threshold < similar_threshold:
+        raise ValueError(
+            "duplicate_threshold must be >= similar_threshold "
+            f"(got {duplicate_threshold} < {similar_threshold})."
+        )
+
+    texts, row_ids = _load_controls(csv_path, text_column)
+    unit_matrix = _embed_controls(texts)
+    sim = _pairwise_cosine(unit_matrix)
+
+    pairs = []
+    n = len(texts)
+    for i in range(n):
+        # Only look at j > i: self-pairs are excluded, each pair counted once
+        row = sim[i, i + 1:]
+        above = np.nonzero(row >= similar_threshold)[0]
+        for j_off in above:
+            j = i + 1 + int(j_off)
+            score = float(row[j_off])
+            pairs.append(
+                {
+                    "type": "duplicate" if score >= duplicate_threshold else "similar",
+                    "score": score,
+                    "row_a": row_ids[i],
+                    "row_b": row_ids[j],
+                    "control_a": texts[i],
+                    "control_b": texts[j],
+                }
+            )
+
+    # Highest similarity first, so duplicates appear at the top
+    pairs.sort(key=lambda p: p["score"], reverse=True)
+    if max_pairs is not None and len(pairs) > max_pairs:
+        pairs = pairs[:max_pairs]
+
+    print(
+        f"Found {len(pairs)} pairs with similarity >= {similar_threshold:.2f} "
+        f"({sum(1 for p in pairs if p['type'] == 'duplicate')} duplicates "
+        f"at >= {duplicate_threshold:.2f})."
+    )
+    return pairs
+
+
+def format_pairs(pairs, preview_len=90):
+    """Human-readable listing of every pair and its similarity score."""
+    if not pairs:
+        return "No control pairs exceeded the configured similarity thresholds."
+    lines = []
+    for idx, p in enumerate(pairs, start=1):
+        a = p["control_a"][:preview_len] + ("..." if len(p["control_a"]) > preview_len else "")
+        b = p["control_b"][:preview_len] + ("..." if len(p["control_b"]) > preview_len else "")
+        lines.append(
+            f"{idx:>4}. [{p['type'].upper():9s}] score={p['score']:.4f} | "
+            f"row {p['row_a']} <-> row {p['row_b']}\n"
+            f"      A: {a}\n"
+            f"      B: {b}"
+        )
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    control_pairs = find_control_pairs(
+        csv_path=DEFAULT_CSV_PATH,
+        # text_column="Control",                 # optional: compare one column only
+        similar_threshold=DEFAULT_SIMILAR_THRESHOLD,
+        duplicate_threshold=DEFAULT_DUPLICATE_THRESHOLD,
+        # max_pairs=200,                         # optional: cap the listing
+    )
+    print(format_pairs(control_pairs))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-08 23:12:22
+Duration: 330.77 seconds
+Verdict: ## Evaluation Analysis for Case 78383658
+
+### Tool Results Summary
+
+1. **generate_diff**: The fix is a complete rewrite. It removes the RAG chain (CSVLoader → CharacterTextSplitter → Chroma → ChatOpenAI) and replaces it with a pairwise cosine-similarity pipeline (`_load_controls` → `_embed_controls` → `_pairwise_cosine` → `find_control_pairs` → `format_pairs`).
+
+2. **validate_fixed_code**: Returned "ACCEPT fixed code matches expected structure and output format."
+
+3. **verify_api_usage**: Returned **completely irrelevant results** (mouse cursor tutorials for `OpenAIEmbeddings`, generic LangChain Wikipedia text for `CSVLoader`, and gun shopping listings for `embed_documents`). The verification tool clearly malfunctioned and provided no usable API documentation.
+
+### Critical Issues Found (via manual diff/test analysis)
+
+Despite the validation tool's ACCEPT, there is a **fatal interface mismatch** between the fixed code and the test:
+
+**1. `run_agent` function was removed entirely.** The test does:
+```python
+from run_fixed import run_agent
+```
+But the diff shows the fixed code defines `find_control_pairs`, `format_pairs`, and helper functions — **no `run_agent` exists anywhere**. The test will fail immediately with:
+```
+ImportError: cannot import name 'run_agent' from 'run_fixed'
+```
+
+**2. Wrong return structure.** Even if the import worked, the test requires:
+- `result` to be a `dict`
+- `result["results"]` to be a `list` of `dict`s
+
+The fixed code's `find_control_pairs()` returns a **bare list** of pair dicts, not a dict containing a `"results"` key. The `__main__` block prints formatted text rather than returning structured output.
+
+**3. Wrong function signature.** The test calls `run_agent(query)` with a query string; the replacement entry point `find_control_pairs(csv_path, text_column, similar_threshold, ...)` takes no query parameter at all.
+
+**4. Task mismatch.** The test query concerns movies ("Return only the title, genre and budget") and checks for structured output, while the fix targets a different task (control pair similarity) with a different output contract.
+
+### What's Actually Good (but insufficient)
+
+- The technical approach (whole-control embeddings, blocked cosine similarity, threshold-based duplicate/similar classification) is sound engineering
+- Import paths (`langchain_community.document_loaders.CSVLoader`, `langchain_openai.OpenAIEmbeddings` with `text-embedding-3-small`) are the current, correct ones
+- Memory-bounded blocked matrix multiplication is appropriate for 3500+ controls
+
+### Verdict
+
+**REJECT**
+
+The fix may be a well-engineered solution to the underlying similarity-detection problem, but it **breaks the test contract entirely**. The test imports `run_agent` from `run_fixed`, a function that no longer exists in the fixed code. Even the validation tool's ACCEPT cannot be reconciled with the diff, which unambiguously shows no `run_agent` definition and a return type (`list`) that fails `assertIsInstance(result, dict)` and `assertIn("results", result)`. Additionally, the verify_api_usage tool returned unrelated garbage results, undermining confidence in the automated tooling for this case. The fix should have preserved the `run_agent(query)` entry point and wrapped its pair results in a `{"results": [...]}` dict to satisfy the test expectations.
+--------------------------------------------------------------------------------
+"""
+Find similar and duplicate control pairs (with similarity scores) in a CSV of
+3500+ controls using LangChain + OpenAI embeddings.
+
+Why the previous version produced the wrong output:
+  * CharacterTextSplitter chunked the controls, destroying the 1:1 mapping
+    between a control and its embedding (one control could be split across
+    several chunks, and several controls could land in one chunk).
+  * The RAG chain retrieved a handful of chunks and asked an LLM to answer a
+    question "in three sentences". An LLM cannot enumerate every pair among
+    3500+ controls nor compute exact similarity scores, so the output could
+    never be the expected list of similar/duplicate pairs with scores.
+
+The fix embeds each control as a whole, computes real pairwise cosine
+similarity, and lists every pair whose score exceeds the configured
+thresholds (duplicates = very high similarity, similar = high similarity).
+"""
+
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import CSVLoader  # current import path
+from langchain_openai import OpenAIEmbeddings               # current import path
+
+load_dotenv()
+
+# ---- Configuration ---------------------------------------------------------
+DEFAULT_CSV_PATH = "control.csv"
+DEFAULT_SIMILAR_THRESHOLD = 0.80    # pairs above this are "similar"
+DEFAULT_DUPLICATE_THRESHOLD = 0.90  # pairs above this are "duplicates"
+EMBEDDING_MODEL = "text-embedding-3-small"  # current, non-deprecated model
+EMBED_BATCH_SIZE = 1000
+BLOCK_SIZE = 512  # rows per similarity block, keeps memory bounded for 3500+ controls
+
+
+# ---- Helpers ----------------------------------------------------------------
+def _control_text(doc, text_column=None):
+    """Whole control text (no chunking!) - optionally a single CSV column."""
+    if text_column:
+        target = text_column.strip().lower()
+        for line in doc.page_content.splitlines():
+            if ":" in line:
+                key, _, value = line.partition(":")
+                if key.strip().lower() == target:
+                    return value.strip()
+        raise ValueError(
+            f"Column '{text_column}' not found in control row: {doc.page_content[:80]}"
+        )
+    # Collapse CSVLoader's "column: value" lines into one string per control
+    return " ".join(doc.page_content.split())
+
+
+def _load_controls(csv_path, text_column=None):
+    """Load one Document per CSV row -> one embedding per control."""
+    docs = CSVLoader(file_path=csv_path).load()
+    if len(docs) < 2:
+        raise ValueError(
+            f"Need at least 2 controls to compare, found {len(docs)} in '{csv_path}'."
+        )
+    texts = []
+    row_ids = []
+    for idx, doc in enumerate(docs):
+        text = _control_text(doc, text_column)
+        if text:  # skip empty rows instead of producing junk 1.0-similarity pairs
+            texts.append(text)
+            row_ids.append(doc.metadata.get("row", idx))
+    if len(texts) < 2:
+        raise ValueError("No non-empty control texts found to compare.")
+    print(f"Loaded {len(texts)} controls from '{csv_path}' (chunking disabled).")
+    return texts, row_ids
+
+
+def _embed_controls(texts):
+    """Embed each control as a whole, in batches."""
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, check_embedding_ctx_length=False)
+    vectors = []
+    for start in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[start:start + EMBED_BATCH_SIZE]
+        vectors.extend(embeddings.embed_documents(batch))
+        print(f"Embedded {start + len(batch)}/{len(texts)} controls...")
+    matrix = np.asarray(vectors, dtype=np.float32)
+    # Normalize once so the dot product of any two rows == cosine similarity
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    return matrix / norms
+
+
+def _pairwise_cosine(unit_matrix):
+    """Blocked all-pairs cosine similarity (3500+ rows stay memory-safe)."""
+    n = unit_matrix.shape[0]
+    sim = np.empty((n, n), dtype=np.float32)
+    for start in range(0, n, BLOCK_SIZE):
+        end = min(start + BLOCK_SIZE, n)
+        sim[start:end] = unit_matrix[start:end] @ unit_matrix.T
+    return sim
+
+
+# ---- Core task: generate and list similar / duplicate pairs -----------------
+def find_control_pairs(
+    csv_path=DEFAULT_CSV_PATH,
+    text_column=None,
+    similar_threshold=DEFAULT_SIMILAR_THRESHOLD,
+    duplicate_threshold=DEFAULT_DUPLICATE_THRESHOLD,
+    max_pairs=None,
+):
+    """
+    Returns a list of dicts (highest score first):
+        {
+            "type": "duplicate" | "similar",
+            "score": float,
+            "row_a": int, "row_b": int,          # CSV row numbers
+            "control_a": str, "control_b": str,  # control texts
+        }
+    """
+    # Precondition checks
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Control file not found: '{csv_path}'")
+    if not 0.0 < similar_threshold < 1.0 or not 0.0 < duplicate_threshold <= 1.0:
+        raise ValueError("Thresholds must be in the range (0, 1].")
+    if duplicate_threshold < similar_threshold:
+        raise ValueError(
+            "duplicate_threshold must be >= similar_threshold "
+            f"(got {duplicate_threshold} < {similar_threshold})."
+        )
+
+    texts, row_ids = _load_controls(csv_path, text_column)
+    unit_matrix = _embed_controls(texts)
+    sim = _pairwise_cosine(unit_matrix)
+
+    pairs = []
+    n = len(texts)
+    for i in range(n):
+        # Only look at j > i: self-pairs are excluded, each pair counted once
+        row = sim[i, i + 1:]
+        above = np.nonzero(row >= similar_threshold)[0]
+        for j_off in above:
+            j = i + 1 + int(j_off)
+            score = float(row[j_off])
+            pairs.append(
+                {
+                    "type": "duplicate" if score >= duplicate_threshold else "similar",
+                    "score": score,
+                    "row_a": row_ids[i],
+                    "row_b": row_ids[j],
+                    "control_a": texts[i],
+                    "control_b": texts[j],
+                }
+            )
+
+    # Highest similarity first, so duplicates appear at the top
+    pairs.sort(key=lambda p: p["score"], reverse=True)
+    if max_pairs is not None and len(pairs) > max_pairs:
+        pairs = pairs[:max_pairs]
+
+    print(
+        f"Found {len(pairs)} pairs with similarity >= {similar_threshold:.2f} "
+        f"({sum(1 for p in pairs if p['type'] == 'duplicate')} duplicates "
+        f"at >= {duplicate_threshold:.2f})."
+    )
+    return pairs
+
+
+def format_pairs(pairs, preview_len=90):
+    """Human-readable listing of every pair and its similarity score."""
+    if not pairs:
+        return "No control pairs exceeded the configured similarity thresholds."
+    lines = []
+    for idx, p in enumerate(pairs, start=1):
+        a = p["control_a"][:preview_len] + ("..." if len(p["control_a"]) > preview_len else "")
+        b = p["control_b"][:preview_len] + ("..." if len(p["control_b"]) > preview_len else "")
+        lines.append(
+            f"{idx:>4}. [{p['type'].upper():9s}] score={p['score']:.4f} | "
+            f"row {p['row_a']} <-> row {p['row_b']}\n"
+            f"      A: {a}\n"
+            f"      B: {b}"
+        )
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    control_pairs = find_control_pairs(
+        csv_path=DEFAULT_CSV_PATH,
+        # text_column="Control",                 # optional: compare one column only
+        similar_threshold=DEFAULT_SIMILAR_THRESHOLD,
+        duplicate_threshold=DEFAULT_DUPLICATE_THRESHOLD,
+        # max_pairs=200,                         # optional: cap the listing
+    )
+    print(format_pairs(control_pairs))
+
+--------------------------------------------------------------------------------

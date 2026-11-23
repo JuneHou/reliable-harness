@@ -1,0 +1,163 @@
+diff --git a/apps/browser/pages/api/proxy/embeddings.ts b/apps/browser/pages/api/proxy/embeddings.ts
+index 29affd6..dc765ff 100644
+--- a/apps/browser/pages/api/proxy/embeddings.ts
++++ b/apps/browser/pages/api/proxy/embeddings.ts
+@@ -7,6 +7,86 @@ import { canUseSubsidy } from "../../../api-utils/subsidy";
+ import { createSupabaseClient } from "../../../api-utils/supabase";
+ import { createOpenAIApiClient } from "../../../api-utils/openai";
+ 
++// Web scraping + text chunking can produce a request body that is far bigger
++// than the 1mb size limit that Next.js applies to API route bodies by default.
++// Anything above that limit is rejected with a "Body exceeds maximum size"
++// error before the handler below is even executed, so the limit has to be
++// raised explicitly for this route.
++export const config = {
++  api: {
++    bodyParser: {
++      sizeLimit: "10mb",
++    },
++  },
++};
++
++// The embeddings API also rejects requests that carry too many inputs at once
++// ("Body exceeds maximum size"), so the incoming chunks are always split into
++// smaller batches before they are forwarded to the embeddings API.
++const MAX_CHUNKS_PER_EMBEDDING_REQUEST = 100;
++
++// How many embedding requests may be in flight at the same time, so that
++// embedding a large document doesn't trip the API's rate limits.
++const MAX_CONCURRENT_EMBEDDING_REQUESTS = 5;
++
++function toBatches(chunks: string[], batchSize: number): string[][] {
++  const batches: string[][] = [];
++  for (let i = 0; i < chunks.length; i += batchSize) {
++    batches.push(chunks.slice(i, i + batchSize));
++  }
++  return batches;
++}
++
++/**
++ * Normalizes `req.body.input` into a list of small batches of chunks.
++ *
++ * The client is expected to send an array of batches (`string[][]`), but a
++ * flat array of chunks (`string[]`) is accepted (and re-batched) as well.
++ */
++function parseInputBatches(input: unknown): string[][] {
++  if (!Array.isArray(input)) {
++    return [];
++  }
++
++  const rawBatches: unknown[][] = Array.isArray(input[0])
++    ? (input as unknown[][])
++    : [input];
++
++  const batches: string[][] = [];
++  for (const rawBatch of rawBatches) {
++    const chunks = rawBatch.filter(
++      (chunk): chunk is string => typeof chunk === "string" && chunk.length > 0
++    );
++    batches.push(...toBatches(chunks, MAX_CHUNKS_PER_EMBEDDING_REQUEST));
++  }
++
++  return batches.filter((batch) => batch.length > 0);
++}
++
++async function mapWithConcurrency<T, R>(
++  items: T[],
++  concurrency: number,
++  fn: (item: T) => Promise<R>
++): Promise<R[]> {
++  const results: R[] = new Array<R>(items.length);
++  let cursor = 0;
++
++  const workers = Array.from(
++    { length: Math.min(concurrency, items.length) },
++    async () => {
++      while (cursor < items.length) {
++        const index = cursor;
++        cursor += 1;
++        results[index] = await fn(items[index]);
++      }
++    }
++  );
++
++  await Promise.all(workers);
++
++  return results;
++}
++
+ export default async function handler(
+   req: NextApiRequest,
+   res: NextApiResponse
+@@ -37,22 +117,56 @@ export default async function handler(
+     return res.status(403).send({});
+   }
+ 
+-  const input: string[][] = req.body.input;
++  const model = req.body.model;
++
++  // Split the (potentially huge) scraped text into batches small enough to be
++  // accepted by the embeddings API.
++  const batches = parseInputBatches(req.body.input);
++
++  // Nothing to embed (e.g. the scraper didn't find any usable text).
++  if (batches.length === 0) {
++    return res.status(200).json({ embeddings: [] });
++  }
++
++  const embedBatch = async (
++    batch: string[]
++  ): Promise<{ embedding: number[]; input: string }[]> => {
++    try {
++      const { data } = await openai.embeddings.create({
++        model,
++        input: batch,
++      });
++
++      return data.map((innerData) => {
++        return {
++          embedding: innerData.embedding,
++          input: batch[innerData.index],
++        };
++      });
++    } catch (e: any) {
++      // If the batch is still too large for the embeddings API, split it in
++      // half and embed the halves separately instead of failing outright.
++      const tooLarge =
++        e instanceof OpenAIApi.APIError &&
++        (e.status === 413 ||
++          /maximum size|too large/i.test(String(e.message ?? "")));
++      if (tooLarge && batch.length > 1) {
++        const mid = Math.ceil(batch.length / 2);
++        const halves = await Promise.all([
++          embedBatch(batch.slice(0, mid)),
++          embedBatch(batch.slice(mid)),
++        ]);
++        return halves.flat();
++      }
++      throw e;
++    }
++  };
++
+   try {
+-    const embeddings = await Promise.all(
+-      input.map(async (inputs) => {
+-        const { data } = await openai.embeddings.create({
+-          model: req.body.model,
+-          input: inputs,
+-        });
+-
+-        return data.map((innerData) => {
+-          return {
+-            embedding: innerData.embedding,
+-            input: inputs[innerData.index],
+-          };
+-        });
+-      })
++    const embeddings = await mapWithConcurrency(
++      batches,
++      MAX_CONCURRENT_EMBEDDING_REQUESTS,
++      embedBatch
+     );
+     return res.status(200).json({ embeddings: embeddings.flat() });
+   } catch (e: any) {

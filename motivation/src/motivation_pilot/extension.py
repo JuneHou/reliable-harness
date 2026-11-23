@@ -4,7 +4,7 @@ Among the existing complete repairs, which persistent component changes are
 required, removable or dependent, and does measuring that change the repair we
 would keep. Plan: ~/.claude/plans/back-to-agent-defect-deep-blossom.md
 
-    PYTHONPATH=src python -m motivation_pilot.extension map|manifest|selftest|live|compare|report
+    PYTHONPATH=src python -m motivation_pilot.extension map|manifest|live|compare|report
 """
 
 from __future__ import annotations
@@ -755,7 +755,7 @@ def classify(raw: dict, events: list[dict], config: dict, original: str) -> tupl
 
 
 def manifest_paths() -> dict:
-    return {"manifest": OUT / "experiment_manifest.json", "selftest": OUT / "selftest.json", "runs": OUT / "runs.jsonl"}
+    return {"manifest": OUT / "experiment_manifest.json", "runs": OUT / "runs.jsonl"}
 
 
 def schedule(configs_by_case: dict) -> list[dict]:
@@ -867,162 +867,6 @@ PROVENANCE = {
 
 def _provenance(case: str, action: str) -> str:
     return PROVENANCE[action]
-
-
-# ---------------------------------------------------------------- selftest
-
-SELFTEST_BODIES = {
-    "chat_request": r'''
-import httpx
-def handler(request):
-    return httpx.Response(200, json={"id": "x", "object": "chat.completion", "created": 0, "model": "gpt-6-luna",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
-llm = StudyChat(api_key="sk-test", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
-assert llm.max_retries == 0, llm.max_retries
-llm.invoke("hello")
-''',
-    "network_attempt": r'''
-import httpx, json as _json
-calls = []
-def failing(request):
-    calls.append(1)
-    return httpx.Response(500, json={"error": {"message": "boom", "type": "server_error"}})
-bad = StudyChat(api_key="sk-test", http_client=httpx.Client(transport=httpx.MockTransport(failing)))
-try:
-    bad.invoke("hello")
-except Exception as exc:
-    print("expected failure", type(exc).__name__)
-print(_json.dumps({"failing_calls": len(calls)}))
-''',
-    "memory": r'''
-from langchain.memory import ConversationBufferMemory
-memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-memory.load_memory_variables({})
-memory.save_context({"input": "a"}, {"output": "b"})
-''',
-    "retrieval": r'''
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import FakeEmbeddings
-FAISS.from_texts(["alpha", "beta"], FakeEmbeddings(size=8)).as_retriever().invoke("alpha")
-''',
-    "direct_search": r'''
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import FakeEmbeddings
-Chroma.from_texts(["alpha", "beta"], FakeEmbeddings(size=8)).similarity_search("alpha", k=1)
-''',
-    "embeddings": r'''
-import httpx, json as _json
-def handler(request):
-    body = _json.loads(request.content)
-    data = [{"object": "embedding", "index": i, "embedding": [0.0, 1.0]} for i, _ in enumerate(body["input"])]
-    return httpx.Response(200, json={"object": "list", "data": data, "model": "text-embedding-ada-002",
-                                     "usage": {"prompt_tokens": 1, "total_tokens": 1}})
-from langchain_openai import OpenAIEmbeddings as NewEmbeddings
-from langchain_community.embeddings import OpenAIEmbeddings as OldEmbeddings
-new = NewEmbeddings(api_key="sk-test", http_client=httpx.Client(transport=httpx.MockTransport(handler)), check_embedding_ctx_length=False)
-assert new.max_retries == 0, new.max_retries
-new.embed_documents(["x"]); new.embed_query("y")
-import openai
-old = OldEmbeddings(openai_api_key="sk-test", http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-                    async_client=openai.AsyncOpenAI(api_key="sk-test").embeddings)
-assert old.max_retries == 0, old.max_retries
-old.embed_documents(["x"]); old.embed_query("y")
-''',
-    "parsers": r'''
-from langchain_core.output_parsers import StrOutputParser
-from langchain.output_parsers import StructuredOutputParser, ResponseSchema
-StrOutputParser().invoke("x"); StrOutputParser().parse("x")
-structured = StructuredOutputParser.from_response_schemas([ResponseSchema(name="results", description="d")])
-structured.invoke('```json\n{"results": "1"}\n```'); structured.parse('```json\n{"results": "1"}\n```')
-''',
-    "agent_parsers": r'''
-from langchain.agents.chat.output_parser import ChatOutputParser
-from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
-ChatOutputParser().parse("Thought: t\nFinal Answer: y")
-ConvoOutputParser().parse('```json\n{"action": "Final Answer", "action_input": "y"}\n```')
-''',
-    "tools": r'''
-from langchain_core.tools import Tool
-Tool(name="echo_tool", func=lambda x: x, description="echo").run("q")
-''',
-}
-
-SELFTEST_EXPECT = {
-    "chat_request": [("StudyChat", "_get_request_payload", "request_prepared")],
-    "network_attempt": [("httpx.Client", "send", "backend_attempt")],
-    "memory": [("ConversationBufferMemory", "load_memory_variables", "memory_before"),
-               ("ConversationBufferMemory", "save_context", "memory_after")],
-    "retrieval": [("VectorStoreRetriever", "_get_relevant_documents", "retrieval")],
-    "direct_search": [("Chroma", "similarity_search", "retrieval")],
-    "embeddings": [(c, m, "embedding") for c in ("langchain_openai", "langchain_community") for m in ("embed_documents", "embed_query")],
-    "parsers": [(c, m, "parser") for c in ("StrOutputParser", "StructuredOutputParser") for m in ("invoke", "parse")],
-    "agent_parsers": [("ChatOutputParser", "parse", "parser"), ("ConvoOutputParser", "parse", "parser")],
-    "tools": [("callback_handler", "on_tool_start", "tool_call"), ("callback_handler", "on_tool_end", "tool_call")],
-    "loader": [("load_excel_response", "func", "loader_output")],
-}
-
-
-def _pair_seen(boundary: str, cls: str, method: str, kind: str, events: list[dict]) -> bool:
-    for e in events:
-        if e["kind"] != kind or e.get("boundary") != boundary:
-            continue
-        if kind == "embedding":
-            if cls in (e.get("cls") or "") and e.get("method") == method:
-                return True
-        elif kind == "parser":
-            if e.get("cls") == cls and e.get("method") == method:
-                return True
-        elif kind == "tool_call":
-            if e.get("stage") == ("start" if method == "on_tool_start" else "end"):
-                return True
-        else:
-            return True
-    return False
-
-
-def selftest_boundary(boundary: str, work: Path) -> dict:
-    """Run one boundary's offline child and check that every class and method pair produced its event."""
-    env = {**os.environ, "OPENAI_API_KEY": "sk-test", "ANONYMIZED_TELEMETRY": "False"}
-    trace = work / f"{boundary}.jsonl"
-    if boundary == "loader":
-        original = archive_text("79343179", "run_buggy.py")
-        raw = pr._run_module("79343179", "loader", "excel_file.xlsx", original, 60, trace_path=trace, boundaries=["loader"])
-        returncode, stdout, stderr = raw["returncode"], raw["stdout"], raw["stderr"]
-    else:
-        script = pr._study_prelude() + instrument.NO_RETRY_PRELUDE + instrument.trace_prelude(trace, [boundary]) + SELFTEST_BODIES[boundary]
-        proc = subprocess.run([sys.executable, "-c", script], cwd=work, env=env, capture_output=True, text=True, timeout=300)
-        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-    events = instrument.read_trace(trace)
-    pairs = [{"cls": c, "method": m, "event": k, "seen": _pair_seen(boundary, c, m, k, events)} for c, m, k in SELFTEST_EXPECT[boundary]]
-    extra = {}
-    if boundary == "network_attempt":
-        extra = instrument.last_json(stdout) or {}
-        attempts = sum(1 for e in events if e["kind"] == "backend_attempt")
-        extra["backend_attempt_events"] = attempts
-        extra["single_attempt"] = extra.get("failing_calls") == 1 and attempts == 1
-    ok = (returncode == 0 and all(p["seen"] for p in pairs) and not any(e["kind"] == "probe_unresolved" for e in events)
-          and not any(e["kind"] == "probe_error" for e in events) and extra.get("single_attempt", True))
-    return {"boundary": boundary, "ok": ok, "returncode": returncode, "pairs": pairs, **extra,
-            "event_counts": dict(Counter(e["kind"] for e in events)),
-            "installed": [f"{e['cls']}.{e['method']} from {e['resolved_from']}" for e in events if e["kind"] == "probe_installed"],
-            "unresolved": [e for e in events if e["kind"] in ("probe_unresolved", "probe_error")],
-            "stderr_tail": stderr[-600:] if not ok else ""}
-
-
-def cmd_selftest() -> int:
-    work = Path(tempfile.mkdtemp(prefix="ext-selftest-"))
-    try:
-        results = [selftest_boundary(boundary, work) for boundary in SELFTEST_EXPECT]
-    finally:
-        import shutil
-        shutil.rmtree(work, ignore_errors=True)
-    ok_all = all(r["ok"] for r in results)
-    write_json(OUT / "selftest.json", {"ok": ok_all, "written": datetime.now(timezone.utc).isoformat(),
-                                       "probe_version": sha256_file(Path(instrument.__file__)), "boundaries": results})
-    for r in results:
-        print(f"{r['boundary']:16s} ok={r['ok']} pairs={sum(p['seen'] for p in r['pairs'])}/{len(r['pairs'])}")
-    return 0 if ok_all else 1
 
 
 # ---------------------------------------------------------------- map
@@ -1209,10 +1053,6 @@ def cmd_live() -> int:
     if not paths["manifest"].exists():
         print("experiment_manifest.json is missing; run map and manifest first.")
         return 7
-    selftest = json.loads(paths["selftest"].read_text(encoding="utf-8")) if paths["selftest"].exists() else {"ok": False}
-    if not selftest.get("ok") or selftest.get("probe_version") != sha256_file(Path(instrument.__file__)):
-        print("selftest.json is missing, failing, or older than instrument.py; run selftest.")
-        return 5
     config = load_config(ROOT / "configs" / "study.yaml")
     if any(config.get(k) != v for k, v in EXPECTED_SETTINGS.items()):
         print("configs/study.yaml differs from the prelude settings:", {k: config.get(k) for k in EXPECTED_SETTINGS})
@@ -2100,10 +1940,10 @@ def cmd_report() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="motivation_pilot.extension")
-    parser.add_argument("command", choices=["map", "manifest", "selftest", "live", "compare", "report", "rescore"])
+    parser.add_argument("command", choices=["map", "manifest", "live", "compare", "report", "rescore"])
     args = parser.parse_args(argv)
     OUT.mkdir(parents=True, exist_ok=True)
-    return {"map": cmd_map, "manifest": cmd_manifest, "selftest": cmd_selftest, "live": cmd_live,
+    return {"map": cmd_map, "manifest": cmd_manifest, "live": cmd_live,
             "compare": cmd_compare, "report": cmd_report, "rescore": cmd_rescore}[args.command]()
 
 

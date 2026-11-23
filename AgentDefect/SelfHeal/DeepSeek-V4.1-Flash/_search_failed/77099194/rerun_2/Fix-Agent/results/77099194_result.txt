@@ -1,0 +1,242 @@
+Case ID: 77099194
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 20:34:39
+End Time: 2026-11-04 20:37:54
+Total Duration: 194.19 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Why the original code returned only "Author A":
+
+1. `CSVLoader` stores ONE Document per CSV row, and
+   `search.as_retriever(search_kwargs={"k": 1})` then hands the LLM
+   **exactly one row** (the single closest embedding match).
+   So even if several rows (e.g. Author A *and* Author C for 1999 films)
+   match the question, only the first one ever reaches the model and the
+   rest are silently dropped -> the answer is truncated/incomplete.
+
+2. `chat_history` was passed as the string "" instead of a list of
+   (human, ai) tuples, which makes the condense-question step ill-defined.
+
+3. The default "stuff" prompt has no instruction to enumerate *every*
+   matching row, so the model is free to answer with just the one row it got.
+
+Fix: retrieve enough documents (k = number of rows in this small CSV),
+use a proper empty list for chat_history, and use an explicit prompt that
+requires the model to scan all context rows and list every match.
+"""
+
+from dotenv import load_dotenv
+
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.document_loaders.csv_loader import CSVLoader
+from langchain.vectorstores import Chroma
+
+from langchain.prompts import PromptTemplate
+from langchain.chains import ConversationalRetrievalChain
+from langchain.chat_models import ChatOpenAI
+
+load_dotenv()
+
+CSV_PATH = "movies.csv"
+
+# Prompt that forces the model to use ALL retrieved rows instead of just one.
+QA_PROMPT = PromptTemplate.from_template(
+    """You are answering questions about a movies database.
+Every line of the context below is exactly one row of the CSV file
+(it contains the movie title, the release year, the author/director, etc.).
+
+Read EVERY row of the context before answering.
+List ALL rows that satisfy the condition in the question - there can be
+several authors/movies that match, and every one of them must be reported.
+Do not stop after the first match, and do not invent rows that are not in
+the context. If no row matches, say that no matching row exists.
+
+Context:
+{context}
+
+Question: {question}
+
+Complete answer (list every matching movie together with all of its columns):"""
+)
+
+
+def run_agent(prompt, chat_history=None):
+    """Answer a question over movies.csv.
+
+    chat_history must be a list of (human, ai) tuples, e.g. []
+    """
+    if chat_history is None:
+        chat_history = []
+
+    embeddings = OpenAIEmbeddings()
+
+    csvloader = CSVLoader(file_path=CSV_PATH, encoding="utf-8")
+    csvdocuments = csvloader.load()
+
+    search = Chroma.from_documents(csvdocuments, embeddings)
+
+    # FIX: k=1 only ever kept a single CSV row, so only the first matching
+    # movie/author reached the LLM. Retrieve enough rows to cover the file.
+    k = max(1, min(len(csvdocuments), 20))
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=ChatOpenAI(temperature=0),
+        retriever=search.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": k},
+        ),
+        return_source_documents=True,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+    )
+
+    result = chain({"question": prompt, "chat_history": chat_history})
+
+    # Optional: helps you verify that all the rows really were retrieved.
+    for doc in result.get("source_documents", []):
+        print(doc.metadata, doc.page_content)
+
+    return result["answer"]
+
+
+if __name__ == "__main__":
+    print(run_agent("which movies are action"))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 20:37:54
+Duration: 194.19 seconds
+Verdict: ## Answer
+
+**ACCEPT**
+
+### 1. What changed (diff summary)
+- `k=1` → `k = max(1, min(len(csvdocuments), 20))`, so the retriever now returns all (or nearly all) CSV rows instead of a single nearest row. This is the root-cause fix: with `CSVLoader` emitting one `Document` per row, `k=1` guaranteed only one row reached the LLM, so a question with multiple matching movies could never be answered completely.
+- `chat_history` now defaults to `[]` (a proper list of `(human, ai)` tuples) instead of the string `""`; `run_agent(prompt, chat_history=None)` normalizes `None → []`.
+- Added an explicit `QA_PROMPT` (via `PromptTemplate.from_template`) instructing the model to read every context row and enumerate all matches, passed in through `combine_docs_chain_kwargs={"prompt": QA_PROMPT}`. This removes the "answer only the first row" freedom of the default *stuff* prompt.
+- `temperature 0.3 → 0` for more deterministic listing; `CSVLoader(file_path=..., encoding="utf-8")` is now explicit; removed `return_only_outputs=True`; added `return_source_documents=True` debug printing and an explanatory module docstring.
+- `if __name__ == "__main__":` guard retained, so `from run_fixed import run_agent` in the test doesn't execute anything (aside from `load_dotenv()` at import time, which is harmless).
+
+### 2. Structural validation
+`validate_fixed_code` returned: *"ACCEPT fixed code matches expected structure and output format"* — the required `run_agent(prompt)` entry point is preserved (extra keyword with a default is backward compatible), and `result["answer"]` is still the return value, so the test's `run_agent(query).lower()` works.
+
+### 3. API verification
+- **`ConversationalRetrievalChain.from_llm`** — `llm`, `retriever`, `return_source_documents`, and `combine_docs_chain_kwargs` are all valid constructor arguments; the QA chain's document variable is `context` and its input key is `question`, both of which the custom `QA_PROMPT` declares as template variables (`{context}`, `{question}`), so prompt-variable wiring is consistent.
+- **`VectorStore.as_retriever`** (used by `Chroma.as_retriever`) — `search_type="similarity"` and `search_kwargs={"k": k}` are supported and correctly forwarded to `similarity_search`.
+- The chain input dict `{"question": ..., "chat_history": [...]}` matches the chain's declared input keys.
+
+### 4. Behavioral check against the test
+For `"Return all the action movies names"`, the retriever now supplies the whole small movies CSV as context and the prompt explicitly requires listing *every* matching row, so both "Avengers" and "The Dark Knight Rises" reach the answer — satisfying both `assertIn` assertions. The extra `print(doc.metadata, doc.page_content)` goes to stdout and cannot break the assertions.
+
+### Minor caveats (non-blocking)
+- `k` is capped at 20, so a CSV with more than ~20 rows could still truncate results; fine for this fixture-sized dataset.
+- The module docstring/top comment talks about "Author A / Author C / 1999 films", which is stale relative to the `movies.csv`/action-movies test — documentation only, no functional impact.
+- Deprecated import paths (`langchain.embeddings.openai`, `langchain.vectorstores`) are unchanged from the original, so they're consistent with the environment the buggy code ran in.
+
+All changes are additive/corrective, consistent with LangChain APIs, and directly address the retrieval-window and prompt-enumeration defects that made the original return an incomplete answer.
+--------------------------------------------------------------------------------
+"""
+Why the original code returned only "Author A":
+
+1. `CSVLoader` stores ONE Document per CSV row, and
+   `search.as_retriever(search_kwargs={"k": 1})` then hands the LLM
+   **exactly one row** (the single closest embedding match).
+   So even if several rows (e.g. Author A *and* Author C for 1999 films)
+   match the question, only the first one ever reaches the model and the
+   rest are silently dropped -> the answer is truncated/incomplete.
+
+2. `chat_history` was passed as the string "" instead of a list of
+   (human, ai) tuples, which makes the condense-question step ill-defined.
+
+3. The default "stuff" prompt has no instruction to enumerate *every*
+   matching row, so the model is free to answer with just the one row it got.
+
+Fix: retrieve enough documents (k = number of rows in this small CSV),
+use a proper empty list for chat_history, and use an explicit prompt that
+requires the model to scan all context rows and list every match.
+"""
+
+from dotenv import load_dotenv
+
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.document_loaders.csv_loader import CSVLoader
+from langchain.vectorstores import Chroma
+
+from langchain.prompts import PromptTemplate
+from langchain.chains import ConversationalRetrievalChain
+from langchain.chat_models import ChatOpenAI
+
+load_dotenv()
+
+CSV_PATH = "movies.csv"
+
+# Prompt that forces the model to use ALL retrieved rows instead of just one.
+QA_PROMPT = PromptTemplate.from_template(
+    """You are answering questions about a movies database.
+Every line of the context below is exactly one row of the CSV file
+(it contains the movie title, the release year, the author/director, etc.).
+
+Read EVERY row of the context before answering.
+List ALL rows that satisfy the condition in the question - there can be
+several authors/movies that match, and every one of them must be reported.
+Do not stop after the first match, and do not invent rows that are not in
+the context. If no row matches, say that no matching row exists.
+
+Context:
+{context}
+
+Question: {question}
+
+Complete answer (list every matching movie together with all of its columns):"""
+)
+
+
+def run_agent(prompt, chat_history=None):
+    """Answer a question over movies.csv.
+
+    chat_history must be a list of (human, ai) tuples, e.g. []
+    """
+    if chat_history is None:
+        chat_history = []
+
+    embeddings = OpenAIEmbeddings()
+
+    csvloader = CSVLoader(file_path=CSV_PATH, encoding="utf-8")
+    csvdocuments = csvloader.load()
+
+    search = Chroma.from_documents(csvdocuments, embeddings)
+
+    # FIX: k=1 only ever kept a single CSV row, so only the first matching
+    # movie/author reached the LLM. Retrieve enough rows to cover the file.
+    k = max(1, min(len(csvdocuments), 20))
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=ChatOpenAI(temperature=0),
+        retriever=search.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": k},
+        ),
+        return_source_documents=True,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+    )
+
+    result = chain({"question": prompt, "chat_history": chat_history})
+
+    # Optional: helps you verify that all the rows really were retrieved.
+    for doc in result.get("source_documents", []):
+        print(doc.metadata, doc.page_content)
+
+    return result["answer"]
+
+
+if __name__ == "__main__":
+    print(run_agent("which movies are action"))
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,521 @@
+Case ID: 78838421
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 19:33:20
+End Time: 2026-11-04 19:59:50
+Total Duration: 1590.30 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import logging
+
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.output_parsers import StrOutputParser, BaseOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.documents import Document
+
+# --- Use the maintained Ollama integration modules (langchain_community ones are
+# --- deprecated / return empty content with recent Ollama versions) -------------
+try:
+    from langchain_ollama import ChatOllama, OllamaEmbeddings
+except ImportError:  # pragma: no cover - fallback for older environments
+    from langchain_community.chat_models import ChatOllama
+    from langchain_community.embeddings import OllamaEmbeddings
+
+try:
+    from langchain_chroma import Chroma
+except ImportError:  # pragma: no cover - fallback for older environments
+    from langchain_community.vectorstores import Chroma
+
+try:
+    from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+except ImportError:  # pragma: no cover - fallback for older langchain layouts
+    from langchain.retrievers.multi_query import MultiQueryRetriever
+
+from typing import List
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class CleanLineListOutputParser(BaseOutputParser[List[str]]):
+    """Split the LLM answer into one query per line.
+
+    Local chat models (llama3) like to answer with a preamble such as
+    "Here are five alternative questions:" and with numbered/bulleted items.
+    The stock parser keeps all of that noise, which produces bogus queries
+    (and therefore junk retrieval context). This parser strips numbering,
+    bullets and preamble lines so only real questions are used.
+    """
+
+    def parse(self, text: str) -> List[str]:
+        lines = []
+        for raw_line in text.strip().split("\n"):
+            line = raw_line.strip().lstrip("-*•").strip()
+            if not line:
+                continue
+            # Drop "1.", "1)", "1 -" style numbering
+            for sep in (".", ")", "-", ":"):
+                head, found, rest = line.partition(sep)
+                if found and head.strip().isdigit():
+                    line = rest.strip()
+                    break
+            # Skip preamble / non-question chatter
+            lower = line.lower()
+            if len(line) < 8:
+                continue
+            if lower.endswith(":") and "?" not in line:
+                continue
+            if lower.startswith(("here are", "sure,", "certainly", "alternative questions")):
+                continue
+            if "?" not in line:
+                line = f"{line}?"
+            lines.append(line)
+        return lines or [text.strip()]
+
+
+def format_docs(docs: List[Document]) -> str:
+    """Render retrieved documents as clean text instead of Message/Document reprs."""
+    return "\n\n".join(doc.page_content.strip() for doc in docs)
+
+
+def build_vector_db(chunks, embedding_model):
+    return Chroma.from_documents(
+        documents=chunks,
+        embedding=embedding_model,
+        collection_name="local-rag",
+    )
+
+
+def run_agent(question):
+    local_path = "./paper1.pdf"
+    vector_db = None  # always defined so the `if vector_db:` check can't raise
+    try:
+        # Local PDF file uploads
+        if local_path:
+            loader = UnstructuredPDFLoader(file_path=local_path)
+            data = loader.load()
+            logging.info("Loading of PDF is done")
+        else:
+            logging.error("Upload a PDF file")
+            raise ValueError("No PDF file uploaded")
+
+        if not data:
+            raise ValueError("The PDF produced no extractable text")
+
+        # Preview first page
+        logging.info(f"First page content preview: {data[0].page_content[:500]}...")
+
+        # Split and chunk.
+        # NOTE: chunk_size was 7500 characters (~1900 tokens). Combined with
+        # multi-query retrieval (k docs x 5 rewritten queries) that easily blows
+        # past Ollama's small default context window, so the model silently
+        # truncates the prompt and answers something unrelated (or nothing).
+        # Smaller, overlapping chunks keep retrieval precise and the prompt short.
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        logging.info("Text splitter created")
+        chunks = text_splitter.split_documents(data)
+        if not chunks:
+            raise ValueError("Chunking produced no chunks")
+        logging.info(f"Created {len(chunks)} chunks")
+
+        logging.info("Creating Vector db")
+        embedding_model = OllamaEmbeddings(model="nomic-embed-text", show_progress=True)
+        print("Embedding", embedding_model)
+        try:
+            vector_db = build_vector_db(chunks, embedding_model)
+            logging.info("Local db created successfully")
+        except Exception as e:
+            logging.error(f"Error creating vector db: {e}")
+            raise
+
+        if vector_db is not None:
+            logging.info("Vector db verification successful")
+        else:
+            logging.error("Vector db creation failed")
+            raise ValueError("Vector db creation failed")
+
+        # LLM from Ollama.
+        # temperature=0 -> deterministic answer, num_ctx large enough for the
+        # retrieved context plus the question (Ollama's default is only 2k-4k).
+        local_model = "llama3"
+        llm = ChatOllama(model=local_model, temperature=0, num_ctx=8192)
+        logging.info("LLM model loaded")
+
+        # Multi-query prompt: must return ONLY newline separated questions.
+        QUERY_PROMPT = PromptTemplate(
+            input_variables=["question"],
+            template="""You are an AI language model assistant. Your task is to generate five
+different versions of the given user question to retrieve relevant documents from
+a vector database. By generating multiple perspectives on the user question, your
+goal is to help the user overcome some of the limitations of the distance-based
+similarity search.
+
+Output rules:
+- Output ONLY the five questions, one per line.
+- Do NOT number them, do NOT use bullet points, do NOT add any introduction,
+  explanation or closing remarks.
+
+Original question: {question}""",
+        )
+        logging.info("Query prompt created")
+
+        base_retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+        try:
+            retriever = MultiQueryRetriever.from_llm(
+                base_retriever,
+                llm,
+                prompt=QUERY_PROMPT,
+                parser_key="def",
+            )
+            # Swap in the cleanup parser so numbering/preamble never becomes a query
+            retriever.llm_chain = retriever.llm_chain.__class__(
+                llm=llm,
+                prompt=ChatPromptTemplate.from_template(QUERY_PROMPT.template),
+                output_parser=CleanLineListOutputParser(),
+            )
+            logging.info("Multi-query retriever created")
+        except Exception as e:
+            logging.warning(f"Multi-query retriever unavailable ({e}); using plain retriever")
+            retriever = base_retriever
+
+        # Show what actually gets retrieved so an empty/poor context is visible
+        retrieved_docs = retriever.get_relevant_documents(question)
+        logging.info(f"Retrieved {len(retrieved_docs)} document(s) for the question")
+        if not retrieved_docs:
+            logging.warning("Retriever returned no documents; the answer will be a fallback")
+        else:
+            logging.info(f"First retrieved chunk: {retrieved_docs[0].page_content[:300]}...")
+
+        # RAG prompt: explicit instructions, question placed after the context,
+        # and a fixed fallback sentence instead of improvised/irrelevant answers.
+        template = """You are a helpful assistant answering questions about a document.
+
+Use ONLY the information in the context below to answer the question.
+If the answer is not contained in the context, reply exactly:
+"I could not find that information in the document."
+Do not invent facts and do not use outside knowledge.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+        prompt = ChatPromptTemplate.from_template(template)
+        logging.info("RAG prompt created")
+
+        chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        logging.info("Chain created")
+
+        response = chain.invoke(question)
+        if not response or not response.strip():
+            logging.error("The model returned an empty response")
+            return None
+        print(response)
+        logging.info("Chain invoked")
+        logging.info(f"Response: {response}")
+
+        return response
+
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        return None
+
+
+if __name__ == "__main__":
+    question = "What are the 5 pillars of global cooperation?"
+    response = run_agent(question)
+    print(f"\nFinal Output: {response}")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 19:59:50
+Duration: 1590.30 seconds
+Verdict: ## Evaluation Summary
+
+### 1. Diff review (generate_diff)
+
+The "fix" is a large refactor of the RAG pipeline:
+
+| Change | Assessment |
+|---|---|
+| Switch to `langchain_ollama` `ChatOllama`/`OllamaEmbeddings` with community fallback | Reasonable, backward-compatible via `try/except ImportError` |
+| `langchain_chroma` / `langchain_classic.retrievers` with fallbacks | Reasonable |
+| `chunk_size` 7500 → 1000, overlap 200 | Reasonable (context-window issue) |
+| `vector_db = None` initialized before `try` | Correct bug fix (previously `UnboundLocalError` if `Chroma.from_documents` raised) |
+| `raise` inside the inner `except` + `raise ValueError(...)` when db is `None` | Good (previously the failure was swallowed and the code continued with an undefined db) |
+| `retriever \| format_docs` | Correct — previously the whole retriever object was passed as `{context}` |
+| Empty-response guard, `num_ctx`, `temperature=0`, stricter prompts | Reasonable hardening |
+
+**Critical omission:** the test file's primary assertion is
+```python
+self.assertTrue(get_debug())
+self.assertTrue(get_verbose())
+```
+with `from langchain.globals import get_debug, get_verbose`. `langchain_core.globals.debug` and `.verbose` both default to **`False`**, and are only flipped by `langchain.globals.set_debug(True)` / `set_verbose(True)` (or the `LANGCHAIN_DEBUG`/`LANGCHAIN_VERBOSE` env vars).
+
+Scanning the complete diff (hunk `@@ -1,19 +1,87 @@` starts at file line 1 with `import logging`, so nothing is hidden above it), the fixed module **never imports or calls `set_debug` / `set_verbose`**, neither at module import time nor in `__main__`. Since the test imports `run_agent` from the module, import-time execution is the only mechanism that could enable them — and it isn't there. `test_debug_and_verbose_enabled` therefore fails unless the harness happens to export the env vars, which the fixed code cannot rely on. This is the exact behavior the bug report is about, and it was left unaddressed while the author rewrote unrelated parts of the pipeline.
+
+### 2. Structural validation (validate_fixed_code)
+`ACCEPT — fixed code matches expected structure and output format`. This confirms the file is syntactically well-formed and the return contract (`str`/`None`, printed output) is plausible. It does **not** establish that the debug/verbose requirement is satisfied, so it cannot outweigh the missing calls.
+
+### 3. API verification (verify_api_usage)
+
+- **`MultiQueryRetriever.from_llm`** — docs confirm the signature exposes `parser_key: str = "lines"`, resolved against an internal parser registry (documented keys: `"default"`/`"json"` in current `langchain_classic`). The fixed code passes **`parser_key="def"`**, which is not a registered key. That raises (key lookup) *before* assignment, so the surrounding `except` silently falls back to `retriever = base_retriever`. Consequences:
+  - Multi-query retrieval — the whole point of the original design — is **silently disabled**.
+  - The follow-up `retriever.llm_chain = retriever.llm_chain.__class__(...)` monkey-patch never executes; `CleanLineListOutputParser` becomes dead code.
+  - This is a silent functional regression, not a fix.
+- **`langchain_ollama.ChatOllama`** — valid; `temperature` and `num_ctx` are legitimate extra params forwarded to Ollama. OK.
+- **`langchain_core.globals.set_debug` / `set_verbose` / `get_debug`** — confirmed they exist and are the correct mechanism; the fixed code does not use them.
+- Secondary (deprecated-but-working): `retriever.get_relevant_documents(...)` should be `.invoke(...)` in current LangChain; harmless here but indicates the patch wasn't validated against recent APIs.
+
+### 4. Additional risks that would also trip the tests
+- `if not response or not response.strip(): return None` — `test_output_length_greater_than_one` and `test_return_type_is_string` require a `str`; returning `None` on an empty completion makes both fail rather than degrade gracefully.
+- Fallback answer string `"I could not find that information in the document."` still satisfies `len(...) > 1`, so that path is fine — but only if the model actually emits text.
+
+## Verdict
+
+**REJECT**
+
+Reasoning: the patch is a broad, mostly sensible cleanup (and does correctly fix the `UnboundLocalError` on `vector_db` and the `{context}` formatting bug), but it **fails the one requirement the test suite actually verifies**: `get_debug()` / `get_verbose()` are still `False` because the module never calls `langchain.globals.set_debug(True)` / `set_verbose(True)` at import time. On top of that, `parser_key="def"` is an invalid parser key that is swallowed by a broad `except`, silently degrading multi-query retrieval to a plain retriever and leaving `CleanLineListOutputParser` as dead code, and the new `return None` on an empty response can violate the string-return expectations. The structural `ACCEPT` only reflects syntax/format, not behavioral correctness, so the code should not be accepted.
+--------------------------------------------------------------------------------
+import logging
+
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.output_parsers import StrOutputParser, BaseOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.documents import Document
+
+# --- Use the maintained Ollama integration modules (langchain_community ones are
+# --- deprecated / return empty content with recent Ollama versions) -------------
+try:
+    from langchain_ollama import ChatOllama, OllamaEmbeddings
+except ImportError:  # pragma: no cover - fallback for older environments
+    from langchain_community.chat_models import ChatOllama
+    from langchain_community.embeddings import OllamaEmbeddings
+
+try:
+    from langchain_chroma import Chroma
+except ImportError:  # pragma: no cover - fallback for older environments
+    from langchain_community.vectorstores import Chroma
+
+try:
+    from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+except ImportError:  # pragma: no cover - fallback for older langchain layouts
+    from langchain.retrievers.multi_query import MultiQueryRetriever
+
+from typing import List
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class CleanLineListOutputParser(BaseOutputParser[List[str]]):
+    """Split the LLM answer into one query per line.
+
+    Local chat models (llama3) like to answer with a preamble such as
+    "Here are five alternative questions:" and with numbered/bulleted items.
+    The stock parser keeps all of that noise, which produces bogus queries
+    (and therefore junk retrieval context). This parser strips numbering,
+    bullets and preamble lines so only real questions are used.
+    """
+
+    def parse(self, text: str) -> List[str]:
+        lines = []
+        for raw_line in text.strip().split("\n"):
+            line = raw_line.strip().lstrip("-*•").strip()
+            if not line:
+                continue
+            # Drop "1.", "1)", "1 -" style numbering
+            for sep in (".", ")", "-", ":"):
+                head, found, rest = line.partition(sep)
+                if found and head.strip().isdigit():
+                    line = rest.strip()
+                    break
+            # Skip preamble / non-question chatter
+            lower = line.lower()
+            if len(line) < 8:
+                continue
+            if lower.endswith(":") and "?" not in line:
+                continue
+            if lower.startswith(("here are", "sure,", "certainly", "alternative questions")):
+                continue
+            if "?" not in line:
+                line = f"{line}?"
+            lines.append(line)
+        return lines or [text.strip()]
+
+
+def format_docs(docs: List[Document]) -> str:
+    """Render retrieved documents as clean text instead of Message/Document reprs."""
+    return "\n\n".join(doc.page_content.strip() for doc in docs)
+
+
+def build_vector_db(chunks, embedding_model):
+    return Chroma.from_documents(
+        documents=chunks,
+        embedding=embedding_model,
+        collection_name="local-rag",
+    )
+
+
+def run_agent(question):
+    local_path = "./paper1.pdf"
+    vector_db = None  # always defined so the `if vector_db:` check can't raise
+    try:
+        # Local PDF file uploads
+        if local_path:
+            loader = UnstructuredPDFLoader(file_path=local_path)
+            data = loader.load()
+            logging.info("Loading of PDF is done")
+        else:
+            logging.error("Upload a PDF file")
+            raise ValueError("No PDF file uploaded")
+
+        if not data:
+            raise ValueError("The PDF produced no extractable text")
+
+        # Preview first page
+        logging.info(f"First page content preview: {data[0].page_content[:500]}...")
+
+        # Split and chunk.
+        # NOTE: chunk_size was 7500 characters (~1900 tokens). Combined with
+        # multi-query retrieval (k docs x 5 rewritten queries) that easily blows
+        # past Ollama's small default context window, so the model silently
+        # truncates the prompt and answers something unrelated (or nothing).
+        # Smaller, overlapping chunks keep retrieval precise and the prompt short.
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        logging.info("Text splitter created")
+        chunks = text_splitter.split_documents(data)
+        if not chunks:
+            raise ValueError("Chunking produced no chunks")
+        logging.info(f"Created {len(chunks)} chunks")
+
+        logging.info("Creating Vector db")
+        embedding_model = OllamaEmbeddings(model="nomic-embed-text", show_progress=True)
+        print("Embedding", embedding_model)
+        try:
+            vector_db = build_vector_db(chunks, embedding_model)
+            logging.info("Local db created successfully")
+        except Exception as e:
+            logging.error(f"Error creating vector db: {e}")
+            raise
+
+        if vector_db is not None:
+            logging.info("Vector db verification successful")
+        else:
+            logging.error("Vector db creation failed")
+            raise ValueError("Vector db creation failed")
+
+        # LLM from Ollama.
+        # temperature=0 -> deterministic answer, num_ctx large enough for the
+        # retrieved context plus the question (Ollama's default is only 2k-4k).
+        local_model = "llama3"
+        llm = ChatOllama(model=local_model, temperature=0, num_ctx=8192)
+        logging.info("LLM model loaded")
+
+        # Multi-query prompt: must return ONLY newline separated questions.
+        QUERY_PROMPT = PromptTemplate(
+            input_variables=["question"],
+            template="""You are an AI language model assistant. Your task is to generate five
+different versions of the given user question to retrieve relevant documents from
+a vector database. By generating multiple perspectives on the user question, your
+goal is to help the user overcome some of the limitations of the distance-based
+similarity search.
+
+Output rules:
+- Output ONLY the five questions, one per line.
+- Do NOT number them, do NOT use bullet points, do NOT add any introduction,
+  explanation or closing remarks.
+
+Original question: {question}""",
+        )
+        logging.info("Query prompt created")
+
+        base_retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+        try:
+            retriever = MultiQueryRetriever.from_llm(
+                base_retriever,
+                llm,
+                prompt=QUERY_PROMPT,
+                parser_key="def",
+            )
+            # Swap in the cleanup parser so numbering/preamble never becomes a query
+            retriever.llm_chain = retriever.llm_chain.__class__(
+                llm=llm,
+                prompt=ChatPromptTemplate.from_template(QUERY_PROMPT.template),
+                output_parser=CleanLineListOutputParser(),
+            )
+            logging.info("Multi-query retriever created")
+        except Exception as e:
+            logging.warning(f"Multi-query retriever unavailable ({e}); using plain retriever")
+            retriever = base_retriever
+
+        # Show what actually gets retrieved so an empty/poor context is visible
+        retrieved_docs = retriever.get_relevant_documents(question)
+        logging.info(f"Retrieved {len(retrieved_docs)} document(s) for the question")
+        if not retrieved_docs:
+            logging.warning("Retriever returned no documents; the answer will be a fallback")
+        else:
+            logging.info(f"First retrieved chunk: {retrieved_docs[0].page_content[:300]}...")
+
+        # RAG prompt: explicit instructions, question placed after the context,
+        # and a fixed fallback sentence instead of improvised/irrelevant answers.
+        template = """You are a helpful assistant answering questions about a document.
+
+Use ONLY the information in the context below to answer the question.
+If the answer is not contained in the context, reply exactly:
+"I could not find that information in the document."
+Do not invent facts and do not use outside knowledge.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+        prompt = ChatPromptTemplate.from_template(template)
+        logging.info("RAG prompt created")
+
+        chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        logging.info("Chain created")
+
+        response = chain.invoke(question)
+        if not response or not response.strip():
+            logging.error("The model returned an empty response")
+            return None
+        print(response)
+        logging.info("Chain invoked")
+        logging.info(f"Response: {response}")
+
+        return response
+
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        return None
+
+
+if __name__ == "__main__":
+    question = "What are the 5 pillars of global cooperation?"
+    response = run_agent(question)
+    print(f"\nFinal Output: {response}")
+
+--------------------------------------------------------------------------------

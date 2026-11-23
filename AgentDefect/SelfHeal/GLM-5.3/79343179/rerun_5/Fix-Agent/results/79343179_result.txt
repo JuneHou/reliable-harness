@@ -1,0 +1,602 @@
+Case ID: 79343179
+Status: ACCEPTED
+Final Attempt: 3
+Start Time: 2026-11-09 05:38:23
+End Time: 2026-11-09 06:02:33
+Total Duration: 1449.71 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import pandas as pd
+from langchain.agents import AgentExecutor, create_react_agent, Tool
+from langchain.tools import tool
+from langchain_community.tools import ShellTool
+from langchain_openai import ChatOpenAI
+from langchain_experimental.utilities import PythonREPL
+from langchain import hub
+import dotenv
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Shared result store: this is the bridge between the agent's tool calls and
+# the calling script's local scope. Objects placed here survive the agent run.
+# ---------------------------------------------------------------------------
+RESULT_STORE = {}
+
+# ---------------------------------------------------------------------------
+# Shared REPL globals: passing the same globals dict to PythonREPL means any
+# variable the agent assigns via python_repl (e.g. df = ...) is written into
+# this dict, so it is retrievable from the main script after invoke().
+# ---------------------------------------------------------------------------
+SHARED_GLOBALS = {}
+
+
+@tool
+def load_excel_response(filepath: str):
+    """Load an Excel file and return a transformed DataFrame."""
+    df = pd.read_excel(filepath, skiprows=2, names=['responses']).reset_index(drop=True)
+    df = df.select_dtypes(include=['object'])
+
+    # Persist the real DataFrame object in the shared store so the calling
+    # script can retrieve it after agent_executor.invoke() finishes. Without
+    # this, the LLM only sees a string summary and the object is lost.
+    RESULT_STORE['df'] = df
+    # Also make it visible to the REPL in case the agent manipulates it later.
+    SHARED_GLOBALS['df'] = df
+
+    # Keep the observation returned to the LLM compact -- a full DataFrame
+    # repr would blow up the context. The real object is in RESULT_STORE.
+    return (
+        f"Loaded Excel file '{filepath}' into a DataFrame named 'df' "
+        f"with shape {df.shape}. The DataFrame object has been stored and is "
+        f"available to the caller under the key 'df'."
+    )
+
+
+def run_agent(user_prompt, file_name="data.json"):
+    llm = ChatOpenAI(model='gpt-4o-mini')
+
+    # Give the REPL a shared globals dict: variables the agent creates at
+    # runtime (e.g. "df = ...") land in SHARED_GLOBALS instead of a throwaway
+    # isolated namespace, making them retrievable from the main script.
+    python_repl = PythonREPL(_globals=SHARED_GLOBALS)
+    shell_tool = ShellTool()
+
+    repl_tool = Tool(
+        name="python_repl",
+        description=(
+            "Run Python commands in a REPL environment. Variables you define "
+            "here (e.g. df) persist across calls and are shared with the "
+            "calling script."
+        ),
+        func=python_repl.run,
+    )
+
+    tools_list = [load_excel_response, repl_tool, shell_tool]
+    prompt = hub.pull("hwchase17/react")
+
+    shell_agent = create_react_agent(llm=llm, tools=tools_list, prompt=prompt)
+    # return_intermediate_steps=True keeps the (action, observation) pairs,
+    # which is how the DataFrame observation can also be surfaced alongside
+    # the final answer dict instead of being silently discarded.
+    agent_executor = AgentExecutor(
+        agent=shell_agent,
+        tools=tools_list,
+        verbose=True,
+        return_intermediate_steps=True,
+        handle_parsing_errors=True,
+    )
+
+    response = agent_executor.invoke({"input": user_prompt})
+
+    # Attach the real DataFrame (and anything the agent assigned in the REPL)
+    # to the response so the caller gets the object, not just a summary dict.
+    response['df'] = RESULT_STORE.get('df')
+    response['repl_variables'] = {k: v for k, v in SHARED_GLOBALS.items() if k != '__builtins__'}
+    return response
+
+
+if __name__ == "__main__":
+    path = 'excel_file.xlsx'
+    user_prompt = f"Load the Excel file located at {path} and assign the result to a variable named df."
+
+    result = run_agent(user_prompt)
+    print(result)
+
+    # The actual DataFrame created during agent execution, now accessible as
+    # a local variable in the main script:
+    df = result.get('df')
+    if df is not None:
+        print("\nRetrieved DataFrame from agent execution:")
+        print(df.head())
+    else:
+        print("\nDataFrame was not produced by the agent; available REPL variables:",
+              list(result.get('repl_variables', {}).keys()))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 05:41:18
+Duration: 174.99 seconds
+Verdict: The API verification results were inconclusive (generic documentation), but the structural analysis of the diff against the test code reveals critical problems. Let me analyze the findings:
+
+## Analysis
+
+**What the test requires:**
+1. `result = run_agent(user_prompt, file_name=output_file)` must return a **dict** or a **list of dicts**
+2. A JSON file must be **written to `file_name`** (`os.path.exists(output_file)` must be True)
+3. The file content must be valid JSON (dict or list of dicts)
+
+**What the fixed code actually does:**
+
+1. **Breaks the return contract.** The fix changed the return to `return response, df` — a **tuple** of `(dict, DataFrame)`. The test checks `isinstance(result, dict)` → `False`, and `isinstance(result, list)` → `False`. Therefore `valid = False` and `self.assertTrue(valid)` **fails immediately**. Notably, this is a regression: the *buggy* code returned `response` (a dict from `agent_executor.invoke`), which would have passed the first assertion. The "fix" made the return type worse.
+
+2. **The `file_name` parameter is completely ignored.** There is no `json.dump`, no file-writing logic anywhere in the fixed code. The test deletes `test_output.json` if it exists, then asserts `os.path.exists(output_file)` — which will be **False**. The core bug (serializing the DataFrame to JSON and writing it to `file_name`) was never addressed.
+
+3. **Conceptual misunderstanding in the fix.** The comments claim the tool "runs in a separate sandbox," but the `@tool`-decorated `load_excel_response` executes in the main process — the `AGENT_RESULT_STORE` mechanism works, but it solves a problem the test doesn't ask about (returning the raw DataFrame object to the caller). The test explicitly wants **JSON output written to a file**, not a live DataFrame object.
+
+4. **Dead/incorrect fallback logic.** The `intermediate_steps` fallback checks `isinstance(obs, pd.DataFrame)`, but ReAct tool observations are always strings — this branch can never succeed. Harmless, but indicates the fix wasn't reasoned against actual LangChain behavior.
+
+5. **The `__main__` block** was updated to unpack `result, df = run_agent(...)`, showing the author was aware of the tuple return — confirming this was an intentional (but test-breaking) design change.
+
+**Verdict: REJECT**
+
+The fixed code fails both critical test assertions:
+- **Assertion 1 fails**: `run_agent` returns a tuple, not a dict or list of dicts.
+- **Assertion 2 fails**: No JSON file is ever written to the `file_name` parameter.
+
+The fundamental bug — that `run_agent` should serialize the loaded DataFrame to JSON, write it to `file_name`, and return JSON-serializable data (e.g., `df.to_dict(orient='records')`) — remains completely unaddressed. Instead, the fix went in an orthogonal direction (returning a live DataFrame object via a global store), which actively breaks the test's interface contract and would cause an `AssertionError` on the very first assertion.
+--------------------------------------------------------------------------------
+import pandas as pd
+from langchain.agents import AgentExecutor, create_react_agent, Tool
+from langchain.tools import tool
+from langchain_community.tools import ShellTool
+from langchain_openai import ChatOpenAI
+from langchain_experimental.utilities import PythonREPL
+from langchain import hub
+import dotenv
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# 1) The agent's sandbox is *separate* from our script, so anything the agent
+#    builds lives (and dies) inside that sandbox.  The only channel back to
+#    our script is a plain Python dict that both sides can see.
+#    The corrected tool stores the real DataFrame object in this dict, so the
+#    caller can grab the object itself instead of relying on the summary text
+#    returned by agent_executor.invoke().
+# ---------------------------------------------------------------------------
+AGENT_RESULT_STORE = {}
+
+
+@tool
+def load_excel_response(filepath: str) -> str:
+    """Load an Excel file and return a transformed DataFrame."""
+    try:
+        df = pd.read_excel(filepath, skiprows=2, names=['responses']).reset_index(drop=True)
+        df = df.select_dtypes(include=['object'])
+    except Exception as e:
+        # If the file cannot be read, report it back to the agent instead of
+        # letting the raw exception abort the whole run.
+        return f"ERROR: could not load the Excel file: {e}"
+
+    # Hand the real DataFrame object back to the calling scope.
+    AGENT_RESULT_STORE['df'] = df
+
+    # The agent still needs a compact, textual observation to reason over —
+    # a full DataFrame is not a good LLM observation.  A serialisable summary
+    # (with a clear marker that the object is available) works much better
+    # than dumping the raw repr of the DataFrame.
+    return (
+        f"Loaded {len(df)} rows from {filepath}. "
+        f"The DataFrame has been stored as the variable 'df' in the shared "
+        f"result store. "
+        f"Columns: {list(df.columns)}. "
+        f"First rows:\n{df.head().to_string()}"
+    )
+
+
+def run_agent(user_prompt, file_name="data.json"):
+    llm = ChatOpenAI(model='gpt-4o-mini')
+    python_repl = PythonREPL()
+    shell_tool = ShellTool()
+
+    # Each agent run starts from a clean result store so previous runs cannot
+    # leak stale DataFrames into the result we hand back.
+    AGENT_RESULT_STORE.clear()
+
+    repl_tool = Tool(
+        name="python_repl",
+        description=(
+            "Run Python commands in a REPL environment. "
+            "You can reference the variable 'df' that was loaded by "
+            "load_excel_response."
+        ),
+        func=python_repl.run,
+    )
+
+    tools_list = [load_excel_response, repl_tool, shell_tool]
+    prompt = hub.pull("hwchase17/react")
+
+    shell_agent = create_react_agent(llm=llm, tools=tools_list, prompt=prompt)
+    agent_executor = AgentExecutor(
+        agent=shell_agent,
+        tools=tools_list,
+        verbose=True,
+        return_intermediate_steps=True,  # keep tool outputs, not just the final answer
+        handle_parsing_errors=True,      # don't die on malformed ReAct output
+    )
+
+    # Clear the PythonREPL sandbox between runs so 'df' from a previous run
+    # cannot be mistaken for the current run's DataFrame.
+    try:
+        python_repl.locals.clear()
+    except Exception:
+        pass
+
+    response = agent_executor.invoke({"input": user_prompt})
+
+    # 'response' is only the agent's textual answer — never the DataFrame
+    # itself.  The real object lives in AGENT_RESULT_STORE.
+    df = AGENT_RESULT_STORE.get('df')
+
+    if df is None:
+        # Fallback: the tool may have been run via python_repl (or another
+        # path) instead of load_excel_response.  Try to recover the object
+        # straight out of the agent's sandbox.
+        try:
+            sandbox_df = python_repl.locals.get('df')
+            if isinstance(sandbox_df, pd.DataFrame):
+                df = sandbox_df
+        except Exception:
+            df = None
+
+    if df is None:
+        # Last resort: try to pull the DataFrame out of the recorded
+        # intermediate tool observations.
+        try:
+            for step in response.get("intermediate_steps", []):
+                obs = step[1] if isinstance(step, (list, tuple)) and len(step) > 1 else None
+                if isinstance(obs, pd.DataFrame):
+                    df = obs
+                    break
+        except Exception:
+            df = None
+
+    return response, df
+
+
+if __name__ == "__main__":
+    path = 'excel_file.xlsx'
+    user_prompt = f"Load the Excel file located at {path} and assign the result to a variable named df."
+    result, df = run_agent(user_prompt)
+
+    # result -> the summary dict returned by the agent (input/output/intermediate_steps)
+    print(result)
+
+    # df -> the actual DataFrame object created inside the agent run,
+    # now available as a normal local variable in the main script.
+    if df is not None:
+        print("\nDataFrame retrieved from the agent run:")
+        print(df.head())
+        print(f"shape: {df.shape}")
+    else:
+        print("\nNo DataFrame could be retrieved from the agent run.")
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-09 05:55:22
+Duration: 843.73 seconds
+Verdict: I now have all the information I need. The API verification tool returned mostly irrelevant results (generic Microsoft/LangChain landing pages, no specific API documentation), so I'll rely on careful code analysis combined with the diff and validation results.
+
+## Evaluation Analysis
+
+### What the fix does well
+The diff shows the fix addresses a real underlying bug with a thoughtful pattern:
+- **Correct diagnosis**: `agent_executor.invoke()` only returns a text summary (`{"input": ..., "output": ...}`); a DataFrame returned from a tool is lost in the ReAct text-only loop. The `RESULT_STORE` global bridges this gap.
+- **ReAct compliance**: The tool now returns a string observation instead of a raw DataFrame, which is required for the ReAct loop to function.
+- **Robustness**: Error handling inside the tool, `handle_parsing_errors=True` on the executor, and informative tool descriptions.
+
+### Critical failure: the test will not pass
+
+Walking through `TestRunAgentJSONResponse.test_response_is_json` against the fixed code:
+
+1. **`result` is a dict** — ✅ PASSES. `agent_executor.invoke()` returns a dict, and adding `response["dataframe"]` keeps it a dict.
+
+2. **`self.assertTrue(os.path.exists(output_file))`** — ❌ **FAILS**. This is the decisive problem:
+   - The test calls `run_agent(user_prompt, file_name="test_output.json")`.
+   - The fixed code **accepts `file_name` but never uses it anywhere** — there is no file-writing code in the entire fixed module. The parameter is dead code.
+   - The test explicitly deletes `test_output.json` before running and then asserts it exists afterward, so the file must be created *during* `run_agent`.
+   - **The agent cannot compensate**: the output filename is never communicated to the LLM (not in the user prompt, not in any tool description), so even if gpt-4o-mini used `python_repl` or `shell_tool` to dump JSON, it has no way to know the target is `test_output.json`.
+
+3. **`json.load(f)` on the file content** — ❌ Unreachable/moot, since the file never exists; and nothing in the fix guarantees valid dict/list-of-dicts JSON content even if it did.
+
+### Secondary concerns
+- `python_repl._globals["RESULT_STORE"] = RESULT_STORE` accesses a private attribute of `PythonREPL` — in several `langchain_experimental`/pydantic versions the field is exposed as `globals` (with `_globals` as a construction alias), so this line is fragile and may raise `AttributeError` depending on the installed version.
+- `response["dataframe"]` embeds a non-JSON-serializable DataFrame into the returned dict — harmless for the `isinstance(result, dict)` check, but inconsistent with the "JSON response" contract the test establishes.
+
+### What a passing fix would require
+After `invoke()`, the code must serialize the result (e.g., `RESULT_STORE["df"].to_json(orient="records")` or parsing the agent's JSON output), **write it to `file_name`** via `json.dump`/`df.to_json`, and return the parsed JSON data. The validated structural checks (imports, signature, dict return type) all pass, but the structural validator does not cover this side-effect requirement.
+
+## Verdict: **REJECT**
+
+**Reasoning**: While the fix correctly solves the "DataFrame object lost across the ReAct boundary" problem via `RESULT_STORE`, it completely ignores the `file_name` parameter — no code path writes the JSON output file. The test's explicit assertions `self.assertTrue(os.path.exists(output_file))` and the subsequent `json.load(f)` validation will fail because `test_output.json` is never created, and the agent has no knowledge of the target filename. A correct fix must serialize the loaded data to JSON and write it to `file_name` before returning.
+--------------------------------------------------------------------------------
+import dotenv
+import pandas as pd
+from langchain import hub
+from langchain.agents import AgentExecutor, Tool, create_react_agent
+from langchain.tools import tool
+from langchain_community.tools import ShellTool
+from langchain_experimental.utilities import PythonREPL
+from langchain_openai import ChatOpenAI
+
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Shared object store.
+#
+# Why: agent_executor.invoke() only returns a text summary dict
+# ({"input": ..., "output": "..."}) produced by the LLM. The ReAct loop is a
+# text-only pipeline, so any Python object (like a DataFrame) created inside a
+# tool is lost unless we capture it somewhere the calling script can reach.
+# This store is that bridge: the tool writes the real object here, and the
+# main script reads it out after invoke() completes.
+# ---------------------------------------------------------------------------
+RESULT_STORE = {}
+
+
+@tool
+def load_excel_response(filepath: str) -> str:
+    """Load an Excel file, transform it, and store the resulting DataFrame in the shared RESULT_STORE under the key 'df'. Returns a confirmation string."""
+    try:
+        df = (
+            pd.read_excel(filepath, skiprows=2, names=["responses"])
+            .reset_index(drop=True)
+            .select_dtypes(include=["object"])
+        )
+
+        # Store the ACTUAL DataFrame object so the main script can use it
+        # as a normal pandas object (df.head(), df.shape, etc.).
+        RESULT_STORE["df"] = df
+
+        # Tools must return a string observation for the LLM to read in the
+        # ReAct loop. Returning the raw DataFrame here is what previously
+        # prevented the object from ever reaching the caller.
+        return (
+            f"Loaded DataFrame from '{filepath}' and stored it in the shared "
+            f"store under key 'df' (rows={len(df)}, columns={list(df.columns)})."
+        )
+    except Exception as exc:
+        # Never raise out of a tool: return an error string the agent can
+        # react to instead of crashing the executor loop.
+        return f"Error loading Excel file '{filepath}': {exc}"
+
+
+def run_agent(user_prompt, file_name="data.json"):
+    llm = ChatOpenAI(model="gpt-4o-mini")
+    python_repl = PythonREPL()
+    shell_tool = ShellTool()
+
+    # Expose the store to the REPL so the agent can inspect/transform the
+    # DataFrame if it runs python_repl commands.
+    python_repl._globals["RESULT_STORE"] = RESULT_STORE
+
+    repl_tool = Tool(
+        name="python_repl",
+        description=(
+            "Run Python commands in a REPL environment. "
+            "The loaded DataFrame is available as RESULT_STORE['df'] "
+            "(a pandas DataFrame) if you need to inspect or transform it."
+        ),
+        func=python_repl.run,
+    )
+
+    tools_list = [load_excel_response, repl_tool, shell_tool]
+    prompt = hub.pull("hwchase17/react")
+
+    shell_agent = create_react_agent(llm=llm, tools=tools_list, prompt=prompt)
+    agent_executor = AgentExecutor(
+        agent=shell_agent,
+        tools=tools_list,
+        verbose=True,
+        handle_parsing_errors=True,  # don't die on malformed LLM steps
+    )
+
+    # invoke() returns only the text summary, e.g.
+    # {"input": "...", "output": "I loaded the file and assigned it to df."}
+    response = agent_executor.invoke({"input": user_prompt})
+
+    # Pull the real object out of the shared store and attach it to the
+    # response so the caller gets both the summary AND the DataFrame.
+    response["dataframe"] = RESULT_STORE.get("df")
+    return response
+
+
+if __name__ == "__main__":
+    path = "excel_file.xlsx"
+    user_prompt = (
+        f"Load the Excel file located at {path} using the load_excel_response "
+        f"tool and assign the result to a variable named df."
+    )
+    result = run_agent(user_prompt)
+
+    # The agent's textual answer (what was previously the ONLY thing returned).
+    print("Agent output:", result.get("output"))
+
+    # The actual DataFrame object, now usable as a local variable.
+    df = result.get("dataframe")
+    if df is not None:
+        print("Retrieved object type:", type(df))
+        print("Shape:", df.shape)
+        print(df.head())
+    else:
+        print("No DataFrame was produced; check the agent trace above.")
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-09 06:02:33
+Duration: 430.99 seconds
+Verdict: ## Evaluation of Case 79343179
+
+### 1. Diff Analysis
+
+The fix makes these changes:
+- Adds a module-level `RESULT_STORE` and `SHARED_GLOBALS` dict
+- `load_excel_response` now stores the real DataFrame in both stores and returns a compact **string summary** to the LLM (instead of the raw DataFrame)
+- `PythonREPL(_globals=SHARED_GLOBALS)` so agent-assigned variables are retrievable
+- `AgentExecutor(..., return_intermediate_steps=True, handle_parsing_errors=True)`
+- Attaches `response['df']` and `response['repl_variables']` to the invoke result
+
+### 2. Structural Validation
+
+`validate_fixed_code` returned **ACCEPT** — the code is syntactically valid, imports resolve, and `run_agent(user_prompt, file_name=...)` matches the signature the test calls.
+
+### 3. API Verification
+
+The verification tool only returned generic LangChain overview pages with no parameter-level documentation. Based on the known `langchain_experimental` API:
+- `PythonREPL(_globals=...)` — valid (Pydantic fields use `_globals`/`_locals` aliases)
+- `AgentExecutor(return_intermediate_steps=..., handle_parsing_errors=...)` — valid parameters
+- `create_react_agent(llm, tools, prompt)`, `hub.pull(...)` — unchanged from original, valid
+
+No API misuse detected.
+
+### 4. Functional Analysis Against the Test — **Critical Failure**
+
+The test requires three things:
+1. ✅ `result` is a dict — `AgentExecutor.invoke()` returns a dict (adding `'df'`/`'repl_variables'` keys keeps it a dict)
+2. ❌ **`os.path.exists("test_output.json")` must be True**
+3. ❌ **The file must contain valid JSON (dict or list of dicts)**
+
+The fixed code **never writes the output file**:
+- The `file_name` parameter of `run_agent` is accepted but **completely unused** — there is no `json.dump()`, no `open(file_name, 'w')`, no `df.to_json(file_name)` anywhere in the fixed code.
+- The file name is also never injected into the agent's prompt, and the test's user prompt ("return it is a json. ONLY RETURN THE JSON") never asks the agent to save a file — so the LLM agent cannot possibly know to create a file named `test_output.json`.
+- The diff even removed the only JSON-related code (`# df.to_json()`) without replacing it with actual serialization/persistence logic.
+
+Therefore, the test will fail at `self.assertTrue(os.path.exists(output_file))` (and would then crash at `json.load(f)` with `FileNotFoundError`). The fix addresses a real concern (DataFrame objects being lost after `invoke()`, context blowup from full DataFrame reprs) but completely misses the test's core requirement of persisting the JSON result to the specified output file. A correct fix would include something like:
+
+```python
+df = RESULT_STORE.get('df')
+if df is not None:
+    with open(file_name, "w", encoding="utf-8") as f:
+        f.write(df.to_json(orient='records'))
+```
+
+Minor additional concerns: module-level `RESULT_STORE`/`SHARED_GLOBALS` leak state across multiple `run_agent` calls, and the response dict now embeds a non-JSON-serializable DataFrame.
+
+## Verdict: **REJECT**
+
+**Reasoning:** While the structural validation passed and all API usage is correct, the fix fails the functional test requirements. The test explicitly requires `run_agent(user_prompt, file_name="test_output.json")` to create `test_output.json` containing valid JSON (a dict or list of dicts). The fixed code accepts the `file_name` parameter but never uses it — no file is written anywhere, and the agent has no knowledge of the output filename. The test will fail at `self.assertTrue(os.path.exists(output_file))`. The fix solves the object-retrieval/context-size problems but omits the essential file-persistence behavior the test validates.
+--------------------------------------------------------------------------------
+import pandas as pd
+from langchain.agents import AgentExecutor, create_react_agent, Tool
+from langchain.tools import tool
+from langchain_community.tools import ShellTool
+from langchain_openai import ChatOpenAI
+from langchain_experimental.utilities import PythonREPL
+from langchain import hub
+import dotenv
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Shared result store: this is the bridge between the agent's tool calls and
+# the calling script's local scope. Objects placed here survive the agent run.
+# ---------------------------------------------------------------------------
+RESULT_STORE = {}
+
+# ---------------------------------------------------------------------------
+# Shared REPL globals: passing the same globals dict to PythonREPL means any
+# variable the agent assigns via python_repl (e.g. df = ...) is written into
+# this dict, so it is retrievable from the main script after invoke().
+# ---------------------------------------------------------------------------
+SHARED_GLOBALS = {}
+
+
+@tool
+def load_excel_response(filepath: str):
+    """Load an Excel file and return a transformed DataFrame."""
+    df = pd.read_excel(filepath, skiprows=2, names=['responses']).reset_index(drop=True)
+    df = df.select_dtypes(include=['object'])
+
+    # Persist the real DataFrame object in the shared store so the calling
+    # script can retrieve it after agent_executor.invoke() finishes. Without
+    # this, the LLM only sees a string summary and the object is lost.
+    RESULT_STORE['df'] = df
+    # Also make it visible to the REPL in case the agent manipulates it later.
+    SHARED_GLOBALS['df'] = df
+
+    # Keep the observation returned to the LLM compact -- a full DataFrame
+    # repr would blow up the context. The real object is in RESULT_STORE.
+    return (
+        f"Loaded Excel file '{filepath}' into a DataFrame named 'df' "
+        f"with shape {df.shape}. The DataFrame object has been stored and is "
+        f"available to the caller under the key 'df'."
+    )
+
+
+def run_agent(user_prompt, file_name="data.json"):
+    llm = ChatOpenAI(model='gpt-4o-mini')
+
+    # Give the REPL a shared globals dict: variables the agent creates at
+    # runtime (e.g. "df = ...") land in SHARED_GLOBALS instead of a throwaway
+    # isolated namespace, making them retrievable from the main script.
+    python_repl = PythonREPL(_globals=SHARED_GLOBALS)
+    shell_tool = ShellTool()
+
+    repl_tool = Tool(
+        name="python_repl",
+        description=(
+            "Run Python commands in a REPL environment. Variables you define "
+            "here (e.g. df) persist across calls and are shared with the "
+            "calling script."
+        ),
+        func=python_repl.run,
+    )
+
+    tools_list = [load_excel_response, repl_tool, shell_tool]
+    prompt = hub.pull("hwchase17/react")
+
+    shell_agent = create_react_agent(llm=llm, tools=tools_list, prompt=prompt)
+    # return_intermediate_steps=True keeps the (action, observation) pairs,
+    # which is how the DataFrame observation can also be surfaced alongside
+    # the final answer dict instead of being silently discarded.
+    agent_executor = AgentExecutor(
+        agent=shell_agent,
+        tools=tools_list,
+        verbose=True,
+        return_intermediate_steps=True,
+        handle_parsing_errors=True,
+    )
+
+    response = agent_executor.invoke({"input": user_prompt})
+
+    # Attach the real DataFrame (and anything the agent assigned in the REPL)
+    # to the response so the caller gets the object, not just a summary dict.
+    response['df'] = RESULT_STORE.get('df')
+    response['repl_variables'] = {k: v for k, v in SHARED_GLOBALS.items() if k != '__builtins__'}
+    return response
+
+
+if __name__ == "__main__":
+    path = 'excel_file.xlsx'
+    user_prompt = f"Load the Excel file located at {path} and assign the result to a variable named df."
+
+    result = run_agent(user_prompt)
+    print(result)
+
+    # The actual DataFrame created during agent execution, now accessible as
+    # a local variable in the main script:
+    df = result.get('df')
+    if df is not None:
+        print("\nRetrieved DataFrame from agent execution:")
+        print(df.head())
+    else:
+        print("\nDataFrame was not produced by the agent; available REPL variables:",
+              list(result.get('repl_variables', {}).keys()))
+
+--------------------------------------------------------------------------------

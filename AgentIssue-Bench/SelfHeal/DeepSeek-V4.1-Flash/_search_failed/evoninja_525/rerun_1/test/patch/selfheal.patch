@@ -1,0 +1,470 @@
+diff --git a/packages/agents/src/agent-core/agent/basicFunctionCallLoop.ts b/packages/agents/src/agent-core/agent/basicFunctionCallLoop.ts
+index b70f2c7..6be8315 100644
+--- a/packages/agents/src/agent-core/agent/basicFunctionCallLoop.ts
++++ b/packages/agents/src/agent-core/agent/basicFunctionCallLoop.ts
+@@ -53,6 +53,9 @@ export async function* basicFunctionCallLoop(
+           continue;
+         }
+         const functionResult = message.content || "";
++        if (!functionResult.length) {
++          continue;
++        }
+         if (result.storeInVariable || context.variables.shouldSave(functionResult)) {
+           const varName = await context.variables.save(name || "", functionResult);
+           message.content = `\${${varName}}`;
+@@ -78,14 +81,24 @@ export async function* basicFunctionCallLoop(
+ }
+ 
+ async function* _preventLoopAndSaveMsg(chat: Chat, response: ChatMessage, loopPreventionPrompt: string, agentSpeakPrompt: string): AsyncGenerator<AgentOutput, void, string | undefined> {
+-  if (chat.messages[chat.messages.length - 1].content === response.content &&
+-    chat.messages[chat.messages.length - 2].content === response.content) {
+-      await chat.temporary("system", loopPreventionPrompt);
+-      yield {
+-        type: AgentOutputType.Warning,
+-        title: "Loop prevention",
+-        content: loopPreventionPrompt
+-      } as AgentOutput;
++  const messages = chat.messages ?? [];
++  const lastMessage: ChatMessage | undefined = messages[messages.length - 1];
++  const prevMessage: ChatMessage | undefined = messages[messages.length - 2];
++
++  // Only treat this as a loop if the agent actually said something,
++  // otherwise two empty contents would look like a repetition.
++  const isRepeating =
++    !!response.content &&
++    lastMessage?.content === response.content &&
++    prevMessage?.content === response.content;
++
++  if (isRepeating) {
++    await chat.temporary("system", loopPreventionPrompt);
++    yield {
++      type: AgentOutputType.Warning,
++      title: "Loop prevention",
++      content: loopPreventionPrompt
++    } as AgentOutput;
+   } else {
+     await chat.temporary([
+       response,
+diff --git a/packages/agents/src/agent-core/chunking/MessageChunker.ts b/packages/agents/src/agent-core/chunking/MessageChunker.ts
+index b470c84..84c0ef9 100644
+--- a/packages/agents/src/agent-core/chunking/MessageChunker.ts
++++ b/packages/agents/src/agent-core/chunking/MessageChunker.ts
+@@ -6,17 +6,36 @@ export class MessageChunker implements Chunker<ChatMessage> {
+   constructor(private readonly config: { maxChunkSize: number }) { }
+ 
+   shouldChunk(message: ChatMessage): boolean {
+-    return JSON.stringify(message.content).length > this.config.maxChunkSize;
++    // `content` may be undefined (e.g. an assistant message that only
++    // contains a `function_call`). `JSON.stringify(undefined)` returns
++    // `undefined`, so calling `.length` on it would throw.
++    const content = message.content ?? "";
++    return content.length > this.config.maxChunkSize;
+   }
+ 
+   chunk(message: ChatMessage): string[] {
+-    return TextChunker.fixedCharacterLength(
+-      message.content || "",
+-      { 
++    const content = message.content ?? "";
++
++    // A message must never produce zero chunks. Otherwise its content
++    // would silently be dropped from the chat, and the caller would
++    // keep re-processing it forever.
++    if (content.length === 0) {
++      return [ JSON.stringify(message) ];
++    }
++
++    const chunks = TextChunker.fixedCharacterLength(
++      content,
++      {
+         chunkLength: this.config.maxChunkSize,
+         overlap: 0.08 * this.config.maxChunkSize
+       }
+-    ).map((chunk) => (JSON.stringify({
++    );
++
++    if (!chunks || chunks.length === 0) {
++      return [ JSON.stringify(message) ];
++    }
++
++    return chunks.map((chunk) => (JSON.stringify({
+       ...message,
+       content: chunk
+     })));
+diff --git a/packages/agents/src/agent-core/chunking/MessageRecombiner.ts b/packages/agents/src/agent-core/chunking/MessageRecombiner.ts
+index 02bd409..88a065b 100644
+--- a/packages/agents/src/agent-core/chunking/MessageRecombiner.ts
++++ b/packages/agents/src/agent-core/chunking/MessageRecombiner.ts
+@@ -2,6 +2,9 @@ import { LocalDocument } from "../embeddings";
+ import { MessageChunk, MsgIdx, ChunkIdx, ChatMessage, ChatLogs, ChatLogType } from "../llm";
+ import { Recombiner } from "../rag/StandardRagBuilder";
+ 
++/** The maximum number of chunks a single message may contribute. */
++const MAX_CHUNKS_PER_MESSAGE = 4;
++
+ export class MessageRecombiner {
+   static standard(
+     tokenLimit: number,
+@@ -14,10 +17,32 @@ export class MessageRecombiner {
+       results: () => Promise<AsyncGenerator<LocalDocument<{ index: number }>>>,
+       originalItems: MessageChunk[],
+     ): Promise<MessageChunk[]> => {
+-      if (calculateTotalTokens(originalItems) < tokenLimit) {
++      if (!originalItems || originalItems.length === 0) {
++        return [];
++      }
++
++      if (calculateTotalTokens(originalItems) <= tokenLimit) {
+         return originalItems;
+       }
+ 
++      // Index the chunks so that we can look them up by `chunkIdx`
++      // (and not by their position within `originalItems`, which is
++      // not guaranteed to be the same thing).
++      const chunkByChunkIdx: Map<ChunkIdx, MessageChunk> = new Map();
++      const posByChunkIdx: Map<ChunkIdx, number> = new Map();
++      const firstChunkIdxByMsgIdx: Map<MsgIdx, ChunkIdx> = new Map();
++
++      originalItems.forEach((item, pos) => {
++        chunkByChunkIdx.set(item.chunkIdx, item);
++        if (!posByChunkIdx.has(item.chunkIdx)) {
++          posByChunkIdx.set(item.chunkIdx, pos);
++        }
++        const firstChunkIdx = firstChunkIdxByMsgIdx.get(item.msgIdx);
++        if (firstChunkIdx === undefined || item.chunkIdx < firstChunkIdx) {
++          firstChunkIdxByMsgIdx.set(item.msgIdx, item.chunkIdx);
++        }
++      });
++
+       const chunks: MessageChunk[] = [];
+       const chunksAdded: Set<ChunkIdx> = new Set();
+       const msgsAdded: Record<MsgIdx, number> = {};
+@@ -25,37 +50,44 @@ export class MessageRecombiner {
+       const canAddTokens = (tokens: number) => tokenCount + tokens <= tokenLimit;
+ 
+       const addChunk = (chunkIdx: ChunkIdx, recursive: boolean = false): boolean => {
+-        const chunk = originalItems[chunkIdx];
+-
+         // Only add a chunk once
+         if (chunksAdded.has(chunkIdx)) {
+           return true;
+-        } else {
+-          chunksAdded.add(chunkIdx);
+         }
+ 
++        const chunk = chunkByChunkIdx.get(chunkIdx);
++
++        // The index does not reference a known chunk (e.g. a stale index
++        // coming from an outdated initial/parametric chunk list).
++        if (!chunk) {
++          return false;
++        }
++
++        const tokens = chunk.tokens ?? 0;
++
+         // Break if we're over the token limit
+-        if (!canAddTokens(chunk.tokens)) {
++        if (!canAddTokens(tokens)) {
+           return false;
+         }
+ 
+         // Only add up to 4 chunks per message
+-        if (!msgsAdded[chunk.msgIdx]) {
+-          msgsAdded[chunk.msgIdx] = 0;
+-        }
+-        if (msgsAdded[chunk.msgIdx] >= 4) {
++        const msgChunksAdded = msgsAdded[chunk.msgIdx] ?? 0;
++        if (msgChunksAdded >= MAX_CHUNKS_PER_MESSAGE) {
+           return true;
+         }
+-        msgsAdded[chunk.msgIdx] += 1;
+ 
++        // Only mark the chunk as added once it is actually added,
++        // so that a chunk rejected for exceeding the token limit can
++        // still be considered later on.
++        chunksAdded.add(chunkIdx);
++        msgsAdded[chunk.msgIdx] = msgChunksAdded + 1;
+         chunks.push(chunk);
+-        tokenCount += chunk.tokens;
++        tokenCount += tokens;
+ 
+-        // Ensure that the first chunk is always added
+-        const firstChunkIdx = originalItems.slice(0, chunkIdx)
+-          .findIndex(item => item.msgIdx === chunk.msgIdx);
++        // Ensure that the first chunk of the message is always added
++        const firstChunkIdx = firstChunkIdxByMsgIdx.get(chunk.msgIdx);
+ 
+-        if (firstChunkIdx !== -1) {
++        if (firstChunkIdx !== undefined && firstChunkIdx !== chunkIdx) {
+           addChunk(firstChunkIdx);
+         }
+ 
+@@ -64,18 +96,18 @@ export class MessageRecombiner {
+         if (!recursive) {
+           const funcPairChunk = tryGetFunctionMessagePair(
+             chunk,
+-            chunkIdx,
++            posByChunkIdx.get(chunkIdx) ?? -1,
+             originalItems,
+             chatLogs,
+             chatLogType
+           );
+-          if (funcPairChunk) {
++          if (funcPairChunk !== undefined) {
+             return addChunk(funcPairChunk, true);
+           }
+         }
+ 
+         return true;
+-      }
++      };
+ 
+       const iterator = await results();
+ 
+@@ -97,7 +129,7 @@ export class MessageRecombiner {
+           addChunk(chunk.chunkIdx);
+         }
+       }
+-      
++
+       // Add any initial chunks
+       for (const chunk of initChunks) {
+         addChunk(chunk);
+@@ -115,48 +147,61 @@ export class MessageRecombiner {
+ }
+ 
+ const calculateTotalTokens = (chunks: MessageChunk[]) => {
+-  return chunks.reduce((acc, chunk) => acc + chunk.tokens, 0);
++  return chunks.reduce((acc, chunk) => acc + (chunk.tokens ?? 0), 0);
+ };
+ 
++/**
++ * Finds the neighbouring chunk of a function call / function result
++ * message, so that they can always be added to the chat together.
++ *
++ * @param chunk - the chunk that was added
++ * @param chunkPos - the position of `chunk` within `originalItems`
++ * @param originalItems - all known chunks, ordered by `chunkIdx`
++ */
+ const tryGetFunctionMessagePair = (
+   chunk: MessageChunk,
+-  chunkIdx: ChunkIdx,
++  chunkPos: number,
+   originalItems: MessageChunk[],
+   chatLogs: ChatLogs,
+   chatLogType: ChatLogType
+ ): ChunkIdx | undefined => {
+-  const msg = JSON.parse(chunk.json) as ChatMessage;
+-
+-  if ((msg.role === "assistant" && "function_call" in msg) || msg.role === "function") {
+-    // Ensure function call + results are always added together.
+-    // We must traverse the chunk array to find the nearest neighbor
+-    const direction = msg.role === "assistant" ? 1 : -1;
+-    const search = msg.role === "assistant" ? "function" : "assistant";
+-    let funcChunkIdx: number | undefined = undefined;
+-    let nextChunkIdx = chunkIdx + direction;
+-
+-    while (!funcChunkIdx) {
+-      if (originalItems.length >= nextChunkIdx || nextChunkIdx < 0) {
+-        break;
+-      }
++  let msg: ChatMessage;
+ 
+-      const msg = chatLogs.getMsg(
+-        chatLogType,
+-        originalItems[nextChunkIdx].msgIdx
+-      );
++  try {
++    msg = JSON.parse(chunk.json) as ChatMessage;
++  } catch {
++    return undefined;
++  }
+ 
+-      if (msg?.role === search) {
+-        // We found it
+-        funcChunkIdx = nextChunkIdx;
+-      } else {
+-        nextChunkIdx += direction;
+-      }
+-    }
++  const isFunctionCall = msg.role === "assistant" && "function_call" in msg;
++  const isFunctionResult = msg.role === "function";
++
++  if (!isFunctionCall && !isFunctionResult) {
++    return undefined;
++  }
++
++  if (chunkPos < 0 || chunkPos >= originalItems.length) {
++    return undefined;
++  }
++
++  // Ensure function call + results are always added together.
++  // We must traverse the chunk array to find the nearest neighbor
++  const direction = isFunctionCall ? 1 : -1;
++  const search = isFunctionCall ? "function" : "assistant";
++
++  let nextChunkPos = chunkPos + direction;
++
++  while (nextChunkPos >= 0 && nextChunkPos < originalItems.length) {
++    const nextChunk = originalItems[nextChunkPos];
++    const nextMsg = chatLogs.getMsg(chatLogType, nextChunk.msgIdx);
+ 
+-    if (funcChunkIdx) {
+-      return funcChunkIdx;
++    if (nextMsg?.role === search) {
++      // We found it
++      return nextChunk.chunkIdx;
+     }
++
++    nextChunkPos += direction;
+   }
+ 
+   return undefined;
+-}
++};
+diff --git a/packages/agents/src/agent-core/llm/chat/ContextualizedChat.ts b/packages/agents/src/agent-core/llm/chat/ContextualizedChat.ts
+index 70ce6b7..67cf8a6 100644
+--- a/packages/agents/src/agent-core/llm/chat/ContextualizedChat.ts
++++ b/packages/agents/src/agent-core/llm/chat/ContextualizedChat.ts
+@@ -106,34 +106,34 @@ export class ContextualizedChat {
+     return chat;
+   }
+ 
+-  private async _processNewMessages() {
+-    this._processNewMessagesByType("persistent");
+-    this._processNewMessagesByType("temporary");
++  private async _processNewMessages(): Promise<void> {
++    await this._processNewMessagesByType("persistent");
++    await this._processNewMessagesByType("temporary");
+   }
+ 
+-  private _processNewMessagesByType(type: ChatLogType) {
++  private async _processNewMessagesByType(type: ChatLogType): Promise<void> {
+     const messages = this._rawChat.chatLogs.get(type).msgs;
+ 
+     // If no messages exist
+-    if (messages.length === 0) {
++    if (!messages || messages.length === 0) {
+       return;
+     }
+ 
+     const lastProcessedIdx = getLastProcessedMessageIndex(this._chunks[type]);
+ 
+     // If we've already processed all messages
+-    if (lastProcessedIdx === messages.length - 1) {
++    if (lastProcessedIdx >= messages.length - 1) {
+       return;
+     }
+ 
+     // Process all messages from lastProcessedIdx -> messages.length
+     for (let i = lastProcessedIdx + 1; i < messages.length; ++i) {
+       const message = messages[i];
+-      this._processNewMessage(message, i, type);
++      await this._processNewMessage(message, i, type);
+     }
+   }
+ 
+-  private _processNewMessage(message: ChatMessage, msgIdx: number, type: ChatLogType) {
++  private async _processNewMessage(message: ChatMessage, msgIdx: number, type: ChatLogType): Promise<void> {
+ 
+     const newChunks: string[] = [];
+ 
+@@ -151,13 +151,15 @@ export class ContextualizedChat {
+ 
+     // If the message is large and requires chunking
+     if (this._chunker.shouldChunk(message)) {
++      const chunks = this._chunker.chunk(message);
++
+       // If it was a variable, prepend its name
+       if (isVariable) {
+-        newChunks.push(...this._chunker.chunk(message).map(
++        newChunks.push(...chunks.map(
+           (chunk, index) => variableChunkText(chunk, index, varName)
+         ));
+       } else {
+-        newChunks.push(...this._chunker.chunk(message));
++        newChunks.push(...chunks);
+       }
+     } else {
+       if (isVariable) {
+@@ -167,6 +169,17 @@ export class ContextualizedChat {
+       }
+     }
+ 
++    // A message must always produce at least one chunk.
++    // Otherwise it would never be sent to the LLM, and
++    // `getLastProcessedMessageIndex` would never advance,
++    // causing the message to be re-processed forever.
++    if (newChunks.length === 0) {
++      newChunks.push(JSON.stringify({
++        ...message,
++        content: message.content ?? ""
++      }));
++    }
++
+     const chunks = this._chunks[type];
+ 
+     // Save the starting chunk index (used later for document index)
+@@ -178,7 +191,7 @@ export class ContextualizedChat {
+     }
+ 
+     // Add the chunks to the rag
+-    this._rags[type].addItems(
++    await this._rags[type].addItems(
+       newChunks.map((chunk, index) => ({
+         chunkIdx: startChunkIdx + index,
+         msgIdx,
+@@ -190,7 +203,7 @@ export class ContextualizedChat {
+     // If the message is a function call or result,
+     // store the first chunk's text so we can easily retrieve it
+     if (message.role === "function" || "function_call" in message) {
+-        this._functionCallResultFirstChunks[startChunkIdx] = {
++      this._functionCallResultFirstChunks[startChunkIdx] = {
+         text: newChunks[0],
+         metadata: { index: startChunkIdx }
+       };
+@@ -214,7 +227,7 @@ function getLastProcessedMessageIndex(chunks: Chunk[]): number {
+   }
+ 
+   // Return the message index of the last metadata
+-  return chunks[lastIdx].msgIdx;
++  return chunks[lastIdx]?.msgIdx ?? -1;
+ }
+ 
+ function postProcessMessages(messages: ChatMessage[]): ChatMessage[] {
+@@ -232,19 +245,18 @@ function postProcessMessages(messages: ChatMessage[]): ChatMessage[] {
+       varName = (match && match[1]) || undefined;
+     }
+ 
+-    if (varName && prevVarName === varName) {
++    if (varName && prevVarName === varName && result.length > 0) {
+       // Join this preview with the previous
+-      const lastMessage = result.at(-1) as ChatMessage;
+-      lastMessage.content += `\n\n${message.content}`;
+-      result[result.length - 1] = lastMessage;
++      const lastMessage = result[result.length - 1];
++      lastMessage.content = `${lastMessage.content ?? ""}\n\n${message.content ?? ""}`;
+     } else {
+       result.push(message);
+-    }
+ 
+-    if (prevVarName && !varName) {
+-      // Append a helpful message
+-      const lastMessage = result.at(-1) as ChatMessage;
+-      lastMessage.content += `\nThe above function result was too large, so it was stored in the variable \"\${${prevVarName}}\".`
++      if (prevVarName && !varName) {
++        // Append a helpful message
++        const lastMessage = result[result.length - 1];
++        lastMessage.content = `${lastMessage.content ?? ""}\nThe above function result was too large, so it was stored in the variable \"\${${prevVarName}}\".`;
++      }
+     }
+ 
+     prevVarName = varName;
+@@ -257,6 +269,6 @@ function variableChunkText(chunk: string | ChatMessage, index: number, varName:
+   const message = typeof chunk === "string" ? JSON.parse(chunk) as ChatMessage : chunk;
+   return JSON.stringify({
+     ...message,
+-    content: `Variable "${varName}" chunk #${index}\n\`\`\`\n${message.content}\n\`\`\``
++    content: `Variable "${varName}" chunk #${index}\n\`\`\`\n${message.content ?? ""}\n\`\`\``
+   });
+ }

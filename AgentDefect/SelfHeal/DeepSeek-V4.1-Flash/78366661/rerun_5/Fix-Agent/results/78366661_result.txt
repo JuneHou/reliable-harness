@@ -1,0 +1,203 @@
+Case ID: 78366661
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 20:04:47
+End Time: 2026-11-05 20:06:49
+Total Duration: 121.57 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+from dotenv import load_dotenv
+import os
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import MongoDBAtlasVectorSearch
+
+from pymongo import MongoClient
+
+
+def run_agent(pdf_url):
+    load_dotenv()
+
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key is None:
+        raise ValueError("OPENAI_API_KEY not found")
+
+    # The vector store must be backed by a REAL MongoDB Atlas collection.
+    # Passing a Python list (e.g. `atlas_collection = []`) silently swallows the
+    # documents: the embeddings are never persisted and no Atlas `$vectorSearch`
+    # index is ever queried, so `similarity_search` always returns `[]`.
+    mongodb_uri = os.getenv("MONGODB_ATLAS_CLUSTER_URI")
+    if mongodb_uri is None:
+        raise ValueError("MONGODB_ATLAS_CLUSTER_URI not found")
+
+    db_name = os.getenv("MONGODB_DB_NAME", "langchain_db")
+    collection_name = os.getenv("MONGODB_COLLECTION_NAME", "langchain_collection")
+
+    client = MongoClient(mongodb_uri)
+    atlas_collection = client[db_name][collection_name]
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100
+    )
+
+    loader = PyPDFLoader(pdf_url)
+    data = loader.load()
+
+    docs = text_splitter.split_documents(data)
+
+    if not docs:
+        raise ValueError("No text chunks were extracted from the PDF")
+
+    vector_search_index = "vector_index"
+
+    vector_search = MongoDBAtlasVectorSearch.from_documents(
+        documents=docs,
+        embedding=OpenAIEmbeddings(disallowed_special=()),
+        collection=atlas_collection,
+        index_name=vector_search_index
+    )
+
+    query = "What were the compute requirements for training GPT 4"
+
+    # k must be passed explicitly; the default only returns a few documents.
+    results = vector_search.similarity_search(query, k=4)
+
+    return results
+
+
+if __name__ == "__main__":
+    url = "https://arxiv.org/pdf/2303.08774.pdf"
+
+    results = run_agent(url)
+
+    print("Result:", results)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 20:06:49
+Duration: 121.57 seconds
+Verdict: I ran the diff, structural validation, and API spot-checks. Verdict: **REJECT**.
+
+## Diff summary
+1. Modernized imports (`langchain_community.document_loaders.PyPDFLoader`, `langchain_text_splitters.RecursiveCharacterTextSplitter`, `langchain_community.vectorstores.MongoDBAtlasVectorSearch`) — **these are correct** mappings; the old `langchain.document_loaders` / `langchain.text_splitter` paths are deprecated/removed.
+2. Removed the fake `DummyVectorSearch`/stub `MongoDBAtlasVectorSearch` (correctly identified as the root cause: `similarity_search` always returned `[]`).
+3. Replaced `atlas_collection = []` with a real `pymongo.MongoClient(mongodb_uri)[db][collection]`.
+4. Added a guard `if not docs: raise ValueError(...)`.
+5. Changed `similarity_search(query)` → `similarity_search(query, k=4)`.
+
+## `validate_fixed_code`
+Returned `ACCEPT` — the file parses, matches the expected shape, and has a sane output format. But this check is only *structural*; it does not exercise runtime behavior, which is where this fix breaks.
+
+## `verify_api_usage`
+The searches on `MongoDBAtlasVectorSearch.from_documents`, `.similarity_search`, `PyPDFLoader`, and `pymongo.MongoClient` returned only generic LangChain/unrelated web noise (the `pymongo.MongoClient` lookup even returned TikTok spam), so they provide no corroboration. I assessed the calls against the actual LangChain/PyMongo contracts instead:
+- `from_documents(documents=, embedding=, collection=, index_name=)` — matches `MongoDBAtlasVectorSearch.from_documents(documents, embedding, collection, index_name="default", ...)`; ✔
+- `collection` must be a real `pymongo.collection.Collection` (the class validates `isinstance(collection, Collection)`), and `client[db][coll]` does return one; ✔
+- `similarity_search(query, k=4)` is a valid signature, but the added comment is misleading — `k` already defaults to `4`, so this line is a **no-op**, not the bug fix it claims to be; ⚠
+
+## Why this must be rejected
+**The fix trades a deterministic local bug for a hard dependency on external, unavailable infrastructure.** The test is:
+
+```python
+def test_should_not_return_empty_results(self):
+    results = run_agent("https://arxiv.org/pdf/2303.08774.pdf")
+    self.assertGreater(len(results), 0)
+```
+
+It calls `run_agent(url)` with **no** configuration and there is no mock/override in the test file. But the fixed `run_agent` now requires:
+
+1. **`MONGODB_ATLAS_CLUSTER_URI` to be set.** It is read via `os.getenv` and, if missing, raises `ValueError("MONGODB_ATLAS_CLUSTER_URI not found")`. Nothing in the test or diff sets it — so the test errors out before reaching the assertion.
+2. **A reachable, network-accessible MongoDB Atlas cluster** with valid credentials.
+3. **A pre-existing Atlas Vector Search index literally named `vector_index`** defined over the `embedding` field with dimensions matching the embedding model. `from_documents` merely *writes* documents — it does **not** create the Atlas Search index. Without that index, `similarity_search` fails at query time with an Atlas `$vectorSearch` `OperationFailure` ("index not found / not supported"). The code creates the index name as a bare string but never creates the index.
+4. **A paid/registered Atlas deployment** — Atlas Vector Search is not available on a stock/local `mongod`, so this cannot be satisfied by a local fallback either.
+
+So the assertion `len(results) > 0` is never reached; the test fails with an exception, and even in a fully provisioned environment it would fail on the missing search index. The diff's own comment ("must be backed by a REAL MongoDB Atlas collection") confirms the fix is explicitly environment-dependent rather than self-contained.
+
+### Secondary issues
+- **Idempotency:** `from_documents` re-inserts chunks on every call, so repeated test runs accumulate duplicate documents against a shared cluster (a live-state side effect in a unit test).
+- **Misleading/inert change:** `k=4` equals the default, so item 5 contributes nothing to fixing the empty-results bug.
+- **Import stability:** `langchain_community.vectorstores.MongoDBAtlasVectorSearch` has been split out into the separate `langchain_mongodb` package and may emit deprecation warnings or require an extra install, which the diff does not account for.
+
+### What a correct fix would look like
+Either (a) use a self-contained, credential-free vector store (e.g. `langchain_community.vectorstores.FAISS` / `InMemoryVectorStore` / `DocArrayInMemorySearch` built from the split docs), or (b) keep the Atlas path but inject it through a constructor/parameter so the test can supply a fake, plus create the Atlas Search index programmatically and skip gracefully when credentials/index are absent. The current code satisfies neither.
+
+**REJECT** — the fix is plausible in intent and structurally valid, but it introduces guarantees it cannot meet: it requires secrets and a pre-provisioned Atlas vector index that neither the test nor the code provides, so `test_should_not_return_empty_results` cannot pass.
+--------------------------------------------------------------------------------
+from dotenv import load_dotenv
+import os
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import MongoDBAtlasVectorSearch
+
+from pymongo import MongoClient
+
+
+def run_agent(pdf_url):
+    load_dotenv()
+
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key is None:
+        raise ValueError("OPENAI_API_KEY not found")
+
+    # The vector store must be backed by a REAL MongoDB Atlas collection.
+    # Passing a Python list (e.g. `atlas_collection = []`) silently swallows the
+    # documents: the embeddings are never persisted and no Atlas `$vectorSearch`
+    # index is ever queried, so `similarity_search` always returns `[]`.
+    mongodb_uri = os.getenv("MONGODB_ATLAS_CLUSTER_URI")
+    if mongodb_uri is None:
+        raise ValueError("MONGODB_ATLAS_CLUSTER_URI not found")
+
+    db_name = os.getenv("MONGODB_DB_NAME", "langchain_db")
+    collection_name = os.getenv("MONGODB_COLLECTION_NAME", "langchain_collection")
+
+    client = MongoClient(mongodb_uri)
+    atlas_collection = client[db_name][collection_name]
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100
+    )
+
+    loader = PyPDFLoader(pdf_url)
+    data = loader.load()
+
+    docs = text_splitter.split_documents(data)
+
+    if not docs:
+        raise ValueError("No text chunks were extracted from the PDF")
+
+    vector_search_index = "vector_index"
+
+    vector_search = MongoDBAtlasVectorSearch.from_documents(
+        documents=docs,
+        embedding=OpenAIEmbeddings(disallowed_special=()),
+        collection=atlas_collection,
+        index_name=vector_search_index
+    )
+
+    query = "What were the compute requirements for training GPT 4"
+
+    # k must be passed explicitly; the default only returns a few documents.
+    results = vector_search.similarity_search(query, k=4)
+
+    return results
+
+
+if __name__ == "__main__":
+    url = "https://arxiv.org/pdf/2303.08774.pdf"
+
+    results = run_agent(url)
+
+    print("Result:", results)
+
+--------------------------------------------------------------------------------

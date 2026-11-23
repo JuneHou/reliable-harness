@@ -1,0 +1,2400 @@
+Case ID: lagent_244
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-12 18:50:13
+End Time: 2026-11-12 19:39:06
+Total Duration: 2933.04 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### examples/internlm2_agent_web_demo_hf.py
+import copy
+import hashlib
+import json
+import os
+
+import streamlit as st
+
+from lagent.actions import ActionExecutor, ArxivSearch, IPythonInterpreter
+from lagent.agents.internlm2_agent import INTERPRETER_CN, META_CN, PLUGIN_CN, Internlm2Agent, Internlm2Protocol
+from lagent.llms import HFTransformer
+from lagent.llms.meta_template import INTERNLM2_META as META
+from lagent.schema import AgentStatusCode
+
+# from streamlit.logger import get_logger
+
+
+class SessionState:
+
+    def init_state(self):
+        """Initialize session state variables."""
+        st.session_state['assistant'] = []
+        st.session_state['user'] = []
+
+        action_list = [
+            ArxivSearch(),
+        ]
+        st.session_state['plugin_map'] = {
+            action.name: action
+            for action in action_list
+        }
+        st.session_state['model_map'] = {}
+        st.session_state['model_selected'] = None
+        st.session_state['plugin_actions'] = set()
+        st.session_state['history'] = []
+
+    def clear_state(self):
+        """Clear the existing session state."""
+        st.session_state['assistant'] = []
+        st.session_state['user'] = []
+        st.session_state['model_selected'] = None
+        st.session_state['file'] = set()
+        if 'chatbot' in st.session_state:
+            st.session_state['chatbot']._session_history = []
+
+
+class StreamlitUI:
+
+    def __init__(self, session_state: SessionState):
+        self.init_streamlit()
+        self.session_state = session_state
+
+    def init_streamlit(self):
+        """Initialize Streamlit's UI settings."""
+        st.set_page_config(
+            layout='wide',
+            page_title='lagent-web',
+            page_icon='./docs/imgs/lagent_icon.png')
+        st.header(':robot_face: :blue[Lagent] Web Demo ', divider='rainbow')
+        st.sidebar.title('模型控制')
+        st.session_state['file'] = set()
+        st.session_state['model_path'] = None
+
+    def setup_sidebar(self):
+        """Setup the sidebar for model and plugin selection."""
+        # model_name = st.sidebar.selectbox('模型选择：', options=['internlm'])
+        model_name = st.sidebar.text_input('模型名称：', value='internlm2-chat-7b')
+        meta_prompt = st.sidebar.text_area('系统提示词', value=META_CN)
+        da_prompt = st.sidebar.text_area('数据分析提示词', value=INTERPRETER_CN)
+        plugin_prompt = st.sidebar.text_area('插件提示词', value=PLUGIN_CN)
+        model_path = st.sidebar.text_input(
+            '模型路径：', value='internlm/internlm2-chat-20b')
+        if model_name != st.session_state['model_selected'] or st.session_state[
+                'model_path'] != model_path:
+            st.session_state['model_path'] = model_path
+            model = self.init_model(model_name, model_path)
+            self.session_state.clear_state()
+            st.session_state['model_selected'] = model_name
+            if 'chatbot' in st.session_state:
+                del st.session_state['chatbot']
+        else:
+            model = st.session_state['model_map'][model_name]
+
+        plugin_name = st.sidebar.multiselect(
+            '插件选择',
+            options=list(st.session_state['plugin_map'].keys()),
+            default=[],
+        )
+        da_flag = st.sidebar.checkbox(
+            '数据分析',
+            value=False,
+        )
+        plugin_action = [
+            st.session_state['plugin_map'][name] for name in plugin_name
+        ]
+
+        if 'chatbot' in st.session_state:
+            if len(plugin_action) > 0:
+                st.session_state['chatbot']._action_executor = ActionExecutor(
+                    actions=plugin_action)
+            else:
+                st.session_state['chatbot']._action_executor = None
+            if da_flag:
+                st.session_state[
+                    'chatbot']._interpreter_executor = ActionExecutor(
+                        actions=[IPythonInterpreter()])
+            else:
+                st.session_state['chatbot']._interpreter_executor = None
+            st.session_state['chatbot']._protocol._meta_template = meta_prompt
+            st.session_state['chatbot']._protocol.plugin_prompt = plugin_prompt
+            st.session_state[
+                'chatbot']._protocol.interpreter_prompt = da_prompt
+        if st.sidebar.button('清空对话', key='clear'):
+            self.session_state.clear_state()
+        uploaded_file = st.sidebar.file_uploader('上传文件')
+
+        return model_name, model, plugin_action, uploaded_file, model_path
+
+    def init_model(self, model_name, path):
+        """Initialize the model based on the input model name."""
+        st.session_state['model_map'][model_name] = HFTransformer(
+            path=path,
+            meta_template=META,
+            max_new_tokens=1024,
+            top_p=0.8,
+            top_k=None,
+            temperature=0.1,
+            repetition_penalty=1.0,
+            stop_words=['<|im_end|>'])
+        return st.session_state['model_map'][model_name]
+
+    def initialize_chatbot(self, model, plugin_action):
+        """Initialize the chatbot with the given model and plugin actions."""
+        return Internlm2Agent(
+            llm=model,
+            protocol=Internlm2Protocol(
+                tool=dict(
+                    begin='{start_token}{name}\n',
+                    start_token='<|action_start|>',
+                    name_map=dict(
+                        plugin='<|plugin|>', interpreter='<|interpreter|>'),
+                    belong='assistant',
+                    end='<|action_end|>\n',
+                ), ),
+            max_turn=7)
+
+    def render_user(self, prompt: str):
+        with st.chat_message('user'):
+            st.markdown(prompt)
+
+    def render_assistant(self, agent_return):
+        with st.chat_message('assistant'):
+            for action in agent_return.actions:
+                if (action) and (action.type != 'FinishAction'):
+                    self.render_action(action)
+            st.markdown(agent_return.response)
+
+    def render_plugin_args(self, action):
+        action_name = action.type
+        args = action.args
+        import json
+        parameter_dict = dict(name=action_name, parameters=args)
+        parameter_str = '```json\n' + json.dumps(
+            parameter_dict, indent=4, ensure_ascii=False) + '\n```'
+        st.markdown(parameter_str)
+
+    def render_interpreter_args(self, action):
+        st.info(action.type)
+        st.markdown(action.args['text'])
+
+    def render_action(self, action):
+        st.markdown(action.thought)
+        if action.type == 'IPythonInterpreter':
+            self.render_interpreter_args(action)
+        elif action.type == 'FinishAction':
+            pass
+        else:
+            self.render_plugin_args(action)
+        self.render_action_results(action)
+
+    def render_action_results(self, action):
+        """Render the results of action, including text, images, videos, and
+        audios."""
+        if (isinstance(action.result, dict)):
+            if 'text' in action.result:
+                st.markdown('```\n' + action.result['text'] + '\n```')
+            if 'image' in action.result:
+                # image_path = action.result['image']
+                for image_path in action.result['image']:
+                    image_data = open(image_path, 'rb').read()
+                    st.image(image_data, caption='Generated Image')
+            if 'video' in action.result:
+                video_data = action.result['video']
+                video_data = open(video_data, 'rb').read()
+                st.video(video_data)
+            if 'audio' in action.result:
+                audio_data = action.result['audio']
+                audio_data = open(audio_data, 'rb').read()
+                st.audio(audio_data)
+        elif isinstance(action.result, list):
+            for item in action.result:
+                if item['type'] == 'text':
+                    st.markdown('```\n' + item['content'] + '\n```')
+                elif item['type'] == 'image':
+                    image_data = open(item['content'], 'rb').read()
+                    st.image(image_data, caption='Generated Image')
+                elif item['type'] == 'video':
+                    video_data = open(item['content'], 'rb').read()
+                    st.video(video_data)
+                elif item['type'] == 'audio':
+                    audio_data = open(item['content'], 'rb').read()
+                    st.audio(audio_data)
+        if action.errmsg:
+            st.error(action.errmsg)
+
+
+def main():
+    # logger = get_logger(__name__)
+    # Initialize Streamlit UI and setup sidebar
+    if 'ui' not in st.session_state:
+        session_state = SessionState()
+        session_state.init_state()
+        st.session_state['ui'] = StreamlitUI(session_state)
+
+    else:
+        st.set_page_config(
+            layout='wide',
+            page_title='lagent-web',
+            page_icon='./docs/imgs/lagent_icon.png')
+        st.header(':robot_face: :blue[Lagent] Web Demo ', divider='rainbow')
+    _, model, plugin_action, uploaded_file, _ = st.session_state[
+        'ui'].setup_sidebar()
+
+    # Initialize chatbot if it is not already initialized
+    # or if the model has changed
+    if 'chatbot' not in st.session_state or model != st.session_state[
+            'chatbot']._llm:
+        st.session_state['chatbot'] = st.session_state[
+            'ui'].initialize_chatbot(model, plugin_action)
+        st.session_state['session_history'] = []
+
+    for prompt, agent_return in zip(st.session_state['user'],
+                                    st.session_state['assistant']):
+        st.session_state['ui'].render_user(prompt)
+        st.session_state['ui'].render_assistant(agent_return)
+
+    if user_input := st.chat_input(''):
+        with st.container():
+            st.session_state['ui'].render_user(user_input)
+        st.session_state['user'].append(user_input)
+        # Add file uploader to sidebar
+        if (uploaded_file
+                and uploaded_file.name not in st.session_state['file']):
+
+            st.session_state['file'].add(uploaded_file.name)
+            file_bytes = uploaded_file.read()
+            file_type = uploaded_file.type
+            if 'image' in file_type:
+                st.image(file_bytes, caption='Uploaded Image')
+            elif 'video' in file_type:
+                st.video(file_bytes, caption='Uploaded Video')
+            elif 'audio' in file_type:
+                st.audio(file_bytes, caption='Uploaded Audio')
+            # Save the file to a temporary location and get the path
+
+            postfix = uploaded_file.name.split('.')[-1]
+            # prefix = str(uuid.uuid4())
+            prefix = hashlib.md5(file_bytes).hexdigest()
+            filename = f'{prefix}.{postfix}'
+            file_path = os.path.join(root_dir, filename)
+            with open(file_path, 'wb') as tmpfile:
+                tmpfile.write(file_bytes)
+            file_size = os.stat(file_path).st_size / 1024 / 1024
+            file_size = f'{round(file_size, 2)} MB'
+            # st.write(f'File saved at: {file_path}')
+            user_input = [
+                dict(role='user', content=user_input),
+                dict(
+                    role='user',
+                    content=json.dumps(dict(path=file_path, size=file_size)),
+                    name='file')
+            ]
+        if isinstance(user_input, str):
+            user_input = [dict(role='user', content=user_input)]
+        st.session_state['last_status'] = AgentStatusCode.SESSION_READY
+        for agent_return in st.session_state['chatbot'].stream_chat(
+                st.session_state['session_history'] + user_input):
+            if agent_return.state == AgentStatusCode.PLUGIN_RETURN:
+                with st.container():
+                    st.session_state['ui'].render_plugin_args(
+                        agent_return.actions[-1])
+                    st.session_state['ui'].render_action_results(
+                        agent_return.actions[-1])
+            elif agent_return.state == AgentStatusCode.CODE_RETURN:
+                with st.container():
+                    st.session_state['ui'].render_action_results(
+                        agent_return.actions[-1])
+            elif (agent_return.state == AgentStatusCode.STREAM_ING
+                  or agent_return.state == AgentStatusCode.CODING):
+                # st.markdown(agent_return.response)
+                # 清除占位符的当前内容，并显示新内容
+                with st.container():
+                    if agent_return.state != st.session_state['last_status']:
+                        st.session_state['temp'] = ''
+                        placeholder = st.empty()
+                        st.session_state['placeholder'] = placeholder
+                    if isinstance(agent_return.response, dict):
+                        action = f"\n\n {agent_return.response['name']}: \n\n"
+                        action_input = agent_return.response['parameters']
+                        if agent_return.response[
+                                'name'] == 'IPythonInterpreter':
+                            action_input = action_input['command']
+                        response = action + action_input
+                    else:
+                        response = agent_return.response
+                    st.session_state['temp'] = response
+                    st.session_state['placeholder'].markdown(
+                        st.session_state['temp'])
+            elif agent_return.state == AgentStatusCode.END:
+                st.session_state['session_history'] += (
+                    user_input + agent_return.inner_steps)
+                agent_return = copy.deepcopy(agent_return)
+                agent_return.response = st.session_state['temp']
+                st.session_state['assistant'].append(
+                    copy.deepcopy(agent_return))
+            st.session_state['last_status'] = agent_return.state
+
+
+if __name__ == '__main__':
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root_dir = os.path.join(root_dir, 'tmp_dir')
+    os.makedirs(root_dir, exist_ok=True)
+    main()
+
+### lagent/agents/internlm2_agent.py
+import json
+import logging
+from collections import defaultdict
+from copy import deepcopy
+from typing import Dict, List, Optional, Union
+
+from termcolor import colored
+
+from lagent.actions import ActionExecutor
+from lagent.agents.base_agent import BaseAgent
+from lagent.llms import BaseAPIModel, BaseModel
+from lagent.schema import ActionReturn, ActionStatusCode, AgentReturn, AgentStatusCode, ModelStatusCode  # noqa: E501
+
+API_PREFIX = (
+    "This is the subfunction for tool '{tool_name}', you can use this tool. "
+    'The description of this function is: \n{description}')
+
+META_CN = ('当开启工具以及代码时，根据需求选择合适的工具进行调用')
+
+INTERPRETER_CN = ('你现在已经能够在一个有状态的 Jupyter 笔记本环境中运行 Python 代码。'
+                  '当你向 python 发送含有 Python 代码的消息时，它将在该环境中执行。'
+                  '这个工具适用于多种场景，如数据分析或处理（包括数据操作、统计分析、图表绘制），'
+                  '复杂的计算问题（解决数学和物理难题），编程示例（理解编程概念或特性），'
+                  '文本处理和分析（比如文本解析和自然语言处理），'
+                  '机器学习和数据科学（用于展示模型训练和数据可视化），'
+                  '以及文件操作和数据导入（处理CSV、JSON等格式的文件）。')
+
+PLUGIN_CN = ('你可以使用如下工具：'
+             '\n{prompt}\n'
+             '如果你已经获得足够信息，请直接给出答案. 避免不必要的工具调用! '
+             '同时注意你可以使用的工具，不要随意捏造！')
+
+
+class Internlm2Protocol:
+
+    def __init__(
+        self,
+        meta_prompt: str = META_CN,
+        interpreter_prompt: str = INTERPRETER_CN,
+        plugin_prompt: str = PLUGIN_CN,
+        few_shot: Optional[List] = None,
+        language: Dict = dict(
+            begin='',
+            end='',
+            belong='assistant',
+        ),
+        tool: Dict = dict(
+            begin='{start_token}{name}\n',
+            start_token='<|action_start|>',
+            name_map=dict(plugin='<|plugin|>', interpreter='<|interpreter|>'),
+            belong='assistant',
+            end='<|action_end|>\n',
+        ),
+        execute: Dict = dict(
+            role='execute', begin='', end='', fallback_role='environment'),
+    ) -> None:
+        self.meta_prompt = meta_prompt
+        self.interpreter_prompt = interpreter_prompt
+        self.plugin_prompt = plugin_prompt
+        self.roles_cfg = dict(tool=tool, language=language)
+        self.language = language
+        self.execute = execute
+        self.tool = tool
+        self.few_shot = few_shot
+
+    def format_sub_role(self, messages: List[Dict]) -> List[Dict]:
+
+        def format_interpreter(message):
+            if isinstance(message['content'], dict):
+                # assert message['content']['name'] == 'IPythonInterpreter'
+                return dict(
+                    role=message['role'],
+                    name=message['name'],
+                    content=message['content']['parameters']['command'])
+            else:
+                return message
+
+        def format_plugin(message):
+            if isinstance(message['content'], dict):
+                return dict(
+                    role=message['role'],
+                    name=message['name'],
+                    content=json.dumps(message['content']))
+            else:
+                return message
+
+        new_message = list()
+        for message in messages:
+            if message['role'] in [
+                    'assistant', 'user', 'system', 'environment'
+            ]:
+                new_message.append(message)
+                continue
+            role_cfg = self.roles_cfg[message['role']]
+            begin = role_cfg['begin']
+            if message['role'] == 'tool':
+                if message['name'] == 'interpreter':
+                    message = format_interpreter(message)
+                elif message['name'] == 'plugin':
+                    message = format_plugin(message)
+                else:
+                    raise NotImplementedError
+                begin = role_cfg['begin'].format(
+                    start_token=role_cfg.get('start_token', ''),
+                    name=role_cfg.get('name_map', {}).get(message['name'], ''))
+            new_content = begin + message['content'] + role_cfg['end']
+            if role_cfg.get('fallback_role'):
+                new_message.append(
+                    dict(role=role_cfg['fallback_role'], content=new_content))
+            elif role_cfg.get('belong'):
+                if new_message[-1]['role'] != role_cfg.get('belong'):
+                    new_message.append(
+                        dict(role=role_cfg.get('belong'), content=new_content))
+                else:
+                    new_message[-1]['content'] += new_content
+            else:
+                new_message.append(
+                    dict(role=message['role'], content=new_content))
+
+        return new_message
+
+    def format(self,
+               inner_step: List[Dict],
+               plugin_executor: ActionExecutor = None,
+               interpreter_executor: ActionExecutor = None,
+               **kwargs) -> list:
+        formatted = []
+        if self.meta_prompt:
+            formatted.append(dict(role='system', content=self.meta_prompt))
+        if interpreter_executor and self.interpreter_prompt:
+            interpreter_info = interpreter_executor.get_actions_info()[0]
+            interpreter_prompt = self.interpreter_prompt.format(
+                code_prompt=interpreter_info['description'])
+            formatted.append(
+                dict(
+                    role='system',
+                    content=interpreter_prompt,
+                    name='interpreter'))
+        if plugin_executor and plugin_executor.actions and self.plugin_prompt:
+            plugin_descriptions = []
+            for api_info in plugin_executor.get_actions_info():
+                plugin = deepcopy(api_info)
+                if isinstance(api_info, dict):
+                    tool_name = api_info['name'].split('.')[0]
+                    plugin['description'] = API_PREFIX.format(
+                        tool_name=tool_name, description=plugin['description'])
+                    # only keep required parameters
+                    required_parameters = [
+                        param for param in plugin['parameters']
+                        if param['name'] in plugin['required']
+                    ]
+                    plugin['parameters'] = required_parameters
+                plugin_descriptions.append(plugin)
+            plugin_prompt = self.plugin_prompt.format(
+                prompt=json.dumps(
+                    plugin_descriptions, ensure_ascii=False, indent=4))
+            formatted.append(
+                dict(role='system', content=plugin_prompt, name='plugin'))
+        if self.few_shot:
+            for few_shot in self.few_shot:
+                formatted += self.format_sub_role(few_shot)
+        formatted += self.format_sub_role(inner_step)
+        return formatted
+
+    def parse(self,
+              message,
+              plugin_executor: ActionExecutor = None,
+              interpreter_executor: ActionExecutor = None):
+        if self.language['begin']:
+            message = message.split(self.language['begin'])[-1]
+        if self.tool['name_map']['plugin'] in message:
+            message, action = message.split(
+                f"{self.tool['start_token']}{self.tool['name_map']['plugin']}")
+            action = action.split(self.tool['end'].strip())[0]
+            return 'plugin', message, action
+        if self.tool['name_map']['interpreter'] in message:
+            try:
+                message, code, *_ = message.split(
+                    f"{self.tool['start_token']}"
+                    f"{self.tool['name_map']['interpreter']}")
+            except ValueError:
+                message, code, *_ = message.split(
+                    self.tool['name_map']['interpreter'])
+                tool_start_idx = message.rfind(self.tool['start_token'])
+                if tool_start_idx != -1:
+                    message = message[:tool_start_idx]
+                message = message.strip()
+            code = code.split(self.tool['end'].strip())[0].strip()
+            return 'interpreter', message, dict(
+                name=interpreter_executor.action_names()[0] if isinstance(
+                    interpreter_executor, ActionExecutor) else
+                'IPythonInterpreter',
+                parameters=dict(command=code))
+        return None, message.split(self.tool['start_token'])[0], None
+
+    def format_response(self, action_return, name) -> dict:
+        if action_return.state == ActionStatusCode.SUCCESS:
+            response = action_return.format_result()
+        else:
+            response = str(action_return.errmsg)
+        content = self.execute['begin'] + response + self.execute['end']
+        if self.execute.get('fallback_role'):
+            return dict(
+                role=self.execute['fallback_role'], content=content, name=name)
+        elif self.execute.get('belong'):
+            return dict(
+                role=self.execute['belong'], content=content, name=name)
+        return dict(role=self.execute['role'], content=response, name=name)
+
+
+class Internlm2Agent(BaseAgent):
+
+    def __init__(self,
+                 llm: Union[BaseModel, BaseAPIModel],
+                 plugin_executor: ActionExecutor = None,
+                 interpreter_executor: ActionExecutor = None,
+                 protocol=Internlm2Protocol(),
+                 max_turn: int = 3) -> None:
+        self.max_turn = max_turn
+        self._interpreter_executor = interpreter_executor
+        super().__init__(
+            llm=llm, action_executor=plugin_executor, protocol=protocol)
+
+    def chat(self, message: Union[str, Dict], **kwargs) -> AgentReturn:
+        if isinstance(message, str):
+            message = dict(role='user', content=message)
+        if isinstance(message, dict):
+            message = [message]
+        inner_history = message[:]
+        offset = len(inner_history)
+        agent_return = AgentReturn()
+        for _ in range(self.max_turn):
+            # list of dict
+            prompt = self._protocol.format(
+                inner_step=inner_history,
+                plugin_executor=self._action_executor,
+                interpreter_executor=self._interpreter_executor,
+            )
+            response = self._llm.chat(prompt, **kwargs)
+            name, language, action = self._protocol.parse(
+                message=response,
+                plugin_executor=self._action_executor,
+                interpreter_executor=self._interpreter_executor,
+            )
+            if name:
+                if name == 'plugin':
+                    if self._action_executor:
+                        executor = self._action_executor
+                    else:
+                        logging.info(msg='No plugin is instantiated!')
+                        continue
+                    try:
+                        action = json.loads(action)
+                    except Exception as e:
+                        logging.info(msg=f'Invaild action {e}')
+                        continue
+                elif name == 'interpreter':
+                    if self._interpreter_executor:
+                        executor = self._interpreter_executor
+                    else:
+                        logging.info(msg='No interpreter is instantiated!')
+                        continue
+                else:
+                    logging.info(
+                        msg=(f"Invalid name '{name}'. Currently only 'plugin' "
+                             "and 'interpreter' are supported."))
+                    continue
+                action_return: ActionReturn = executor(action['name'],
+                                                       action['parameters'])
+                action_return.thought = language
+                agent_return.actions.append(action_return)
+            inner_history.append(dict(role='language', content=language))
+            if not name or action_return.type == executor.finish_action.name:
+                agent_return.response = language
+                agent_return.state = AgentStatusCode.END
+                break
+            else:
+                inner_history.append(
+                    dict(role='tool', content=action, name=name))
+                inner_history.append(
+                    self._protocol.format_response(action_return, name=name))
+        agent_return.inner_steps = inner_history[offset:]
+        return agent_return
+
+    def stream_chat(self, message: List[dict], **kwargs) -> AgentReturn:
+        if isinstance(message, str):
+            message = dict(role='user', content=message)
+        if isinstance(message, dict):
+            message = [message]
+        inner_history = message[:]
+        offset = len(inner_history)
+        agent_return = AgentReturn()
+        agent_return.inner_steps = deepcopy(inner_history)
+        last_agent_state = AgentStatusCode.SESSION_READY
+        for _ in range(self.max_turn):
+            # list of dict
+            prompt = self._protocol.format(
+                inner_step=inner_history,
+                plugin_executor=self._action_executor,
+                interpreter_executor=self._interpreter_executor,
+            )
+            response = ''
+            for model_state, res, _ in self._llm.stream_chat(prompt, **kwargs):
+                model_state: ModelStatusCode
+                response = res
+                if model_state.value < 0:
+                    agent_return.state = getattr(AgentStatusCode,
+                                                 model_state.name)
+                    yield deepcopy(agent_return)
+                    return
+                else:
+                    name, language, action = self._protocol.parse(
+                        message=response,
+                        plugin_executor=self._action_executor,
+                        interpreter_executor=self._interpreter_executor,
+                    )
+                    if name:
+                        if model_state == ModelStatusCode.END:
+                            agent_state = last_agent_state + 1
+                            if name == 'plugin':
+                                if self._action_executor:
+                                    executor = self._action_executor
+                                else:
+                                    logging.info(
+                                        msg='No plugin is instantiated!')
+                                    continue
+                                try:
+                                    action = json.loads(action)
+                                except Exception as e:
+                                    logging.info(msg=f'Invaild action {e}')
+                                    continue
+                            elif name == 'interpreter':
+                                if self._interpreter_executor:
+                                    executor = self._interpreter_executor
+                                else:
+                                    logging.info(
+                                        msg='No interpreter is instantiated!')
+                                    continue
+                            agent_return.state = agent_state
+                            agent_return.response = action
+                        else:
+                            agent_state = (
+                                AgentStatusCode.PLUGIN_START if name
+                                == 'plugin' else AgentStatusCode.CODING)
+                            if agent_state != last_agent_state:
+                                # agent_return.state = agent_state
+                                agent_return.response = language
+                                yield deepcopy(agent_return)
+                            agent_return.state = agent_state
+                            agent_return.response = action
+                    else:
+                        agent_state = AgentStatusCode.STREAM_ING
+                        agent_return.state = agent_state
+                        agent_return.response = language
+                    last_agent_state = agent_state
+                    yield deepcopy(agent_return)
+            print(colored(response, 'red'))
+            if name:
+                action_return: ActionReturn = executor(action['name'],
+                                                       action['parameters'])
+                action_return.type = action['name']
+                action_return.thought = language
+                agent_return.actions.append(action_return)
+                print(colored(action_return.result, 'magenta'))
+            inner_history.append(dict(role='language', content=language))
+            if not name:
+                agent_return.response = language
+                break
+            elif action_return.type == executor.finish_action.name:
+                try:
+                    response = action_return.args['text']['response']
+                except Exception:
+                    logging.info(msg='Unable to parse FinishAction.')
+                    response = ''
+                agent_return.response = response
+                break
+            else:
+                inner_history.append(
+                    dict(role='tool', content=action, name=name))
+                inner_history.append(
+                    self._protocol.format_response(action_return, name=name))
+                agent_state += 1
+                agent_return.state = agent_state
+                agent_return.inner_steps = deepcopy(inner_history[offset:])
+                yield agent_return
+        agent_return.inner_steps = deepcopy(inner_history[offset:])
+        agent_return.state = AgentStatusCode.END
+        yield agent_return
+
+    def batch_chat(self, batch_messages: List[Union[List[dict], dict, str]],
+                   **kwargs) -> List[AgentReturn]:
+        assert isinstance(batch_messages, list)
+        agent_returns = [AgentReturn() for _ in range(len(batch_messages))]
+        inner_histories = []
+        for message in batch_messages:
+            if isinstance(message, str):
+                message = dict(role='user', content=message)
+            if isinstance(message, dict):
+                message = [message]
+            inner_histories.append(deepcopy(message))
+        offsets = [len(inner) for inner in inner_histories]
+        finish_flags = [False for _ in range(len(batch_messages))]
+        for _ in range(self.max_turn):
+            unfinished = [
+                index for index, is_finish in enumerate(finish_flags)
+                if not is_finish
+            ]
+            if not unfinished:
+                break
+            batch_prompt = []
+            for index in unfinished:
+                batch_prompt.append(
+                    self._protocol.format(
+                        inner_step=inner_histories[index],
+                        plugin_executor=self._action_executor,
+                        interpreter_executor=self._interpreter_executor,
+                    ))
+            batch_response = self._llm.chat(batch_prompt, **kwargs)
+            executor2action_args = defaultdict(lambda: defaultdict(list))
+            for response, index in zip(batch_response, unfinished):
+                name, language, action = self._protocol.parse(
+                    message=response,
+                    plugin_executor=self._action_executor,
+                    interpreter_executor=self._interpreter_executor,
+                )
+                if name:
+                    if name == 'plugin':
+                        if self._action_executor:
+                            executor = self._action_executor
+                        else:
+                            logging.info(msg='No plugin is instantiated!')
+                            continue
+                        try:
+                            action = json.loads(action)
+                        except Exception as e:
+                            logging.info(msg=f'Invaild action {e}')
+                            continue
+                    elif name == 'interpreter':
+                        if self._interpreter_executor:
+                            executor = self._interpreter_executor
+                        else:
+                            logging.info(msg='No interpreter is instantiated!')
+                            continue
+                    else:
+                        logging.info(
+                            msg=  # noqa
+                            (f"Invalid name '{name}'. Currently only 'plugin' "
+                             "and 'interpreter' are supported."))
+                        continue
+                    executor2action_args[executor][action['name']].append(
+                        (index, name, action, language))
+                else:
+                    inner_histories[index].append(
+                        dict(role='language', content=language))
+                    agent_returns[index].response = language
+                    agent_returns[index].state = AgentStatusCode.END
+                    finish_flags[index] = True
+
+            for executor, action_args in executor2action_args.items():
+                for action_name, args in action_args.items():
+                    indexes, _, actions, _ = list(zip(*args))
+                    action_returns = executor.actions[action_name]([
+                        action['parameters']['command'] for action in actions
+                    ], list(indexes))
+                    for (index, name, action,
+                         language), action_return in zip(args, action_returns):
+                        action_return.thought = language
+                        inner_histories[index].append(
+                            dict(role='language', content=language))
+                        if action_return.type == executor.finish_action.name:
+                            agent_returns[index].response = language
+                            agent_returns[index].state = AgentStatusCode.END
+                            finish_flags[index] = True
+                        else:
+                            inner_histories[index].append(
+                                dict(role='tool', content=action, name=name))
+                            inner_histories[index].append(
+                                self._protocol.format_response(
+                                    action_return, name=name))
+        for agent_return, offset, inner_history in zip(agent_returns, offsets,
+                                                       inner_histories):
+            agent_return.inner_steps = inner_history[offset:]
+        return agent_returns
+
+### lagent/llms/huggingface.py
+import copy
+import logging
+from typing import Dict, List, Optional, Union
+
+from lagent.schema import ModelStatusCode
+from .base_api import APITemplateParser
+from .base_llm import BaseModel
+
+logger = logging.getLogger(__name__)
+
+
+class HFTransformer(BaseModel):
+    """Model wrapper around HuggingFace general models.
+
+    Adapted from Internlm (https://github.com/InternLM/InternLM/blob/main/
+        chat/web_demo.py)
+
+    Args:
+        path (str): The name or path to HuggingFace's model.
+        tokenizer_path (str): The path to the tokenizer. Defaults to None.
+        tokenizer_kwargs (dict): Keyword arguments for the tokenizer.
+            Defaults to {}.
+        tokenizer_only (bool): If True, only the tokenizer will be initialized.
+            Defaults to False.
+        model_kwargs (dict): Keyword arguments for the model, used in loader.
+            Defaults to dict(device_map='auto').
+        meta_template (Dict, optional): The model's meta prompt
+            template if needed, in case the requirement of injecting or
+            wrapping of any meta instructions.
+    """
+
+    def __init__(self,
+                 path: str,
+                 tokenizer_path: Optional[str] = None,
+                 tokenizer_kwargs: dict = dict(),
+                 tokenizer_only: bool = False,
+                 model_kwargs: dict = dict(device_map='auto'),
+                 meta_template: Optional[Dict] = None,
+                 stop_words_id: Union[List[int], int] = None,
+                 **kwargs):
+        super().__init__(
+            path=path,
+            tokenizer_only=tokenizer_only,
+            meta_template=meta_template,
+            **kwargs)
+        if isinstance(stop_words_id, int):
+            stop_words_id = [stop_words_id]
+        self.gen_params.update(stop_words_id=stop_words_id)
+        if self.gen_params['stop_words'] is not None and \
+                self.gen_params['stop_words_id'] is not None:
+            logger.warning('Both stop_words and stop_words_id are specified,'
+                           'only stop_words_id will be used.')
+
+        self._load_tokenizer(
+            path=path,
+            tokenizer_path=tokenizer_path,
+            tokenizer_kwargs=tokenizer_kwargs)
+        if not tokenizer_only:
+            self._load_model(path=path, model_kwargs=model_kwargs)
+
+        from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList  # noqa: E501
+        self.logits_processor = LogitsProcessorList()
+        self.stopping_criteria = StoppingCriteriaList()
+        self.prefix_allowed_tokens_fn = None
+
+        stop_words_id = []
+        if self.gen_params.get('stop_words_id'):
+            stop_words_id = self.gen_params.get('stop_words_id')
+        elif self.gen_params.get('stop_words'):
+            for sw in self.gen_params.get('stop_words'):
+                stop_words_id.append(self.tokenizer(sw)['input_ids'][-1])
+        self.additional_eos_token_id = stop_words_id
+
+    def _load_tokenizer(self, path: str, tokenizer_path: Optional[str],
+                        tokenizer_kwargs: dict):
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path if tokenizer_path else path,
+            trust_remote_code=True,
+            **tokenizer_kwargs)
+
+        if self.tokenizer.pad_token_id is None:
+            if self.tokenizer.eos_token is not None:
+                logger.warning(
+                    f'Using eos_token_id {self.tokenizer.eos_token} '
+                    'as pad_token_id.')
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                from transformers.generation import GenerationConfig
+                self.gcfg = GenerationConfig.from_pretrained(path)
+
+                if self.gcfg.pad_token_id is not None:
+                    logger.warning(
+                        f'Using pad_token_id {self.gcfg.pad_token_id} '
+                        'as pad_token_id.')
+                    self.tokenizer.pad_token_id = self.gcfg.pad_token_id
+                else:
+                    raise ValueError(
+                        'pad_token_id is not set for this tokenizer. Try to '
+                        'set pad_token_id via passing '
+                        '`pad_token_id={PAD_TOKEN_ID}` in model_cfg.')
+
+    def _load_model(self, path: str, model_kwargs: dict):
+        import torch
+        from transformers import AutoModel
+        model_kwargs.setdefault('torch_dtype', torch.float16)
+        self.model = AutoModel.from_pretrained(
+            path, trust_remote_code=True, **model_kwargs)
+        self.model.eval()
+
+    def tokenize(self, inputs: str):
+        assert isinstance(inputs, str)
+        inputs = self.tokenizer(
+            inputs, return_tensors='pt', return_length=True)
+        return inputs['input_ids'].tolist()
+
+    def generate(
+        self,
+        inputs: Union[str, List[str]],
+        do_sample: bool = True,
+        **kwargs,
+    ):
+        """Return the chat completions in non-stream mode.
+
+        Args:
+            inputs (Union[str, List[str]]): input texts to be completed.
+            do_sample (bool): do sampling if enabled
+        Returns:
+            (a list of/batched) text/chat completion
+        """
+        for status, chunk, _ in self.stream_generate(inputs, do_sample,
+                                                     **kwargs):
+            response = chunk
+        return response
+
+    def stream_generate(
+        self,
+        inputs: List[str],
+        do_sample: bool = True,
+        **kwargs,
+    ):
+        """Return the chat completions in stream mode.
+
+        Args:
+            inputs (Union[str, List[str]]): input texts to be completed.
+            do_sample (bool): do sampling if enabled
+        Returns:
+            tuple(Status, str, int): status, text/chat completion,
+            generated token number
+        """
+        import torch
+        from torch import nn
+        with torch.no_grad():
+            batched = True
+            if isinstance(inputs, str):
+                inputs = [inputs]
+                batched = False
+            inputs = self.tokenizer(
+                inputs, padding=True, return_tensors='pt', return_length=True)
+            input_length = inputs['length']
+            for k, v in inputs.items():
+                inputs[k] = v.cuda()
+            input_ids = inputs['input_ids']
+            attention_mask = inputs['attention_mask']
+            batch_size = input_ids.shape[0]
+            input_ids_seq_length = input_ids.shape[-1]
+            generation_config = self.model.generation_config
+            generation_config = copy.deepcopy(generation_config)
+            new_gen_params = self.update_gen_params(**kwargs)
+            generation_config.update(**new_gen_params)
+            generation_config.update(**kwargs)
+            model_kwargs = generation_config.to_dict()
+            model_kwargs['attention_mask'] = attention_mask
+            eos_token_id = generation_config.eos_token_id
+            if eos_token_id is None:
+                # ``gcfg`` is only available when the tokenizer provides
+                # neither pad_token nor eos_token, so access it safely.
+                gcfg = getattr(self, 'gcfg', None)
+                if gcfg is not None and gcfg.eos_token_id is not None:
+                    eos_token_id = gcfg.eos_token_id
+                else:
+                    eos_token_id = []
+            if isinstance(eos_token_id, int):
+                eos_token_id = [eos_token_id]
+            else:
+                eos_token_id = list(eos_token_id)
+            if self.additional_eos_token_id is not None:
+                eos_token_id.extend(self.additional_eos_token_id)
+            eos_token_id_tensor = torch.tensor(eos_token_id).to(
+                input_ids.device) if eos_token_id is not None else None
+            # ``_eos_token_tensor`` is a private attribute that is normally
+            # initialized by ``GenerationMixin._prepare_special_tokens``
+            # (transformers>=4.45). Since the generation loop below is written
+            # manually, those helpers are never invoked and the stopping
+            # criteria would raise
+            # ``AttributeError: 'GenerationConfig' object has no attribute
+            # '_eos_token_tensor'``. Hence initialize the attributes that the
+            # generation internals rely on explicitly.
+            generation_config.eos_token_id = eos_token_id
+            generation_config._eos_token_tensor = eos_token_id_tensor
+            pad_token_id = generation_config.pad_token_id
+            generation_config._pad_token_tensor = (
+                torch.tensor(pad_token_id).to(input_ids.device)
+                if pad_token_id is not None else None)
+            generation_config.max_length = (
+                generation_config.max_new_tokens + input_ids_seq_length)
+            # Set generation parameters if not already defined
+            logits_processor = self.logits_processor
+            stopping_criteria = self.stopping_criteria
+
+            logits_processor = self.model._get_logits_processor(
+                generation_config=generation_config,
+                input_ids_seq_length=input_ids_seq_length,
+                encoder_input_ids=input_ids,
+                prefix_allowed_tokens_fn=self.prefix_allowed_tokens_fn,
+                logits_processor=logits_processor,
+            )
+
+            stopping_criteria = self.model._get_stopping_criteria(
+                generation_config=generation_config,
+                stopping_criteria=stopping_criteria)
+            logits_warper = self.model._get_logits_warper(generation_config)
+
+            unfinished_sequences = input_ids.new(batch_size).fill_(1)
+            scores = None
+            while True:
+                model_inputs = self.model.prepare_inputs_for_generation(
+                    input_ids, **model_kwargs)
+                # forward pass to get next token
+                outputs = self.model(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                )
+
+                next_token_logits = outputs.logits[:, -1, :]
+
+                # pre-process distribution
+                next_token_scores = logits_processor(input_ids,
+                                                     next_token_logits)
+                next_token_scores = logits_warper(input_ids, next_token_scores)
+
+                # sample
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                if do_sample:
+                    next_tokens = torch.multinomial(
+                        probs, num_samples=1).squeeze(1)
+                else:
+                    next_tokens = torch.argmax(probs, dim=-1)
+
+                # update generated ids, model inputs,
+                # and length for next step
+                input_ids = torch.cat([input_ids, next_tokens[:, None]],
+                                      dim=-1)
+                model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa: E501
+                    outputs,
+                    model_kwargs,
+                    is_encoder_decoder=False)
+                unfinished_sequences = unfinished_sequences.mul(
+                    next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(
+                        eos_token_id_tensor.unsqueeze(1)).prod(dim=0))
+                output_token_ids = input_ids.cpu().tolist()
+                for i in range(len(output_token_ids)):
+                    output_token_ids[i] = output_token_ids[i][:][
+                        input_length[i]:]
+                    # Find the first occurrence of
+                    # an EOS token in the sequence
+                    first_eos_idx = next(
+                        (idx
+                         for idx, token_id in enumerate(output_token_ids[i])
+                         if token_id in eos_token_id), None)
+                    # If an EOS token is found, only the previous
+                    # part of it is retained
+                    if first_eos_idx is not None:
+                        output_token_ids[i] = output_token_ids[
+                            i][:first_eos_idx]
+
+                response = self.tokenizer.batch_decode(output_token_ids)
+                # print(response)
+                if not batched:
+                    response = response[0]
+                yield ModelStatusCode.STREAM_ING, response, None
+                # stop when each sentence is finished,
+                # or if we exceed the maximum length
+                if (unfinished_sequences.max() == 0
+                        or stopping_criteria(input_ids, scores)):
+                    break
+            yield ModelStatusCode.END, response, None
+
+    def stream_chat(
+        self,
+        inputs: List[dict],
+        do_sample: bool = True,
+        **kwargs,
+    ):
+        """Return the chat completions in stream mode.
+
+        Args:
+            inputs (List[dict]): input messages to be completed.
+            do_sample (bool): do sampling if enabled
+        Returns:
+            the text/chat completion
+        """
+        prompt = self.template_parser(inputs)
+        yield from self.stream_generate(prompt, do_sample, **kwargs)
+
+
+class HFTransformerCasualLM(HFTransformer):
+
+    def _load_model(self, path: str, model_kwargs: dict):
+        import torch
+        from transformers import AutoModelForCausalLM
+        model_kwargs.setdefault('torch_dtype', torch.float16)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            path, trust_remote_code=True, **model_kwargs)
+        self.model.eval()
+
+
+class HFTransformerChat(HFTransformerCasualLM):
+
+    def __init__(self, template_parser=APITemplateParser, **kwargs):
+        super().__init__(template_parser=template_parser, **kwargs)
+
+    def chat(self,
+             inputs: Union[List[dict], List[List[dict]]],
+             do_sample: bool = True,
+             **kwargs):
+        """Return the chat completions in stream mode.
+
+        Args:
+            inputs (Union[List[dict], List[List[dict]]]): input messages to be completed.
+            do_sample (bool): do sampling if enabled
+        Returns:
+            the text/chat completion
+        """
+        # handle batch inference with vanilla for loop
+        if isinstance(inputs[0], list):
+            resps = []
+            for input in inputs:
+                resps.append(self.chat(input, do_sample, **kwargs))
+            return resps
+        prompt = self.template_parser(inputs)
+        query = prompt[-1]['content']
+        history = prompt[:-1]
+        try:
+            response, history = self.model.chat(
+                self.tokenizer, query, history=history)
+        except Exception as e:
+            # handle over-length input error
+            logger.warning(str(e))
+            response = ''
+        return response
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-12 19:39:06
+Duration: 2933.04 seconds
+Verdict: ## Evaluation Summary
+
+**1. Diff review (`generate_diff`)**
+
+The change is small and localized to `lagent/llms/huggingface.py` (plus whitespace/duplicate-`logger` cleanup):
+
+- Replaced the odd `_, eos_token_id = (generation_config.bos_token_id, generation_config.eos_token_id)` tuple-unpacking with a direct `eos_token_id = generation_config.eos_token_id`.
+- Fixed a *second* latent bug: `self.gcfg` is only created in `_load_tokenizer` when the tokenizer has neither `pad_token` nor `eos_token`, so the old `self.gcfg.eos_token_id` could raise `AttributeError`. Now guarded via `gcfg = getattr(self, 'gcfg', None)`.
+- Normalizes `eos_token_id` to a mutable list (`isinstance(int)` → wrap, else `list(...)`) before extending with `additional_eos_token_id`.
+- **Key fix:** explicitly initializes `generation_config.eos_token_id`, `generation_config._eos_token_tensor` (on `input_ids.device`) and `generation_config._pad_token_tensor` before `_get_logits_processor` / `_get_stopping_criteria` are called.
+
+This is exactly the right place and the right values: `_eos_token_tensor` / `_pad_token_tensor` are normally populated by `GenerationMixin._prepare_special_tokens`, which the *hand-rolled* generation loop in `stream_generate` never invokes — hence the reported `AttributeError: 'GenerationConfig' object has no attribute '_eos_token_tensor'` from the stopping-criteria/logits-processor path in newer `transformers`. The attributes are set **before** those helpers are constructed (correct ordering), and setting them on a `GenerationConfig` is legal (it is a `PretrainedConfig`; the library itself assigns these private attributes the same way). The tensor is placed on the input device so `next_tokens.tile(...).ne(...)` broadcasting continues to work, and the pre-existing empty-list edge case still degrades gracefully to `MaxLengthCriteria` (no crash).
+
+**2. Structural validation (`validate_fixed_code`)**
+
+`ACCEPT — every file is present once with its full text`. No truncation, no duplicated/dropped modules; the edited function (`stream_generate`) is syntactically complete and consistent with the rest of the file.
+
+**3. API verification (`verify_api_usage`)**
+
+Attempted verification of `GenerationMixin._get_stopping_criteria`, `GenerationConfig._eos_token_tensor`, `GenerationConfig.__setattr__`, and `_prepare_special_tokens`; the web search backend returned irrelevant/generic "Transformers" results (and one timeout), so no contradicting documentation was found — the usage was assessed from the code semantics: private attributes assigned match the library's own `_prepare_special_tokens` contract (`torch.tensor(...).to(device)`), and `GenerationConfig` does not reject such assignments (it accepts dynamic attributes, which is how the library sets them itself).
+
+**4. Test-behaviour check**
+
+- `check_dependency_constraints()`: this patch does **not** add the upstream `transformers>=4.34,<=4.40` pin, so this branch reports "constraint not found".
+- `test_with_transformers_version()` for `version == "fixed"`: the probe script uses `getattr(config, "_eos_token_tensor", None)` (never raises), and `generation_config.eos_token_id` defaults to `2`, so it prints `NO_BUG`, making the function return `True`. Since the test's pass condition is `constraint_check_pass or transformers_test_pass`, the fixed run exits 0.
+- The patch is also correct independent of the test: it resolves the real root cause at the code level (and additionally removes the `self.gcfg` `AttributeError` and the duplicated `logger`), rather than merely pinning a version.
+
+**Minor, non-blocking notes:** relying on `transformers` private attributes is version-fragile (a version pin would still be advisable), and `torch.tensor([])` yields a float tensor in the empty-`eos` case — but that is pre-existing behaviour and harmless because the loop still terminates via `MaxLengthCriteria`.
+
+## Verdict: **ACCEPT**
+
+The fixed code is syntactically/structurally sound, sets the required private generation attributes at the correct time and devices (mirroring `_prepare_special_tokens`), fixes an adjacent `gcfg` attribute bug, introduces no regressions in the generation loop, and passes the supplied test for the fixed version.
+--------------------------------------------------------------------------------
+### examples/internlm2_agent_web_demo_hf.py
+import copy
+import hashlib
+import json
+import os
+
+import streamlit as st
+
+from lagent.actions import ActionExecutor, ArxivSearch, IPythonInterpreter
+from lagent.agents.internlm2_agent import INTERPRETER_CN, META_CN, PLUGIN_CN, Internlm2Agent, Internlm2Protocol
+from lagent.llms import HFTransformer
+from lagent.llms.meta_template import INTERNLM2_META as META
+from lagent.schema import AgentStatusCode
+
+# from streamlit.logger import get_logger
+
+
+class SessionState:
+
+    def init_state(self):
+        """Initialize session state variables."""
+        st.session_state['assistant'] = []
+        st.session_state['user'] = []
+
+        action_list = [
+            ArxivSearch(),
+        ]
+        st.session_state['plugin_map'] = {
+            action.name: action
+            for action in action_list
+        }
+        st.session_state['model_map'] = {}
+        st.session_state['model_selected'] = None
+        st.session_state['plugin_actions'] = set()
+        st.session_state['history'] = []
+
+    def clear_state(self):
+        """Clear the existing session state."""
+        st.session_state['assistant'] = []
+        st.session_state['user'] = []
+        st.session_state['model_selected'] = None
+        st.session_state['file'] = set()
+        if 'chatbot' in st.session_state:
+            st.session_state['chatbot']._session_history = []
+
+
+class StreamlitUI:
+
+    def __init__(self, session_state: SessionState):
+        self.init_streamlit()
+        self.session_state = session_state
+
+    def init_streamlit(self):
+        """Initialize Streamlit's UI settings."""
+        st.set_page_config(
+            layout='wide',
+            page_title='lagent-web',
+            page_icon='./docs/imgs/lagent_icon.png')
+        st.header(':robot_face: :blue[Lagent] Web Demo ', divider='rainbow')
+        st.sidebar.title('模型控制')
+        st.session_state['file'] = set()
+        st.session_state['model_path'] = None
+
+    def setup_sidebar(self):
+        """Setup the sidebar for model and plugin selection."""
+        # model_name = st.sidebar.selectbox('模型选择：', options=['internlm'])
+        model_name = st.sidebar.text_input('模型名称：', value='internlm2-chat-7b')
+        meta_prompt = st.sidebar.text_area('系统提示词', value=META_CN)
+        da_prompt = st.sidebar.text_area('数据分析提示词', value=INTERPRETER_CN)
+        plugin_prompt = st.sidebar.text_area('插件提示词', value=PLUGIN_CN)
+        model_path = st.sidebar.text_input(
+            '模型路径：', value='internlm/internlm2-chat-20b')
+        if model_name != st.session_state['model_selected'] or st.session_state[
+                'model_path'] != model_path:
+            st.session_state['model_path'] = model_path
+            model = self.init_model(model_name, model_path)
+            self.session_state.clear_state()
+            st.session_state['model_selected'] = model_name
+            if 'chatbot' in st.session_state:
+                del st.session_state['chatbot']
+        else:
+            model = st.session_state['model_map'][model_name]
+
+        plugin_name = st.sidebar.multiselect(
+            '插件选择',
+            options=list(st.session_state['plugin_map'].keys()),
+            default=[],
+        )
+        da_flag = st.sidebar.checkbox(
+            '数据分析',
+            value=False,
+        )
+        plugin_action = [
+            st.session_state['plugin_map'][name] for name in plugin_name
+        ]
+
+        if 'chatbot' in st.session_state:
+            if len(plugin_action) > 0:
+                st.session_state['chatbot']._action_executor = ActionExecutor(
+                    actions=plugin_action)
+            else:
+                st.session_state['chatbot']._action_executor = None
+            if da_flag:
+                st.session_state[
+                    'chatbot']._interpreter_executor = ActionExecutor(
+                        actions=[IPythonInterpreter()])
+            else:
+                st.session_state['chatbot']._interpreter_executor = None
+            st.session_state['chatbot']._protocol._meta_template = meta_prompt
+            st.session_state['chatbot']._protocol.plugin_prompt = plugin_prompt
+            st.session_state[
+                'chatbot']._protocol.interpreter_prompt = da_prompt
+        if st.sidebar.button('清空对话', key='clear'):
+            self.session_state.clear_state()
+        uploaded_file = st.sidebar.file_uploader('上传文件')
+
+        return model_name, model, plugin_action, uploaded_file, model_path
+
+    def init_model(self, model_name, path):
+        """Initialize the model based on the input model name."""
+        st.session_state['model_map'][model_name] = HFTransformer(
+            path=path,
+            meta_template=META,
+            max_new_tokens=1024,
+            top_p=0.8,
+            top_k=None,
+            temperature=0.1,
+            repetition_penalty=1.0,
+            stop_words=['<|im_end|>'])
+        return st.session_state['model_map'][model_name]
+
+    def initialize_chatbot(self, model, plugin_action):
+        """Initialize the chatbot with the given model and plugin actions."""
+        return Internlm2Agent(
+            llm=model,
+            protocol=Internlm2Protocol(
+                tool=dict(
+                    begin='{start_token}{name}\n',
+                    start_token='<|action_start|>',
+                    name_map=dict(
+                        plugin='<|plugin|>', interpreter='<|interpreter|>'),
+                    belong='assistant',
+                    end='<|action_end|>\n',
+                ), ),
+            max_turn=7)
+
+    def render_user(self, prompt: str):
+        with st.chat_message('user'):
+            st.markdown(prompt)
+
+    def render_assistant(self, agent_return):
+        with st.chat_message('assistant'):
+            for action in agent_return.actions:
+                if (action) and (action.type != 'FinishAction'):
+                    self.render_action(action)
+            st.markdown(agent_return.response)
+
+    def render_plugin_args(self, action):
+        action_name = action.type
+        args = action.args
+        import json
+        parameter_dict = dict(name=action_name, parameters=args)
+        parameter_str = '```json\n' + json.dumps(
+            parameter_dict, indent=4, ensure_ascii=False) + '\n```'
+        st.markdown(parameter_str)
+
+    def render_interpreter_args(self, action):
+        st.info(action.type)
+        st.markdown(action.args['text'])
+
+    def render_action(self, action):
+        st.markdown(action.thought)
+        if action.type == 'IPythonInterpreter':
+            self.render_interpreter_args(action)
+        elif action.type == 'FinishAction':
+            pass
+        else:
+            self.render_plugin_args(action)
+        self.render_action_results(action)
+
+    def render_action_results(self, action):
+        """Render the results of action, including text, images, videos, and
+        audios."""
+        if (isinstance(action.result, dict)):
+            if 'text' in action.result:
+                st.markdown('```\n' + action.result['text'] + '\n```')
+            if 'image' in action.result:
+                # image_path = action.result['image']
+                for image_path in action.result['image']:
+                    image_data = open(image_path, 'rb').read()
+                    st.image(image_data, caption='Generated Image')
+            if 'video' in action.result:
+                video_data = action.result['video']
+                video_data = open(video_data, 'rb').read()
+                st.video(video_data)
+            if 'audio' in action.result:
+                audio_data = action.result['audio']
+                audio_data = open(audio_data, 'rb').read()
+                st.audio(audio_data)
+        elif isinstance(action.result, list):
+            for item in action.result:
+                if item['type'] == 'text':
+                    st.markdown('```\n' + item['content'] + '\n```')
+                elif item['type'] == 'image':
+                    image_data = open(item['content'], 'rb').read()
+                    st.image(image_data, caption='Generated Image')
+                elif item['type'] == 'video':
+                    video_data = open(item['content'], 'rb').read()
+                    st.video(video_data)
+                elif item['type'] == 'audio':
+                    audio_data = open(item['content'], 'rb').read()
+                    st.audio(audio_data)
+        if action.errmsg:
+            st.error(action.errmsg)
+
+
+def main():
+    # logger = get_logger(__name__)
+    # Initialize Streamlit UI and setup sidebar
+    if 'ui' not in st.session_state:
+        session_state = SessionState()
+        session_state.init_state()
+        st.session_state['ui'] = StreamlitUI(session_state)
+
+    else:
+        st.set_page_config(
+            layout='wide',
+            page_title='lagent-web',
+            page_icon='./docs/imgs/lagent_icon.png')
+        st.header(':robot_face: :blue[Lagent] Web Demo ', divider='rainbow')
+    _, model, plugin_action, uploaded_file, _ = st.session_state[
+        'ui'].setup_sidebar()
+
+    # Initialize chatbot if it is not already initialized
+    # or if the model has changed
+    if 'chatbot' not in st.session_state or model != st.session_state[
+            'chatbot']._llm:
+        st.session_state['chatbot'] = st.session_state[
+            'ui'].initialize_chatbot(model, plugin_action)
+        st.session_state['session_history'] = []
+
+    for prompt, agent_return in zip(st.session_state['user'],
+                                    st.session_state['assistant']):
+        st.session_state['ui'].render_user(prompt)
+        st.session_state['ui'].render_assistant(agent_return)
+
+    if user_input := st.chat_input(''):
+        with st.container():
+            st.session_state['ui'].render_user(user_input)
+        st.session_state['user'].append(user_input)
+        # Add file uploader to sidebar
+        if (uploaded_file
+                and uploaded_file.name not in st.session_state['file']):
+
+            st.session_state['file'].add(uploaded_file.name)
+            file_bytes = uploaded_file.read()
+            file_type = uploaded_file.type
+            if 'image' in file_type:
+                st.image(file_bytes, caption='Uploaded Image')
+            elif 'video' in file_type:
+                st.video(file_bytes, caption='Uploaded Video')
+            elif 'audio' in file_type:
+                st.audio(file_bytes, caption='Uploaded Audio')
+            # Save the file to a temporary location and get the path
+
+            postfix = uploaded_file.name.split('.')[-1]
+            # prefix = str(uuid.uuid4())
+            prefix = hashlib.md5(file_bytes).hexdigest()
+            filename = f'{prefix}.{postfix}'
+            file_path = os.path.join(root_dir, filename)
+            with open(file_path, 'wb') as tmpfile:
+                tmpfile.write(file_bytes)
+            file_size = os.stat(file_path).st_size / 1024 / 1024
+            file_size = f'{round(file_size, 2)} MB'
+            # st.write(f'File saved at: {file_path}')
+            user_input = [
+                dict(role='user', content=user_input),
+                dict(
+                    role='user',
+                    content=json.dumps(dict(path=file_path, size=file_size)),
+                    name='file')
+            ]
+        if isinstance(user_input, str):
+            user_input = [dict(role='user', content=user_input)]
+        st.session_state['last_status'] = AgentStatusCode.SESSION_READY
+        for agent_return in st.session_state['chatbot'].stream_chat(
+                st.session_state['session_history'] + user_input):
+            if agent_return.state == AgentStatusCode.PLUGIN_RETURN:
+                with st.container():
+                    st.session_state['ui'].render_plugin_args(
+                        agent_return.actions[-1])
+                    st.session_state['ui'].render_action_results(
+                        agent_return.actions[-1])
+            elif agent_return.state == AgentStatusCode.CODE_RETURN:
+                with st.container():
+                    st.session_state['ui'].render_action_results(
+                        agent_return.actions[-1])
+            elif (agent_return.state == AgentStatusCode.STREAM_ING
+                  or agent_return.state == AgentStatusCode.CODING):
+                # st.markdown(agent_return.response)
+                # 清除占位符的当前内容，并显示新内容
+                with st.container():
+                    if agent_return.state != st.session_state['last_status']:
+                        st.session_state['temp'] = ''
+                        placeholder = st.empty()
+                        st.session_state['placeholder'] = placeholder
+                    if isinstance(agent_return.response, dict):
+                        action = f"\n\n {agent_return.response['name']}: \n\n"
+                        action_input = agent_return.response['parameters']
+                        if agent_return.response[
+                                'name'] == 'IPythonInterpreter':
+                            action_input = action_input['command']
+                        response = action + action_input
+                    else:
+                        response = agent_return.response
+                    st.session_state['temp'] = response
+                    st.session_state['placeholder'].markdown(
+                        st.session_state['temp'])
+            elif agent_return.state == AgentStatusCode.END:
+                st.session_state['session_history'] += (
+                    user_input + agent_return.inner_steps)
+                agent_return = copy.deepcopy(agent_return)
+                agent_return.response = st.session_state['temp']
+                st.session_state['assistant'].append(
+                    copy.deepcopy(agent_return))
+            st.session_state['last_status'] = agent_return.state
+
+
+if __name__ == '__main__':
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root_dir = os.path.join(root_dir, 'tmp_dir')
+    os.makedirs(root_dir, exist_ok=True)
+    main()
+
+### lagent/agents/internlm2_agent.py
+import json
+import logging
+from collections import defaultdict
+from copy import deepcopy
+from typing import Dict, List, Optional, Union
+
+from termcolor import colored
+
+from lagent.actions import ActionExecutor
+from lagent.agents.base_agent import BaseAgent
+from lagent.llms import BaseAPIModel, BaseModel
+from lagent.schema import ActionReturn, ActionStatusCode, AgentReturn, AgentStatusCode, ModelStatusCode  # noqa: E501
+
+API_PREFIX = (
+    "This is the subfunction for tool '{tool_name}', you can use this tool. "
+    'The description of this function is: \n{description}')
+
+META_CN = ('当开启工具以及代码时，根据需求选择合适的工具进行调用')
+
+INTERPRETER_CN = ('你现在已经能够在一个有状态的 Jupyter 笔记本环境中运行 Python 代码。'
+                  '当你向 python 发送含有 Python 代码的消息时，它将在该环境中执行。'
+                  '这个工具适用于多种场景，如数据分析或处理（包括数据操作、统计分析、图表绘制），'
+                  '复杂的计算问题（解决数学和物理难题），编程示例（理解编程概念或特性），'
+                  '文本处理和分析（比如文本解析和自然语言处理），'
+                  '机器学习和数据科学（用于展示模型训练和数据可视化），'
+                  '以及文件操作和数据导入（处理CSV、JSON等格式的文件）。')
+
+PLUGIN_CN = ('你可以使用如下工具：'
+             '\n{prompt}\n'
+             '如果你已经获得足够信息，请直接给出答案. 避免不必要的工具调用! '
+             '同时注意你可以使用的工具，不要随意捏造！')
+
+
+class Internlm2Protocol:
+
+    def __init__(
+        self,
+        meta_prompt: str = META_CN,
+        interpreter_prompt: str = INTERPRETER_CN,
+        plugin_prompt: str = PLUGIN_CN,
+        few_shot: Optional[List] = None,
+        language: Dict = dict(
+            begin='',
+            end='',
+            belong='assistant',
+        ),
+        tool: Dict = dict(
+            begin='{start_token}{name}\n',
+            start_token='<|action_start|>',
+            name_map=dict(plugin='<|plugin|>', interpreter='<|interpreter|>'),
+            belong='assistant',
+            end='<|action_end|>\n',
+        ),
+        execute: Dict = dict(
+            role='execute', begin='', end='', fallback_role='environment'),
+    ) -> None:
+        self.meta_prompt = meta_prompt
+        self.interpreter_prompt = interpreter_prompt
+        self.plugin_prompt = plugin_prompt
+        self.roles_cfg = dict(tool=tool, language=language)
+        self.language = language
+        self.execute = execute
+        self.tool = tool
+        self.few_shot = few_shot
+
+    def format_sub_role(self, messages: List[Dict]) -> List[Dict]:
+
+        def format_interpreter(message):
+            if isinstance(message['content'], dict):
+                # assert message['content']['name'] == 'IPythonInterpreter'
+                return dict(
+                    role=message['role'],
+                    name=message['name'],
+                    content=message['content']['parameters']['command'])
+            else:
+                return message
+
+        def format_plugin(message):
+            if isinstance(message['content'], dict):
+                return dict(
+                    role=message['role'],
+                    name=message['name'],
+                    content=json.dumps(message['content']))
+            else:
+                return message
+
+        new_message = list()
+        for message in messages:
+            if message['role'] in [
+                    'assistant', 'user', 'system', 'environment'
+            ]:
+                new_message.append(message)
+                continue
+            role_cfg = self.roles_cfg[message['role']]
+            begin = role_cfg['begin']
+            if message['role'] == 'tool':
+                if message['name'] == 'interpreter':
+                    message = format_interpreter(message)
+                elif message['name'] == 'plugin':
+                    message = format_plugin(message)
+                else:
+                    raise NotImplementedError
+                begin = role_cfg['begin'].format(
+                    start_token=role_cfg.get('start_token', ''),
+                    name=role_cfg.get('name_map', {}).get(message['name'], ''))
+            new_content = begin + message['content'] + role_cfg['end']
+            if role_cfg.get('fallback_role'):
+                new_message.append(
+                    dict(role=role_cfg['fallback_role'], content=new_content))
+            elif role_cfg.get('belong'):
+                if new_message[-1]['role'] != role_cfg.get('belong'):
+                    new_message.append(
+                        dict(role=role_cfg.get('belong'), content=new_content))
+                else:
+                    new_message[-1]['content'] += new_content
+            else:
+                new_message.append(
+                    dict(role=message['role'], content=new_content))
+
+        return new_message
+
+    def format(self,
+               inner_step: List[Dict],
+               plugin_executor: ActionExecutor = None,
+               interpreter_executor: ActionExecutor = None,
+               **kwargs) -> list:
+        formatted = []
+        if self.meta_prompt:
+            formatted.append(dict(role='system', content=self.meta_prompt))
+        if interpreter_executor and self.interpreter_prompt:
+            interpreter_info = interpreter_executor.get_actions_info()[0]
+            interpreter_prompt = self.interpreter_prompt.format(
+                code_prompt=interpreter_info['description'])
+            formatted.append(
+                dict(
+                    role='system',
+                    content=interpreter_prompt,
+                    name='interpreter'))
+        if plugin_executor and plugin_executor.actions and self.plugin_prompt:
+            plugin_descriptions = []
+            for api_info in plugin_executor.get_actions_info():
+                plugin = deepcopy(api_info)
+                if isinstance(api_info, dict):
+                    tool_name = api_info['name'].split('.')[0]
+                    plugin['description'] = API_PREFIX.format(
+                        tool_name=tool_name, description=plugin['description'])
+                    # only keep required parameters
+                    required_parameters = [
+                        param for param in plugin['parameters']
+                        if param['name'] in plugin['required']
+                    ]
+                    plugin['parameters'] = required_parameters
+                plugin_descriptions.append(plugin)
+            plugin_prompt = self.plugin_prompt.format(
+                prompt=json.dumps(
+                    plugin_descriptions, ensure_ascii=False, indent=4))
+            formatted.append(
+                dict(role='system', content=plugin_prompt, name='plugin'))
+        if self.few_shot:
+            for few_shot in self.few_shot:
+                formatted += self.format_sub_role(few_shot)
+        formatted += self.format_sub_role(inner_step)
+        return formatted
+
+    def parse(self,
+              message,
+              plugin_executor: ActionExecutor = None,
+              interpreter_executor: ActionExecutor = None):
+        if self.language['begin']:
+            message = message.split(self.language['begin'])[-1]
+        if self.tool['name_map']['plugin'] in message:
+            message, action = message.split(
+                f"{self.tool['start_token']}{self.tool['name_map']['plugin']}")
+            action = action.split(self.tool['end'].strip())[0]
+            return 'plugin', message, action
+        if self.tool['name_map']['interpreter'] in message:
+            try:
+                message, code, *_ = message.split(
+                    f"{self.tool['start_token']}"
+                    f"{self.tool['name_map']['interpreter']}")
+            except ValueError:
+                message, code, *_ = message.split(
+                    self.tool['name_map']['interpreter'])
+                tool_start_idx = message.rfind(self.tool['start_token'])
+                if tool_start_idx != -1:
+                    message = message[:tool_start_idx]
+                message = message.strip()
+            code = code.split(self.tool['end'].strip())[0].strip()
+            return 'interpreter', message, dict(
+                name=interpreter_executor.action_names()[0] if isinstance(
+                    interpreter_executor, ActionExecutor) else
+                'IPythonInterpreter',
+                parameters=dict(command=code))
+        return None, message.split(self.tool['start_token'])[0], None
+
+    def format_response(self, action_return, name) -> dict:
+        if action_return.state == ActionStatusCode.SUCCESS:
+            response = action_return.format_result()
+        else:
+            response = str(action_return.errmsg)
+        content = self.execute['begin'] + response + self.execute['end']
+        if self.execute.get('fallback_role'):
+            return dict(
+                role=self.execute['fallback_role'], content=content, name=name)
+        elif self.execute.get('belong'):
+            return dict(
+                role=self.execute['belong'], content=content, name=name)
+        return dict(role=self.execute['role'], content=response, name=name)
+
+
+class Internlm2Agent(BaseAgent):
+
+    def __init__(self,
+                 llm: Union[BaseModel, BaseAPIModel],
+                 plugin_executor: ActionExecutor = None,
+                 interpreter_executor: ActionExecutor = None,
+                 protocol=Internlm2Protocol(),
+                 max_turn: int = 3) -> None:
+        self.max_turn = max_turn
+        self._interpreter_executor = interpreter_executor
+        super().__init__(
+            llm=llm, action_executor=plugin_executor, protocol=protocol)
+
+    def chat(self, message: Union[str, Dict], **kwargs) -> AgentReturn:
+        if isinstance(message, str):
+            message = dict(role='user', content=message)
+        if isinstance(message, dict):
+            message = [message]
+        inner_history = message[:]
+        offset = len(inner_history)
+        agent_return = AgentReturn()
+        for _ in range(self.max_turn):
+            # list of dict
+            prompt = self._protocol.format(
+                inner_step=inner_history,
+                plugin_executor=self._action_executor,
+                interpreter_executor=self._interpreter_executor,
+            )
+            response = self._llm.chat(prompt, **kwargs)
+            name, language, action = self._protocol.parse(
+                message=response,
+                plugin_executor=self._action_executor,
+                interpreter_executor=self._interpreter_executor,
+            )
+            if name:
+                if name == 'plugin':
+                    if self._action_executor:
+                        executor = self._action_executor
+                    else:
+                        logging.info(msg='No plugin is instantiated!')
+                        continue
+                    try:
+                        action = json.loads(action)
+                    except Exception as e:
+                        logging.info(msg=f'Invaild action {e}')
+                        continue
+                elif name == 'interpreter':
+                    if self._interpreter_executor:
+                        executor = self._interpreter_executor
+                    else:
+                        logging.info(msg='No interpreter is instantiated!')
+                        continue
+                else:
+                    logging.info(
+                        msg=(f"Invalid name '{name}'. Currently only 'plugin' "
+                             "and 'interpreter' are supported."))
+                    continue
+                action_return: ActionReturn = executor(action['name'],
+                                                       action['parameters'])
+                action_return.thought = language
+                agent_return.actions.append(action_return)
+            inner_history.append(dict(role='language', content=language))
+            if not name or action_return.type == executor.finish_action.name:
+                agent_return.response = language
+                agent_return.state = AgentStatusCode.END
+                break
+            else:
+                inner_history.append(
+                    dict(role='tool', content=action, name=name))
+                inner_history.append(
+                    self._protocol.format_response(action_return, name=name))
+        agent_return.inner_steps = inner_history[offset:]
+        return agent_return
+
+    def stream_chat(self, message: List[dict], **kwargs) -> AgentReturn:
+        if isinstance(message, str):
+            message = dict(role='user', content=message)
+        if isinstance(message, dict):
+            message = [message]
+        inner_history = message[:]
+        offset = len(inner_history)
+        agent_return = AgentReturn()
+        agent_return.inner_steps = deepcopy(inner_history)
+        last_agent_state = AgentStatusCode.SESSION_READY
+        for _ in range(self.max_turn):
+            # list of dict
+            prompt = self._protocol.format(
+                inner_step=inner_history,
+                plugin_executor=self._action_executor,
+                interpreter_executor=self._interpreter_executor,
+            )
+            response = ''
+            for model_state, res, _ in self._llm.stream_chat(prompt, **kwargs):
+                model_state: ModelStatusCode
+                response = res
+                if model_state.value < 0:
+                    agent_return.state = getattr(AgentStatusCode,
+                                                 model_state.name)
+                    yield deepcopy(agent_return)
+                    return
+                else:
+                    name, language, action = self._protocol.parse(
+                        message=response,
+                        plugin_executor=self._action_executor,
+                        interpreter_executor=self._interpreter_executor,
+                    )
+                    if name:
+                        if model_state == ModelStatusCode.END:
+                            agent_state = last_agent_state + 1
+                            if name == 'plugin':
+                                if self._action_executor:
+                                    executor = self._action_executor
+                                else:
+                                    logging.info(
+                                        msg='No plugin is instantiated!')
+                                    continue
+                                try:
+                                    action = json.loads(action)
+                                except Exception as e:
+                                    logging.info(msg=f'Invaild action {e}')
+                                    continue
+                            elif name == 'interpreter':
+                                if self._interpreter_executor:
+                                    executor = self._interpreter_executor
+                                else:
+                                    logging.info(
+                                        msg='No interpreter is instantiated!')
+                                    continue
+                            agent_return.state = agent_state
+                            agent_return.response = action
+                        else:
+                            agent_state = (
+                                AgentStatusCode.PLUGIN_START if name
+                                == 'plugin' else AgentStatusCode.CODING)
+                            if agent_state != last_agent_state:
+                                # agent_return.state = agent_state
+                                agent_return.response = language
+                                yield deepcopy(agent_return)
+                            agent_return.state = agent_state
+                            agent_return.response = action
+                    else:
+                        agent_state = AgentStatusCode.STREAM_ING
+                        agent_return.state = agent_state
+                        agent_return.response = language
+                    last_agent_state = agent_state
+                    yield deepcopy(agent_return)
+            print(colored(response, 'red'))
+            if name:
+                action_return: ActionReturn = executor(action['name'],
+                                                       action['parameters'])
+                action_return.type = action['name']
+                action_return.thought = language
+                agent_return.actions.append(action_return)
+                print(colored(action_return.result, 'magenta'))
+            inner_history.append(dict(role='language', content=language))
+            if not name:
+                agent_return.response = language
+                break
+            elif action_return.type == executor.finish_action.name:
+                try:
+                    response = action_return.args['text']['response']
+                except Exception:
+                    logging.info(msg='Unable to parse FinishAction.')
+                    response = ''
+                agent_return.response = response
+                break
+            else:
+                inner_history.append(
+                    dict(role='tool', content=action, name=name))
+                inner_history.append(
+                    self._protocol.format_response(action_return, name=name))
+                agent_state += 1
+                agent_return.state = agent_state
+                agent_return.inner_steps = deepcopy(inner_history[offset:])
+                yield agent_return
+        agent_return.inner_steps = deepcopy(inner_history[offset:])
+        agent_return.state = AgentStatusCode.END
+        yield agent_return
+
+    def batch_chat(self, batch_messages: List[Union[List[dict], dict, str]],
+                   **kwargs) -> List[AgentReturn]:
+        assert isinstance(batch_messages, list)
+        agent_returns = [AgentReturn() for _ in range(len(batch_messages))]
+        inner_histories = []
+        for message in batch_messages:
+            if isinstance(message, str):
+                message = dict(role='user', content=message)
+            if isinstance(message, dict):
+                message = [message]
+            inner_histories.append(deepcopy(message))
+        offsets = [len(inner) for inner in inner_histories]
+        finish_flags = [False for _ in range(len(batch_messages))]
+        for _ in range(self.max_turn):
+            unfinished = [
+                index for index, is_finish in enumerate(finish_flags)
+                if not is_finish
+            ]
+            if not unfinished:
+                break
+            batch_prompt = []
+            for index in unfinished:
+                batch_prompt.append(
+                    self._protocol.format(
+                        inner_step=inner_histories[index],
+                        plugin_executor=self._action_executor,
+                        interpreter_executor=self._interpreter_executor,
+                    ))
+            batch_response = self._llm.chat(batch_prompt, **kwargs)
+            executor2action_args = defaultdict(lambda: defaultdict(list))
+            for response, index in zip(batch_response, unfinished):
+                name, language, action = self._protocol.parse(
+                    message=response,
+                    plugin_executor=self._action_executor,
+                    interpreter_executor=self._interpreter_executor,
+                )
+                if name:
+                    if name == 'plugin':
+                        if self._action_executor:
+                            executor = self._action_executor
+                        else:
+                            logging.info(msg='No plugin is instantiated!')
+                            continue
+                        try:
+                            action = json.loads(action)
+                        except Exception as e:
+                            logging.info(msg=f'Invaild action {e}')
+                            continue
+                    elif name == 'interpreter':
+                        if self._interpreter_executor:
+                            executor = self._interpreter_executor
+                        else:
+                            logging.info(msg='No interpreter is instantiated!')
+                            continue
+                    else:
+                        logging.info(
+                            msg=  # noqa
+                            (f"Invalid name '{name}'. Currently only 'plugin' "
+                             "and 'interpreter' are supported."))
+                        continue
+                    executor2action_args[executor][action['name']].append(
+                        (index, name, action, language))
+                else:
+                    inner_histories[index].append(
+                        dict(role='language', content=language))
+                    agent_returns[index].response = language
+                    agent_returns[index].state = AgentStatusCode.END
+                    finish_flags[index] = True
+
+            for executor, action_args in executor2action_args.items():
+                for action_name, args in action_args.items():
+                    indexes, _, actions, _ = list(zip(*args))
+                    action_returns = executor.actions[action_name]([
+                        action['parameters']['command'] for action in actions
+                    ], list(indexes))
+                    for (index, name, action,
+                         language), action_return in zip(args, action_returns):
+                        action_return.thought = language
+                        inner_histories[index].append(
+                            dict(role='language', content=language))
+                        if action_return.type == executor.finish_action.name:
+                            agent_returns[index].response = language
+                            agent_returns[index].state = AgentStatusCode.END
+                            finish_flags[index] = True
+                        else:
+                            inner_histories[index].append(
+                                dict(role='tool', content=action, name=name))
+                            inner_histories[index].append(
+                                self._protocol.format_response(
+                                    action_return, name=name))
+        for agent_return, offset, inner_history in zip(agent_returns, offsets,
+                                                       inner_histories):
+            agent_return.inner_steps = inner_history[offset:]
+        return agent_returns
+
+### lagent/llms/huggingface.py
+import copy
+import logging
+from typing import Dict, List, Optional, Union
+
+from lagent.schema import ModelStatusCode
+from .base_api import APITemplateParser
+from .base_llm import BaseModel
+
+logger = logging.getLogger(__name__)
+
+
+class HFTransformer(BaseModel):
+    """Model wrapper around HuggingFace general models.
+
+    Adapted from Internlm (https://github.com/InternLM/InternLM/blob/main/
+        chat/web_demo.py)
+
+    Args:
+        path (str): The name or path to HuggingFace's model.
+        tokenizer_path (str): The path to the tokenizer. Defaults to None.
+        tokenizer_kwargs (dict): Keyword arguments for the tokenizer.
+            Defaults to {}.
+        tokenizer_only (bool): If True, only the tokenizer will be initialized.
+            Defaults to False.
+        model_kwargs (dict): Keyword arguments for the model, used in loader.
+            Defaults to dict(device_map='auto').
+        meta_template (Dict, optional): The model's meta prompt
+            template if needed, in case the requirement of injecting or
+            wrapping of any meta instructions.
+    """
+
+    def __init__(self,
+                 path: str,
+                 tokenizer_path: Optional[str] = None,
+                 tokenizer_kwargs: dict = dict(),
+                 tokenizer_only: bool = False,
+                 model_kwargs: dict = dict(device_map='auto'),
+                 meta_template: Optional[Dict] = None,
+                 stop_words_id: Union[List[int], int] = None,
+                 **kwargs):
+        super().__init__(
+            path=path,
+            tokenizer_only=tokenizer_only,
+            meta_template=meta_template,
+            **kwargs)
+        if isinstance(stop_words_id, int):
+            stop_words_id = [stop_words_id]
+        self.gen_params.update(stop_words_id=stop_words_id)
+        if self.gen_params['stop_words'] is not None and \
+                self.gen_params['stop_words_id'] is not None:
+            logger.warning('Both stop_words and stop_words_id are specified,'
+                           'only stop_words_id will be used.')
+
+        self._load_tokenizer(
+            path=path,
+            tokenizer_path=tokenizer_path,
+            tokenizer_kwargs=tokenizer_kwargs)
+        if not tokenizer_only:
+            self._load_model(path=path, model_kwargs=model_kwargs)
+
+        from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList  # noqa: E501
+        self.logits_processor = LogitsProcessorList()
+        self.stopping_criteria = StoppingCriteriaList()
+        self.prefix_allowed_tokens_fn = None
+
+        stop_words_id = []
+        if self.gen_params.get('stop_words_id'):
+            stop_words_id = self.gen_params.get('stop_words_id')
+        elif self.gen_params.get('stop_words'):
+            for sw in self.gen_params.get('stop_words'):
+                stop_words_id.append(self.tokenizer(sw)['input_ids'][-1])
+        self.additional_eos_token_id = stop_words_id
+
+    def _load_tokenizer(self, path: str, tokenizer_path: Optional[str],
+                        tokenizer_kwargs: dict):
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path if tokenizer_path else path,
+            trust_remote_code=True,
+            **tokenizer_kwargs)
+
+        if self.tokenizer.pad_token_id is None:
+            if self.tokenizer.eos_token is not None:
+                logger.warning(
+                    f'Using eos_token_id {self.tokenizer.eos_token} '
+                    'as pad_token_id.')
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                from transformers.generation import GenerationConfig
+                self.gcfg = GenerationConfig.from_pretrained(path)
+
+                if self.gcfg.pad_token_id is not None:
+                    logger.warning(
+                        f'Using pad_token_id {self.gcfg.pad_token_id} '
+                        'as pad_token_id.')
+                    self.tokenizer.pad_token_id = self.gcfg.pad_token_id
+                else:
+                    raise ValueError(
+                        'pad_token_id is not set for this tokenizer. Try to '
+                        'set pad_token_id via passing '
+                        '`pad_token_id={PAD_TOKEN_ID}` in model_cfg.')
+
+    def _load_model(self, path: str, model_kwargs: dict):
+        import torch
+        from transformers import AutoModel
+        model_kwargs.setdefault('torch_dtype', torch.float16)
+        self.model = AutoModel.from_pretrained(
+            path, trust_remote_code=True, **model_kwargs)
+        self.model.eval()
+
+    def tokenize(self, inputs: str):
+        assert isinstance(inputs, str)
+        inputs = self.tokenizer(
+            inputs, return_tensors='pt', return_length=True)
+        return inputs['input_ids'].tolist()
+
+    def generate(
+        self,
+        inputs: Union[str, List[str]],
+        do_sample: bool = True,
+        **kwargs,
+    ):
+        """Return the chat completions in non-stream mode.
+
+        Args:
+            inputs (Union[str, List[str]]): input texts to be completed.
+            do_sample (bool): do sampling if enabled
+        Returns:
+            (a list of/batched) text/chat completion
+        """
+        for status, chunk, _ in self.stream_generate(inputs, do_sample,
+                                                     **kwargs):
+            response = chunk
+        return response
+
+    def stream_generate(
+        self,
+        inputs: List[str],
+        do_sample: bool = True,
+        **kwargs,
+    ):
+        """Return the chat completions in stream mode.
+
+        Args:
+            inputs (Union[str, List[str]]): input texts to be completed.
+            do_sample (bool): do sampling if enabled
+        Returns:
+            tuple(Status, str, int): status, text/chat completion,
+            generated token number
+        """
+        import torch
+        from torch import nn
+        with torch.no_grad():
+            batched = True
+            if isinstance(inputs, str):
+                inputs = [inputs]
+                batched = False
+            inputs = self.tokenizer(
+                inputs, padding=True, return_tensors='pt', return_length=True)
+            input_length = inputs['length']
+            for k, v in inputs.items():
+                inputs[k] = v.cuda()
+            input_ids = inputs['input_ids']
+            attention_mask = inputs['attention_mask']
+            batch_size = input_ids.shape[0]
+            input_ids_seq_length = input_ids.shape[-1]
+            generation_config = self.model.generation_config
+            generation_config = copy.deepcopy(generation_config)
+            new_gen_params = self.update_gen_params(**kwargs)
+            generation_config.update(**new_gen_params)
+            generation_config.update(**kwargs)
+            model_kwargs = generation_config.to_dict()
+            model_kwargs['attention_mask'] = attention_mask
+            eos_token_id = generation_config.eos_token_id
+            if eos_token_id is None:
+                # ``gcfg`` is only available when the tokenizer provides
+                # neither pad_token nor eos_token, so access it safely.
+                gcfg = getattr(self, 'gcfg', None)
+                if gcfg is not None and gcfg.eos_token_id is not None:
+                    eos_token_id = gcfg.eos_token_id
+                else:
+                    eos_token_id = []
+            if isinstance(eos_token_id, int):
+                eos_token_id = [eos_token_id]
+            else:
+                eos_token_id = list(eos_token_id)
+            if self.additional_eos_token_id is not None:
+                eos_token_id.extend(self.additional_eos_token_id)
+            eos_token_id_tensor = torch.tensor(eos_token_id).to(
+                input_ids.device) if eos_token_id is not None else None
+            # ``_eos_token_tensor`` is a private attribute that is normally
+            # initialized by ``GenerationMixin._prepare_special_tokens``
+            # (transformers>=4.45). Since the generation loop below is written
+            # manually, those helpers are never invoked and the stopping
+            # criteria would raise
+            # ``AttributeError: 'GenerationConfig' object has no attribute
+            # '_eos_token_tensor'``. Hence initialize the attributes that the
+            # generation internals rely on explicitly.
+            generation_config.eos_token_id = eos_token_id
+            generation_config._eos_token_tensor = eos_token_id_tensor
+            pad_token_id = generation_config.pad_token_id
+            generation_config._pad_token_tensor = (
+                torch.tensor(pad_token_id).to(input_ids.device)
+                if pad_token_id is not None else None)
+            generation_config.max_length = (
+                generation_config.max_new_tokens + input_ids_seq_length)
+            # Set generation parameters if not already defined
+            logits_processor = self.logits_processor
+            stopping_criteria = self.stopping_criteria
+
+            logits_processor = self.model._get_logits_processor(
+                generation_config=generation_config,
+                input_ids_seq_length=input_ids_seq_length,
+                encoder_input_ids=input_ids,
+                prefix_allowed_tokens_fn=self.prefix_allowed_tokens_fn,
+                logits_processor=logits_processor,
+            )
+
+            stopping_criteria = self.model._get_stopping_criteria(
+                generation_config=generation_config,
+                stopping_criteria=stopping_criteria)
+            logits_warper = self.model._get_logits_warper(generation_config)
+
+            unfinished_sequences = input_ids.new(batch_size).fill_(1)
+            scores = None
+            while True:
+                model_inputs = self.model.prepare_inputs_for_generation(
+                    input_ids, **model_kwargs)
+                # forward pass to get next token
+                outputs = self.model(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                )
+
+                next_token_logits = outputs.logits[:, -1, :]
+
+                # pre-process distribution
+                next_token_scores = logits_processor(input_ids,
+                                                     next_token_logits)
+                next_token_scores = logits_warper(input_ids, next_token_scores)
+
+                # sample
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                if do_sample:
+                    next_tokens = torch.multinomial(
+                        probs, num_samples=1).squeeze(1)
+                else:
+                    next_tokens = torch.argmax(probs, dim=-1)
+
+                # update generated ids, model inputs,
+                # and length for next step
+                input_ids = torch.cat([input_ids, next_tokens[:, None]],
+                                      dim=-1)
+                model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa: E501
+                    outputs,
+                    model_kwargs,
+                    is_encoder_decoder=False)
+                unfinished_sequences = unfinished_sequences.mul(
+                    next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(
+                        eos_token_id_tensor.unsqueeze(1)).prod(dim=0))
+                output_token_ids = input_ids.cpu().tolist()
+                for i in range(len(output_token_ids)):
+                    output_token_ids[i] = output_token_ids[i][:][
+                        input_length[i]:]
+                    # Find the first occurrence of
+                    # an EOS token in the sequence
+                    first_eos_idx = next(
+                        (idx
+                         for idx, token_id in enumerate(output_token_ids[i])
+                         if token_id in eos_token_id), None)
+                    # If an EOS token is found, only the previous
+                    # part of it is retained
+                    if first_eos_idx is not None:
+                        output_token_ids[i] = output_token_ids[
+                            i][:first_eos_idx]
+
+                response = self.tokenizer.batch_decode(output_token_ids)
+                # print(response)
+                if not batched:
+                    response = response[0]
+                yield ModelStatusCode.STREAM_ING, response, None
+                # stop when each sentence is finished,
+                # or if we exceed the maximum length
+                if (unfinished_sequences.max() == 0
+                        or stopping_criteria(input_ids, scores)):
+                    break
+            yield ModelStatusCode.END, response, None
+
+    def stream_chat(
+        self,
+        inputs: List[dict],
+        do_sample: bool = True,
+        **kwargs,
+    ):
+        """Return the chat completions in stream mode.
+
+        Args:
+            inputs (List[dict]): input messages to be completed.
+            do_sample (bool): do sampling if enabled
+        Returns:
+            the text/chat completion
+        """
+        prompt = self.template_parser(inputs)
+        yield from self.stream_generate(prompt, do_sample, **kwargs)
+
+
+class HFTransformerCasualLM(HFTransformer):
+
+    def _load_model(self, path: str, model_kwargs: dict):
+        import torch
+        from transformers import AutoModelForCausalLM
+        model_kwargs.setdefault('torch_dtype', torch.float16)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            path, trust_remote_code=True, **model_kwargs)
+        self.model.eval()
+
+
+class HFTransformerChat(HFTransformerCasualLM):
+
+    def __init__(self, template_parser=APITemplateParser, **kwargs):
+        super().__init__(template_parser=template_parser, **kwargs)
+
+    def chat(self,
+             inputs: Union[List[dict], List[List[dict]]],
+             do_sample: bool = True,
+             **kwargs):
+        """Return the chat completions in stream mode.
+
+        Args:
+            inputs (Union[List[dict], List[List[dict]]]): input messages to be completed.
+            do_sample (bool): do sampling if enabled
+        Returns:
+            the text/chat completion
+        """
+        # handle batch inference with vanilla for loop
+        if isinstance(inputs[0], list):
+            resps = []
+            for input in inputs:
+                resps.append(self.chat(input, do_sample, **kwargs))
+            return resps
+        prompt = self.template_parser(inputs)
+        query = prompt[-1]['content']
+        history = prompt[:-1]
+        try:
+            response, history = self.model.chat(
+                self.tokenizer, query, history=history)
+        except Exception as e:
+            # handle over-length input error
+            logger.warning(str(e))
+            response = ''
+        return response
+
+--------------------------------------------------------------------------------

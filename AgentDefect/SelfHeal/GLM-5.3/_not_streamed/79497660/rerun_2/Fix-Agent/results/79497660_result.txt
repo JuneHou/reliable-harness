@@ -1,0 +1,482 @@
+Case ID: 79497660
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 23:41:36
+End Time: 2026-11-05 00:18:08
+Total Duration: 2191.92 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+from llama_index.core import VectorStoreIndex, Document
+from llama_index.core.vector_stores import VectorStoreQuery
+from llama_index.vector_stores.postgres import PGVectorStore
+from sqlalchemy import Column, Text, text as sql_text
+import psycopg2
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_CONFIG = {
+    "host": "localhost",
+    "password": "password",
+    "port": 5432,
+    "user": "postgres",
+}
+
+# PGVectorStore stores rows in a physical table named "data_" + table_name,
+# so table_name="vectorstore" maps to the physical table "data_vectorstore".
+TABLE_NAME = "vectorstore"
+PHYSICAL_TABLE = f"data_{TABLE_NAME}"
+SCHEMA_NAME = "public"
+CUSTOM_COLUMN = "external_id"
+
+
+def ensure_external_id_column(request):
+    """
+    KEY FIX (part 1): PGVectorStore only creates `metadata_cols` columns when
+    it *creates* the table. If the table already exists from a previous run
+    (created without metadata_cols), the new column would never be added and
+    external_id would keep living only inside the metadata JSON column.
+
+    This helper migrates an already-existing table in place so that its
+    schema actually contains the external_id column (preserving any rows).
+    """
+    conn = psycopg2.connect(dbname=request.tenant, **DB_CONFIG)
+    try:
+        cur = conn.cursor()
+
+        # Does the physical table exist yet?
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            (SCHEMA_NAME, PHYSICAL_TABLE),
+        )
+        table_exists = cur.fetchone() is not None
+
+        if table_exists:
+            # Does it already have the custom column?
+            cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s AND column_name = %s
+                """,
+                (SCHEMA_NAME, PHYSICAL_TABLE, CUSTOM_COLUMN),
+            )
+            column_exists = cur.fetchone() is not None
+
+            if not column_exists:
+                cur.execute(
+                    f'ALTER TABLE {SCHEMA_NAME}."{PHYSICAL_TABLE}" '
+                    f'ADD COLUMN IF NOT EXISTS "{CUSTOM_COLUMN}" TEXT'
+                )
+                conn.commit()
+
+        cur.close()
+    finally:
+        conn.close()
+
+
+def create_vector_store(request):
+    host = "localhost"
+    password = "password"
+    port = 5432
+    user = "postgres"
+
+    # KEY FIX (part 2): declare external_id as a real SQLAlchemy column that
+    # PGVectorStore will create directly on the table, instead of letting it
+    # get buried inside the metadata JSON column.
+    external_id_col = Column(
+        CUSTOM_COLUMN,
+        Text,
+        nullable=True,
+    )
+
+    def customize_query_fn(query_base, query: VectorStoreQuery):
+        # KEY FIX (part 3): surface the extra column on every SELECT
+        # statement so that it is returned during retrieval in
+        # node.metadata["custom_fields"].
+        return query_base.add_columns(sql_text(CUSTOM_COLUMN))
+
+    vector_store = PGVectorStore.from_params(
+        database=request.tenant,
+        host=host,
+        password=password,
+        port=port,
+        user=user,
+        table_name=TABLE_NAME,
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+        # This makes PGVectorStore create a dedicated `external_id` column
+        # on the data_<table_name> table. Its value is populated from
+        # node.metadata["external_id"] on insert.
+        metadata_cols={CUSTOM_COLUMN: external_id_col},
+        # Retrieve the custom column back in query results.
+        customize_query_fn=customize_query_fn,
+    )
+
+    return vector_store
+
+
+def run_agent(request):
+    # Make sure an already-created table actually has the new column.
+    ensure_external_id_column(request)
+
+    vector_store = create_vector_store(request)
+
+    # Note: external_id must also be present in the node metadata, because
+    # PGVectorStore populates the custom column from the matching metadata
+    # key on insert.
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store,
+    )
+
+    return index
+
+
+def verify_table_columns(request):
+    """Confirm that external_id now exists as its own table column."""
+    conn = psycopg2.connect(dbname=request.tenant, **DB_CONFIG)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (SCHEMA_NAME, PHYSICAL_TABLE),
+        )
+        columns = [row[0] for row in cur.fetchall()]
+        cur.close()
+    finally:
+        conn.close()
+    return columns
+
+
+def verify_external_id_values(request):
+    """Confirm that external_id values were written into the new column."""
+    conn = psycopg2.connect(dbname=request.tenant, **DB_CONFIG)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f'SELECT "{CUSTOM_COLUMN}" FROM {SCHEMA_NAME}."{PHYSICAL_TABLE}" '
+            f'WHERE "{CUSTOM_COLUMN}" IS NOT NULL'
+        )
+        values = [row[0] for row in cur.fetchall()]
+        cur.close()
+    finally:
+        conn.close()
+    return values
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+
+    # Verify the schema now contains a dedicated external_id column.
+    columns = verify_table_columns(request)
+    print(f"Table '{SCHEMA_NAME}.{PHYSICAL_TABLE}' columns: {columns}")
+
+    values = verify_external_id_values(request)
+    print(f"external_id values stored in the dedicated column: {values}")
+
+    assert CUSTOM_COLUMN in columns, (
+        f"'{CUSTOM_COLUMN}' column is missing from the table schema!"
+    )
+    assert "ext_001" in values and "ext_002" in values, (
+        "external_id values were not written to the dedicated column!"
+    )
+    print(f"'{CUSTOM_COLUMN}' is now stored as a separate column in the table")
+
+    # Optional demonstration: retrieve documents and read the custom column
+    # back through node.metadata["custom_fields"] (courtesy of
+    # customize_query_fn).
+    try:
+        from llama_index.core.retrievers import VectorIndexRetriever
+
+        retriever = VectorIndexRetriever(index=index, similarity_top_k=2)
+        nodes = retriever.retrieve("Sample document")
+        for n in nodes:
+            print(
+                "Retrieved external_id:",
+                n.metadata.get("custom_fields", {}).get(CUSTOM_COLUMN),
+            )
+    except Exception as e:
+        print(f"(Retrieval demonstration skipped: {e})")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 00:18:08
+Duration: 2191.92 seconds
+Verdict: ## Evaluation Summary
+
+**Tool Results:**
+- `generate_diff`: Shows a comprehensive fix using `metadata_cols`, `customize_query_fn`, plus a schema migration helper.
+- `validate_fixed_code`: **ACCEPT** — "fixed code matches expected structure and output format"
+- `verify_api_usage`: Confirmed `metadata_cols` and `customize_query_fn` are real, documented LlamaIndex `PGVectorStore` parameters. Notably, the search results quote the official LlamaIndex docs: *"we can then query the vector store and retrieve any additional field added to the select statement in a dictionary named `custom_fields` in the node metadata"* — exactly the pattern the fixed code implements.
+
+## ACCEPT
+
+**Detailed reasoning:**
+
+**1. Correct core fix (uses documented canonical API):** The bug was that `external_id` lived only inside the `metadata_` JSON column. The fix uses `PGVectorStore.from_params(..., metadata_cols={"external_id": Column("external_id", Text)})`, which is the documented LlamaIndex mechanism for creating a dedicated table column populated from `node.metadata` on insert. The test queries `SELECT external_id, metadata_ FROM data_vectorstore`, and the fix correctly preserves `table_name="vectorstore"` → physical table `data_vectorstore` (LlamaIndex's `data_` prefix behavior is correct).
+
+**2. Correct retrieval support:** The `customize_query_fn` callback adding `sql_text("external_id")` to the SELECT is the documented way to surface custom columns during retrieval via `node.metadata["custom_fields"]` — verified against the official docs.
+
+**3. Thoughtful edge-case handling:** The `ensure_external_id_column()` migration helper addresses a real gap: `metadata_cols` columns are only created when the table is *first* created. If the table already exists from a prior (buggy) run, the column would never appear. The helper checks `information_schema` and applies `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` only when needed, preserving existing rows.
+
+**4. Required supporting details present:** `external_id` is kept in the `Document` metadata (a documented requirement — the store populates the custom column from the matching metadata key), so `ext_001`/`ext_002` land in the dedicated column, satisfying `test_expected_external_ids` and the `assertIsNotNone(external_id)` check.
+
+**5. No regressions:** All original behavior (documents, HNSW params, embed_dim, index construction, `__main__` demo) is preserved; the fix only adds the column functionality plus verification helpers and assertions confirming the schema and values.
+
+**Minor observations (non-blocking):**
+- `DB_CONFIG` is duplicated with local variables in `create_vector_store` (cosmetic).
+- Test-side `ORDER BY id DESC LIMIT 2` behavior depends on the test DB state, but that's a property of the given test, not of this fix, and the structural validation passed.
+
+Given the validation tool's ACCEPT, correct use of the documented `metadata_cols`/`customize_query_fn` APIs, proper handling of pre-existing tables, and preservation of the expected `data_vectorstore` schema, the fixed code is correct.
+--------------------------------------------------------------------------------
+from llama_index.core import VectorStoreIndex, Document
+from llama_index.core.vector_stores import VectorStoreQuery
+from llama_index.vector_stores.postgres import PGVectorStore
+from sqlalchemy import Column, Text, text as sql_text
+import psycopg2
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_CONFIG = {
+    "host": "localhost",
+    "password": "password",
+    "port": 5432,
+    "user": "postgres",
+}
+
+# PGVectorStore stores rows in a physical table named "data_" + table_name,
+# so table_name="vectorstore" maps to the physical table "data_vectorstore".
+TABLE_NAME = "vectorstore"
+PHYSICAL_TABLE = f"data_{TABLE_NAME}"
+SCHEMA_NAME = "public"
+CUSTOM_COLUMN = "external_id"
+
+
+def ensure_external_id_column(request):
+    """
+    KEY FIX (part 1): PGVectorStore only creates `metadata_cols` columns when
+    it *creates* the table. If the table already exists from a previous run
+    (created without metadata_cols), the new column would never be added and
+    external_id would keep living only inside the metadata JSON column.
+
+    This helper migrates an already-existing table in place so that its
+    schema actually contains the external_id column (preserving any rows).
+    """
+    conn = psycopg2.connect(dbname=request.tenant, **DB_CONFIG)
+    try:
+        cur = conn.cursor()
+
+        # Does the physical table exist yet?
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            (SCHEMA_NAME, PHYSICAL_TABLE),
+        )
+        table_exists = cur.fetchone() is not None
+
+        if table_exists:
+            # Does it already have the custom column?
+            cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s AND column_name = %s
+                """,
+                (SCHEMA_NAME, PHYSICAL_TABLE, CUSTOM_COLUMN),
+            )
+            column_exists = cur.fetchone() is not None
+
+            if not column_exists:
+                cur.execute(
+                    f'ALTER TABLE {SCHEMA_NAME}."{PHYSICAL_TABLE}" '
+                    f'ADD COLUMN IF NOT EXISTS "{CUSTOM_COLUMN}" TEXT'
+                )
+                conn.commit()
+
+        cur.close()
+    finally:
+        conn.close()
+
+
+def create_vector_store(request):
+    host = "localhost"
+    password = "password"
+    port = 5432
+    user = "postgres"
+
+    # KEY FIX (part 2): declare external_id as a real SQLAlchemy column that
+    # PGVectorStore will create directly on the table, instead of letting it
+    # get buried inside the metadata JSON column.
+    external_id_col = Column(
+        CUSTOM_COLUMN,
+        Text,
+        nullable=True,
+    )
+
+    def customize_query_fn(query_base, query: VectorStoreQuery):
+        # KEY FIX (part 3): surface the extra column on every SELECT
+        # statement so that it is returned during retrieval in
+        # node.metadata["custom_fields"].
+        return query_base.add_columns(sql_text(CUSTOM_COLUMN))
+
+    vector_store = PGVectorStore.from_params(
+        database=request.tenant,
+        host=host,
+        password=password,
+        port=port,
+        user=user,
+        table_name=TABLE_NAME,
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+        # This makes PGVectorStore create a dedicated `external_id` column
+        # on the data_<table_name> table. Its value is populated from
+        # node.metadata["external_id"] on insert.
+        metadata_cols={CUSTOM_COLUMN: external_id_col},
+        # Retrieve the custom column back in query results.
+        customize_query_fn=customize_query_fn,
+    )
+
+    return vector_store
+
+
+def run_agent(request):
+    # Make sure an already-created table actually has the new column.
+    ensure_external_id_column(request)
+
+    vector_store = create_vector_store(request)
+
+    # Note: external_id must also be present in the node metadata, because
+    # PGVectorStore populates the custom column from the matching metadata
+    # key on insert.
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store,
+    )
+
+    return index
+
+
+def verify_table_columns(request):
+    """Confirm that external_id now exists as its own table column."""
+    conn = psycopg2.connect(dbname=request.tenant, **DB_CONFIG)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (SCHEMA_NAME, PHYSICAL_TABLE),
+        )
+        columns = [row[0] for row in cur.fetchall()]
+        cur.close()
+    finally:
+        conn.close()
+    return columns
+
+
+def verify_external_id_values(request):
+    """Confirm that external_id values were written into the new column."""
+    conn = psycopg2.connect(dbname=request.tenant, **DB_CONFIG)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f'SELECT "{CUSTOM_COLUMN}" FROM {SCHEMA_NAME}."{PHYSICAL_TABLE}" '
+            f'WHERE "{CUSTOM_COLUMN}" IS NOT NULL'
+        )
+        values = [row[0] for row in cur.fetchall()]
+        cur.close()
+    finally:
+        conn.close()
+    return values
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+
+    # Verify the schema now contains a dedicated external_id column.
+    columns = verify_table_columns(request)
+    print(f"Table '{SCHEMA_NAME}.{PHYSICAL_TABLE}' columns: {columns}")
+
+    values = verify_external_id_values(request)
+    print(f"external_id values stored in the dedicated column: {values}")
+
+    assert CUSTOM_COLUMN in columns, (
+        f"'{CUSTOM_COLUMN}' column is missing from the table schema!"
+    )
+    assert "ext_001" in values and "ext_002" in values, (
+        "external_id values were not written to the dedicated column!"
+    )
+    print(f"'{CUSTOM_COLUMN}' is now stored as a separate column in the table")
+
+    # Optional demonstration: retrieve documents and read the custom column
+    # back through node.metadata["custom_fields"] (courtesy of
+    # customize_query_fn).
+    try:
+        from llama_index.core.retrievers import VectorIndexRetriever
+
+        retriever = VectorIndexRetriever(index=index, similarity_top_k=2)
+        nodes = retriever.retrieve("Sample document")
+        for n in nodes:
+            print(
+                "Retrieved external_id:",
+                n.metadata.get("custom_fields", {}).get(CUSTOM_COLUMN),
+            )
+    except Exception as e:
+        print(f"(Retrieval demonstration skipped: {e})")
+
+--------------------------------------------------------------------------------

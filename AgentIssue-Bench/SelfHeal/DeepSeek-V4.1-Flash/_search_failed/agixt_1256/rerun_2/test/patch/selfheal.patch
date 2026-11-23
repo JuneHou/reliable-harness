@@ -1,0 +1,303 @@
+diff --git a/agixt/Agent.py b/agixt/Agent.py
+index fcab9d5..f7e7252 100644
+--- a/agixt/Agent.py
++++ b/agixt/Agent.py
+@@ -32,6 +32,31 @@ logging.basicConfig(
+ )
+ 
+ 
++def convert_to_bool(value):
++    """Normalize the different ways a command state can be provided into a bool."""
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, str):
++        return value.strip().lower() in ("true", "1", "yes", "on", "enabled")
++    if value is None:
++        return False
++    return bool(value)
++
++
++def get_or_create_command(session, command_name):
++    """Return the command with the given name, creating it when it is missing.
++
++    Commands that are not (yet) in the database used to be silently skipped which
++    made the agent command selections appear as if they were never saved.
++    """
++    command = session.query(Command).filter_by(name=command_name).first()
++    if not command:
++        command = Command(name=command_name)
++        session.add(command)
++        session.commit()
++    return command
++
++
+ def add_agent(agent_name, provider_settings=None, commands=None, user=DEFAULT_USER):
+     if not agent_name:
+         return {"message": "Agent name cannot be empty."}
+@@ -63,10 +88,11 @@ def add_agent(agent_name, provider_settings=None, commands=None, user=DEFAULT_US
+     # Get provider ID based on provider name from provider_settings["provider"]
+     provider = (
+         session.query(ProviderModel)
+-        .filter_by(name=provider_settings["provider"])
++        .filter_by(name=provider_settings.get("provider", "default"))
+         .first()
+     )
+-    agent = AgentModel(name=agent_name, user_id=user_id, provider_id=provider.id)
++    provider_id = provider.id if provider else None
++    agent = AgentModel(name=agent_name, user_id=user_id, provider_id=provider_id)
+     session.add(agent)
+     session.commit()
+ 
+@@ -79,12 +105,13 @@ def add_agent(agent_name, provider_settings=None, commands=None, user=DEFAULT_US
+         session.add(agent_setting)
+     if commands:
+         for command_name, enabled in commands.items():
+-            command = session.query(Command).filter_by(name=command_name).first()
+-            if command:
+-                agent_command = AgentCommand(
+-                    agent_id=agent.id, command_id=command.id, state=enabled
+-                )
+-                session.add(agent_command)
++            command = get_or_create_command(session, command_name)
++            agent_command = AgentCommand(
++                agent_id=agent.id,
++                command_id=command.id,
++                state=convert_to_bool(enabled),
++            )
++            session.add(agent_command)
+     session.commit()
+     session.close()
+     return {"message": f"Agent {agent_name} created."}
+@@ -340,24 +367,18 @@ class Agent:
+                 session.query(AgentSettingModel).filter_by(agent_id=agent.id).all()
+             )
+             agent_commands = (
+-                session.query(AgentCommand)
+-                .join(Command)
+-                .filter(
+-                    AgentCommand.agent_id == agent.id,
+-                    AgentCommand.state == True,
+-                )
+-                .all()
++                session.query(AgentCommand).filter_by(agent_id=agent.id).all()
+             )
++            enabled_commands = set()
++            for agent_command in agent_commands:
++                if agent_command.state and agent_command.command is not None:
++                    enabled_commands.add(agent_command.command.name)
+             for command in all_commands:
+                 config["commands"].update(
+-                    {
+-                        command.name: command.name
+-                        in [ac.command.name for ac in agent_commands]
+-                    }
++                    {command.name: command.name in enabled_commands}
+                 )
+             for setting in agent_settings:
+                 config["settings"][setting.name] = setting.value
+-            session.commit()
+             session.close()
+             user_settings = self.get_registration_requirement_settings()
+             for key, value in user_settings.items():
+@@ -441,6 +462,8 @@ class Agent:
+ 
+     def update_agent_config(self, new_config, config_key):
+         session = get_session()
++        if new_config is None:
++            new_config = {}
+         agent = (
+             session.query(AgentModel)
+             .filter(
+@@ -450,6 +473,7 @@ class Agent:
+         )
+         if not agent:
+             if self.user == DEFAULT_USER:
++                session.close()
+                 return f"Agent {self.agent_name} not found."
+             # Check if it is a global agent.
+             global_user = session.query(User).filter(User.email == DEFAULT_USER).first()
+@@ -457,7 +481,7 @@ class Agent:
+                 session.query(AgentModel)
+                 .filter(
+                     AgentModel.name == self.agent_name,
+-                    AgentModel.user_id == global_user.id,
++                    AgentModel.user_id == global_user.id if global_user else None,
+                 )
+                 .first()
+             )
+@@ -482,38 +506,43 @@ class Agent:
+                         value=setting.value,
+                     )
+                     session.add(agent_setting)
+-                session.commit()
+                 agent_commands = (
+                     session.query(AgentCommand)
+                     .filter_by(agent_id=global_agent.id)
+                     .all()
+                 )
+-                for agent_command in agent_commands:
++                for global_agent_command in agent_commands:
+                     agent_command = AgentCommand(
+                         agent_id=agent.id,
+-                        command_id=agent_command.command_id,
+-                        state=agent_command.state,
++                        command_id=global_agent_command.command_id,
++                        state=global_agent_command.state,
+                     )
+                     session.add(agent_command)
+                 session.commit()
++            else:
+                 session.close()
+-                return f"Agent {self.agent_name} configuration updated successfully."
++                return f"Agent {self.agent_name} not found."
++        # Apply the new configuration to the agent. When the agent did not exist
++        # for this user yet, the configuration is applied to the copy of the
++        # global agent that was just created above so that the changes are
++        # actually persisted instead of being discarded.
+         if config_key == "commands":
+             for command_name, enabled in new_config.items():
+-                command = session.query(Command).filter_by(name=command_name).first()
+-                if command:
+-                    agent_command = (
+-                        session.query(AgentCommand)
+-                        .filter_by(agent_id=agent.id, command_id=command.id)
+-                        .first()
++                state = convert_to_bool(enabled)
++                command = get_or_create_command(session, command_name)
++                agent_commands = (
++                    session.query(AgentCommand)
++                    .filter_by(agent_id=agent.id, command_id=command.id)
++                    .all()
++                )
++                if agent_commands:
++                    for agent_command in agent_commands:
++                        agent_command.state = state
++                else:
++                    agent_command = AgentCommand(
++                        agent_id=agent.id, command_id=command.id, state=state
+                     )
+-                    if agent_command:
+-                        agent_command.state = enabled
+-                    else:
+-                        agent_command = AgentCommand(
+-                            agent_id=agent.id, command_id=command.id, state=enabled
+-                        )
+-                        session.add(agent_command)
++                    session.add(agent_command)
+         else:
+             for setting_name, setting_value in new_config.items():
+                 logging.info(f"Setting {setting_name} to {setting_value}.")
+@@ -563,13 +592,25 @@ class Agent:
+         browsed_links = (
+             session.query(AgentBrowsedLink)
+             .filter_by(agent_id=agent.id, conversation_id=conversation_id)
+-            .order_by(AgentBrowsedLink.id.desc())
++            .order_by(AgentBrowsedLink.timestamp.desc())
+             .all()
+         )
++        links = [
++            {
++                "id": str(browsed_link.id),
++                "agent_id": str(browsed_link.agent_id),
++                "conversation_id": (
++                    str(browsed_link.conversation_id)
++                    if browsed_link.conversation_id is not None
++                    else None
++                ),
++                "url": browsed_link.url,
++                "timestamp": browsed_link.timestamp,
++            }
++            for browsed_link in browsed_links
++        ]
+         session.close()
+-        if not browsed_links:
+-            return []
+-        return browsed_links
++        return links
+ 
+     def browsed_recently(self, url, conversation_id=None) -> bool:
+         """
+@@ -585,9 +626,15 @@ class Agent:
+         if not browsed_links:
+             return False
+         for link in browsed_links:
+-            if link["url"] == url:
+-                if link["timestamp"] >= datetime.now(timezone.utc) - timedelta(days=1):
+-                    return True
++            if str(link["url"]) != str(url):
++                continue
++            timestamp = link["timestamp"]
++            if timestamp is None:
++                return True
++            if timestamp.tzinfo is None:
++                timestamp = timestamp.replace(tzinfo=timezone.utc)
++            if timestamp >= datetime.now(timezone.utc) - timedelta(days=1):
++                return True
+         return False
+ 
+     def add_browsed_link(self, url, conversation_id=None):
+@@ -609,6 +656,7 @@ class Agent:
+             .first()
+         )
+         if not agent:
++            session.close()
+             return f"Agent {self.agent_name} not found."
+         browsed_link = AgentBrowsedLink(
+             agent_id=agent.id, url=url, conversation_id=conversation_id
+@@ -638,6 +686,7 @@ class Agent:
+             .first()
+         )
+         if not agent:
++            session.close()
+             return f"Agent {self.agent_name} not found."
+         browsed_link = (
+             session.query(AgentBrowsedLink)
+@@ -645,6 +694,7 @@ class Agent:
+             .first()
+         )
+         if not browsed_link:
++            session.close()
+             return f"Link {url} not found."
+         session.delete(browsed_link)
+         session.commit()
+diff --git a/agixt/DB.py b/agixt/DB.py
+index 4e2c34c..7a91c07 100644
+--- a/agixt/DB.py
++++ b/agixt/DB.py
+@@ -218,7 +218,7 @@ class AgentBrowsedLink(Base):
+         ForeignKey("conversation.id"),
+         nullable=True,
+     )
+-    link = Column(Text, nullable=False)
++    url = Column(Text, nullable=False)
+     timestamp = Column(DateTime, server_default=func.now())
+ 
+ 
+diff --git a/agixt/endpoints/Agent.py b/agixt/endpoints/Agent.py
+index 9f351b6..78a33d3 100644
+--- a/agixt/endpoints/Agent.py
++++ b/agixt/endpoints/Agent.py
+@@ -111,13 +111,20 @@ async def update_agent_settings(
+     if is_admin(email=user, api_key=authorization) != True:
+         raise HTTPException(status_code=403, detail="Access Denied")
+     ApiClient = get_api_client(authorization=authorization)
++    agent = Agent(agent_name=agent_name, user=user, ApiClient=ApiClient)
+     new_settings = {}
+     for key in settings.settings:
+         if settings.settings[key] != "HIDDEN":
+             new_settings[key] = settings.settings[key]
+-    update_config = Agent(
+-        agent_name=agent_name, user=user, ApiClient=ApiClient
+-    ).update_agent_config(new_config=settings.settings, config_key="settings")
++    update_config = agent.update_agent_config(
++        new_config=new_settings, config_key="settings"
++    )
++    # Commands may be submitted along with the settings, make sure they are saved
++    # as well so the selected extension commands do not revert on page refresh.
++    if settings.commands:
++        update_config = agent.update_agent_config(
++            new_config=settings.commands, config_key="commands"
++        )
+     return ResponseMessage(message=update_config)
+ 
+ 

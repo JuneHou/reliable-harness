@@ -1,0 +1,199 @@
+diff --git a/packages/google/src/convert-json-schema-to-openapi-schema.test.ts b/packages/google/src/convert-json-schema-to-openapi-schema.test.ts
+index cf1b7fc..0d40916 100644
+--- a/packages/google/src/convert-json-schema-to-openapi-schema.test.ts
++++ b/packages/google/src/convert-json-schema-to-openapi-schema.test.ts
+@@ -553,3 +553,75 @@ it('should convert nullable string enum', () => {
+     },
+   });
+ });
++
++it('should convert record schemas (additionalProperties) without undefined values', () => {
++  // `z.record(z.string())` is converted by zod to an object schema that only
++  // has `additionalProperties`. Such schemas must not be removed from the
++  // generated schema (which previously produced `undefined` values that
++  // Vertex AI rejected).
++  const input: JSONSchema7 = {
++    type: 'object',
++    properties: {
++      record: {
++        type: 'object',
++        additionalProperties: { type: 'string' },
++      },
++      emptyObject: {
++        type: 'object',
++      },
++    },
++    required: ['record'],
++    additionalProperties: false,
++    $schema: 'http://json-schema.org/draft-07/schema#',
++  };
++
++  const converted = convertJSONSchemaToOpenAPISchema(input);
++
++  expect(converted).toStrictEqual({
++    type: 'object',
++    properties: {
++      record: { type: 'object' },
++      emptyObject: { type: 'object' },
++    },
++    required: ['record'],
++  });
++});
++
++it('should convert a record schema at the root level', () => {
++  const input: JSONSchema7 = {
++    type: 'object',
++    additionalProperties: { type: 'string' },
++  };
++
++  expect(convertJSONSchemaToOpenAPISchema(input)).toStrictEqual({
++    type: 'object',
++  });
++});
++
++it('should not create undefined values in nested arrays and unions', () => {
++  const input: JSONSchema7 = {
++    type: 'object',
++    properties: {
++      list: {
++        type: 'array',
++        items: { type: 'object' },
++      },
++      union: {
++        anyOf: [{ type: 'object' }, { type: 'string' }],
++      },
++    },
++  };
++
++  expect(convertJSONSchemaToOpenAPISchema(input)).toStrictEqual({
++    type: 'object',
++    properties: {
++      list: {
++        type: 'array',
++        items: { type: 'object' },
++      },
++      union: {
++        anyOf: [{ type: 'object' }, { type: 'string' }],
++      },
++    },
++  });
++});
+diff --git a/packages/google/src/convert-json-schema-to-openapi-schema.ts b/packages/google/src/convert-json-schema-to-openapi-schema.ts
+index 108c376..3de9e64 100644
+--- a/packages/google/src/convert-json-schema-to-openapi-schema.ts
++++ b/packages/google/src/convert-json-schema-to-openapi-schema.ts
+@@ -5,9 +5,12 @@ import { JSONSchema7Definition } from '@ai-sdk/provider';
+  */
+ export function convertJSONSchemaToOpenAPISchema(
+   jsonSchema: JSONSchema7Definition | undefined,
++  isRoot: boolean = true,
+ ): unknown {
+   // parameters need to be undefined if they are empty objects:
+-  if (jsonSchema == null || isEmptyObjectSchema(jsonSchema)) {
++  // (this is only valid for the root schema, because `undefined` is not a
++  // valid value inside of a schema, e.g. for object properties)
++  if (jsonSchema == null || (isRoot && isEmptyObjectSchema(jsonSchema))) {
+     return undefined;
+   }
+ 
+@@ -44,8 +47,13 @@ export function convertJSONSchemaToOpenAPISchema(
+   if (type) {
+     if (Array.isArray(type)) {
+       if (type.includes('null')) {
+-        result.type = type.filter(t => t !== 'null')[0];
+-        result.nullable = true;
++        const nonNullTypes = type.filter(t => t !== 'null');
++        // `type` cannot be undefined in the generated schema,
++        // so we fall back to null if there is no other type:
++        result.type = nonNullTypes.length > 0 ? nonNullTypes[0] : 'null';
++        if (result.type !== 'null') {
++          result.nullable = true;
++        }
+       } else {
+         result.type = type;
+       }
+@@ -64,7 +72,16 @@ export function convertJSONSchemaToOpenAPISchema(
+   if (properties != null) {
+     result.properties = Object.entries(properties).reduce(
+       (acc, [key, value]) => {
+-        acc[key] = convertJSONSchemaToOpenAPISchema(value);
++        const convertedValue = convertJSONSchemaToOpenAPISchema(value, false);
++
++        // `undefined` is not a valid value inside of a schema. This can
++        // happen for schemas that describe "empty" objects, such as
++        // `z.record(...)` or `z.object({})`. Nested schemas are therefore
++        // kept as (unconstrained) object schemas instead of being removed:
++        if (convertedValue !== undefined) {
++          acc[key] = convertedValue;
++        }
++
+         return acc;
+       },
+       {} as Record<string, unknown>,
+@@ -73,12 +90,14 @@ export function convertJSONSchemaToOpenAPISchema(
+ 
+   if (items) {
+     result.items = Array.isArray(items)
+-      ? items.map(convertJSONSchemaToOpenAPISchema)
+-      : convertJSONSchemaToOpenAPISchema(items);
++      ? items.map(item => convertJSONSchemaToOpenAPISchema(item, false))
++      : convertJSONSchemaToOpenAPISchema(items, false);
+   }
+ 
+   if (allOf) {
+-    result.allOf = allOf.map(convertJSONSchemaToOpenAPISchema);
++    result.allOf = allOf.map(schema =>
++      convertJSONSchemaToOpenAPISchema(schema, false),
++    );
+   }
+   if (anyOf) {
+     // Handle cases where anyOf includes a null type
+@@ -93,22 +112,31 @@ export function convertJSONSchemaToOpenAPISchema(
+ 
+       if (nonNullSchemas.length === 1) {
+         // If there's only one non-null schema, convert it and make it nullable
+-        const converted = convertJSONSchemaToOpenAPISchema(nonNullSchemas[0]);
+-        if (typeof converted === 'object') {
++        const converted = convertJSONSchemaToOpenAPISchema(
++          nonNullSchemas[0],
++          false,
++        );
++        if (typeof converted === 'object' && converted != null) {
+           result.nullable = true;
+           Object.assign(result, converted);
+         }
+       } else {
+         // If there are multiple non-null schemas, keep them in anyOf
+-        result.anyOf = nonNullSchemas.map(convertJSONSchemaToOpenAPISchema);
++        result.anyOf = nonNullSchemas.map(schema =>
++          convertJSONSchemaToOpenAPISchema(schema, false),
++        );
+         result.nullable = true;
+       }
+     } else {
+-      result.anyOf = anyOf.map(convertJSONSchemaToOpenAPISchema);
++      result.anyOf = anyOf.map(schema =>
++        convertJSONSchemaToOpenAPISchema(schema, false),
++      );
+     }
+   }
+   if (oneOf) {
+-    result.oneOf = oneOf.map(convertJSONSchemaToOpenAPISchema);
++    result.oneOf = oneOf.map(schema =>
++      convertJSONSchemaToOpenAPISchema(schema, false),
++    );
+   }
+ 
+   if (minLength !== undefined) {
+@@ -124,6 +152,10 @@ function isEmptyObjectSchema(jsonSchema: JSONSchema7Definition): boolean {
+     typeof jsonSchema === 'object' &&
+     jsonSchema.type === 'object' &&
+     (jsonSchema.properties == null ||
+-      Object.keys(jsonSchema.properties).length === 0)
++      Object.keys(jsonSchema.properties).length === 0) &&
++    // schemas with `additionalProperties` (such as `z.record(...)`) describe
++    // objects with arbitrary keys and are therefore not empty:
++    (jsonSchema.additionalProperties == null ||
++      jsonSchema.additionalProperties === false)
+   );
+ }

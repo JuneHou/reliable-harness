@@ -1,0 +1,389 @@
+Case ID: 76670856
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 20:14:22
+End Time: 2026-11-04 20:26:39
+Total Duration: 737.36 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+from dotenv import load_dotenv
+from pathlib import Path
+import json
+import os
+import sys
+
+from langchain.chains import ConversationalRetrievalChain
+from langchain.chat_models import ChatOpenAI
+from langchain.document_loaders import JSONLoader
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.indexes import VectorstoreIndexCreator
+from langchain.indexes.vectorstore import VectorStoreIndexWrapper
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+
+load_dotenv()
+
+# The JSON key that actually holds the review text.
+CONTENT_KEY = "text"
+
+REVIEWS = [
+    "Great hotel, excellent service and comfortable rooms.",
+    "I had a terrible experience at this hotel. The room was dirty and the staff was rude.",
+    "Highly recommended! The hotel has a beautiful view and the staff is friendly.",
+    "Average hotel. The room was okay, but nothing special.",
+    "I absolutely loved my stay at this hotel. The amenities were top notch.",
+    "Disappointing experience. The hotel was overpriced for the quality provided.",
+    "The hotel exceeded my expectations. The room was spacious and clean.",
+    "Avoid this hotel at all costs! The customer service was horrendous.",
+    "Fantastic hotel with a great location. I would definitely stay here again.",
+    "Not a bad hotel, but there are better options available in the area.",
+]
+
+# The default ConversationalRetrievalChain prompt is written for a generic
+# "answer from the retrieved context" task.  For an opinion/review dataset the
+# model must (a) only use the reviews it is given and (b) use *all* of them for
+# counting/listing questions instead of only the few most similar ones.
+QA_PROMPT = PromptTemplate(
+    template=(
+        "You are an assistant that answers questions about a hotel review dataset.\n"
+        "Use ONLY the review excerpts in the context below. Never invent reviews, "
+        "ratings, numbers or details that are not in the context.\n"
+        "The context contains every review of the dataset, so when the question asks "
+        "for a list, a count or an overall summary, enumerate/summarise all of the "
+        "reviews you were given instead of only the most relevant ones.\n"
+        "If the answer is not contained in the context, say that you don't know.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n"
+        "Helpful answer:"
+    ),
+    input_variables=["context", "question"],
+)
+
+
+def _write_review_file(review_file: Path) -> None:
+    """Write the sample dataset, giving every review a stable, explicit id."""
+    payload = {
+        "reviews": [
+            {"id": index + 1, "text": text}
+            for index, text in enumerate(REVIEWS)
+        ]
+    }
+    review_file.write_text(json.dumps(payload, indent=2))
+
+
+def _review_metadata(record: dict, metadata: dict) -> dict:
+    """Keep useful metadata (id) alongside the default 'source' metadata."""
+    metadata["review_id"] = record.get("id")
+    return metadata
+
+
+def _ensure_text_content(documents, content_key: str = CONTENT_KEY):
+    """Guarantee that each Document.page_content is the plain review text.
+
+    Depending on the installed langchain version the JSONLoader may fall back to
+    putting the whole JSON object into ``page_content``.  Feeding the LLM a
+    serialised dict (``{"text": "..."}``) instead of the review itself is one of
+    the reasons the generated answers do not match the data, so normalise it.
+    """
+    for document in documents:
+        content = document.page_content
+        if isinstance(content, dict):
+            document.page_content = str(content.get(content_key, content))
+        elif isinstance(content, str) and content.lstrip().startswith("{"):
+            try:
+                parsed = json.loads(content)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict) and content_key in parsed:
+                document.page_content = str(parsed[content_key])
+    return documents
+
+
+def run_agent(queries):
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+
+    review_file = data_dir / "review.json"
+
+    if not review_file.exists():
+        _write_review_file(review_file)
+
+    # Enable to save to disk & reuse the model (for repeated queries on the same data)
+    PERSIST = False
+
+    # Number of reviews in the file. It is used as the retrieval depth so that
+    # every review is handed to the LLM (the default retriever only returns the
+    # 4 most similar documents, which makes "list/count all reviews" questions
+    # come back incomplete or plainly wrong).
+    payload = json.loads(review_file.read_text())
+    num_reviews = len(payload.get("reviews", []))
+    top_k = max(num_reviews, 1)
+
+    if PERSIST and os.path.exists("persist"):
+        print("Reusing index...\n")
+        vectorstore = Chroma(
+            persist_directory="persist",
+            embedding_function=OpenAIEmbeddings(),
+        )
+        index = VectorStoreIndexWrapper(vectorstore=vectorstore)
+    else:
+        # jq_schema ".reviews[]" yields one object per review and content_key
+        # "text" picks the review string out of that object, i.e. every review
+        # becomes its own Document whose page_content is the review text.
+        # (Equivalent alternative: jq_schema=".reviews[].text" with no content_key.)
+        loader = JSONLoader(
+            file_path=str(review_file),
+            jq_schema=".reviews[]",
+            content_key=CONTENT_KEY,
+            metadata_func=_review_metadata,
+        )
+
+        documents = _ensure_text_content(loader.load())
+
+        if PERSIST:
+            index = VectorstoreIndexCreator(
+                vectorstore_kwargs={"persist_directory": "persist"}
+            ).from_documents(documents)
+        else:
+            index = VectorstoreIndexCreator().from_documents(documents)
+
+        # keep the retrieval depth in sync with the number of ingested chunks
+        top_k = max(len(documents), 1)
+
+    retriever = index.vectorstore.as_retriever(search_kwargs={"k": top_k})
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
+        retriever=retriever,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+    )
+
+    chat_history = []
+    results = []
+    for query in queries:
+        if query in ["quit", "q", "exit"]:
+            break
+        result = chain({"question": query, "chat_history": chat_history})
+        print(result["answer"])
+        results.append(result["answer"])
+        chat_history.append((query, result["answer"]))
+    return results
+
+
+if __name__ == "__main__":
+    run_agent(sys.argv[1:])
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 20:26:39
+Duration: 737.36 seconds
+Verdict: ## Evaluation Summary
+
+### 1. Diff analysis — what changed
+
+| Area | Original | Fixed | Assessment |
+|---|---|---|---|
+| Dataset write | inline dict literal | extracted to `_write_review_file()`, adds stable `id` per review | Neutral/improvement |
+| Document loading | `VectorstoreIndexCreator().from_loaders([loader])` | `loader.load()` → normalize → `from_documents(documents)` | Fixes polluted `page_content` risk |
+| Loader | `JSONLoader("data/review.json", jq_schema=".reviews[]", content_key='text')` | same + `file_path=str(...)`, `metadata_func=_review_metadata` | Correct, more explicit |
+| Retrieval | default `as_retriever()` (k=4) | `k = number of documents` | Fixes truncated/incomplete answers for list/count/summary questions on a 10-review corpus |
+| Prompt | default combine-docs prompt | custom `QA_PROMPT` (`context`, `question`) via `combine_docs_chain_kwargs` | Grounds answers in the review corpus |
+| LLM | `ChatOpenAI(model="gpt-3.5-turbo")` | adds `temperature=0` | Improvement (determinism) |
+| Control flow | `sys.exit()` on 'quit' | `break` | Improvement — no longer kills the process/test runner |
+| Dead code | `query = None` reassignment, `query = sys.argv[1]` inside function | removed | Cleanup |
+| Imports | unused `openai`, `RetrievalQA`, `DirectoryLoader/TextLoader`, `OpenAI` | removed | Cleanup |
+
+### 2. Structural validation
+`validate_fixed_code` → **ACCEPT** — matches expected structure and output contract (returns `results` list; test's `list`/`str` assertions satisfied).
+
+### 3. API verification
+- **`JSONLoader(file_path=..., jq_schema=..., content_key=..., metadata_func=...)`** — verified signature: `jq_schema=".reviews[]"` yields one object per review, `content_key="text"` extracts the review string, `metadata_func(record, metadata) -> dict` matches the helper's signature (`record.get("id")`). ✅
+- **`ConversationalRetrievalChain.from_llm(llm=..., retriever=..., combine_docs_chain_kwargs={"prompt": ...})`** — documented pattern; the combine-docs prompt must take `{context}`/`{question}`, exactly what `QA_PROMPT` declares. ✅
+- **`VectorstoreIndexCreator.from_documents(documents)`** — verified: `from_documents(documents: List[Document]) -> VectorStoreIndexWrapper`; the code passes the already-loaded/normalized `Document` list. ✅
+- **`Chroma.as_retriever(search_kwargs={"k": top_k})`** — standard `VectorStore.as_retriever` usage; `k` is bounded by `max(len(documents), 1)`, so it never exceeds the corpus size on the fresh-index path. ✅
+
+### 4. Residual (non-blocking) observations
+- Deprecated import paths (`langchain.chat_models`, `langchain.embeddings`, `langchain.vectorstores`, `langchain.prompts.PromptTemplate` with explicit `input_variables`) remain — they still resolve with deprecation warnings but no imports exist in this file that would raise.
+- Retrieving *all* documents and asserting "the context contains every review" is a coarse strategy; it does not scale beyond tiny corpora and is slightly presumptuous in the prompt wording. Acceptable for a 10-review sample.
+- `sys.exit()` → `break` is a deliberate behavior change; it's safer, but a caller relying on process termination no longer gets it.
+- Test still requires a live `OPENAI_API_KEY`/network, which is an environment dependency, not a code defect.
+
+### Verdict
+All three checks pass; every API call in the changed code matches documented signatures. The changes directly address the real defects (JSON content pollution, k=4 truncation causing wrong/incomplete answers, process-terminating `sys.exit`, non-deterministic sampling) without breaking the `run_agent(queries) -> list[str]` contract.
+
+**ACCEPT**
+--------------------------------------------------------------------------------
+from dotenv import load_dotenv
+from pathlib import Path
+import json
+import os
+import sys
+
+from langchain.chains import ConversationalRetrievalChain
+from langchain.chat_models import ChatOpenAI
+from langchain.document_loaders import JSONLoader
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.indexes import VectorstoreIndexCreator
+from langchain.indexes.vectorstore import VectorStoreIndexWrapper
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+
+load_dotenv()
+
+# The JSON key that actually holds the review text.
+CONTENT_KEY = "text"
+
+REVIEWS = [
+    "Great hotel, excellent service and comfortable rooms.",
+    "I had a terrible experience at this hotel. The room was dirty and the staff was rude.",
+    "Highly recommended! The hotel has a beautiful view and the staff is friendly.",
+    "Average hotel. The room was okay, but nothing special.",
+    "I absolutely loved my stay at this hotel. The amenities were top notch.",
+    "Disappointing experience. The hotel was overpriced for the quality provided.",
+    "The hotel exceeded my expectations. The room was spacious and clean.",
+    "Avoid this hotel at all costs! The customer service was horrendous.",
+    "Fantastic hotel with a great location. I would definitely stay here again.",
+    "Not a bad hotel, but there are better options available in the area.",
+]
+
+# The default ConversationalRetrievalChain prompt is written for a generic
+# "answer from the retrieved context" task.  For an opinion/review dataset the
+# model must (a) only use the reviews it is given and (b) use *all* of them for
+# counting/listing questions instead of only the few most similar ones.
+QA_PROMPT = PromptTemplate(
+    template=(
+        "You are an assistant that answers questions about a hotel review dataset.\n"
+        "Use ONLY the review excerpts in the context below. Never invent reviews, "
+        "ratings, numbers or details that are not in the context.\n"
+        "The context contains every review of the dataset, so when the question asks "
+        "for a list, a count or an overall summary, enumerate/summarise all of the "
+        "reviews you were given instead of only the most relevant ones.\n"
+        "If the answer is not contained in the context, say that you don't know.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n"
+        "Helpful answer:"
+    ),
+    input_variables=["context", "question"],
+)
+
+
+def _write_review_file(review_file: Path) -> None:
+    """Write the sample dataset, giving every review a stable, explicit id."""
+    payload = {
+        "reviews": [
+            {"id": index + 1, "text": text}
+            for index, text in enumerate(REVIEWS)
+        ]
+    }
+    review_file.write_text(json.dumps(payload, indent=2))
+
+
+def _review_metadata(record: dict, metadata: dict) -> dict:
+    """Keep useful metadata (id) alongside the default 'source' metadata."""
+    metadata["review_id"] = record.get("id")
+    return metadata
+
+
+def _ensure_text_content(documents, content_key: str = CONTENT_KEY):
+    """Guarantee that each Document.page_content is the plain review text.
+
+    Depending on the installed langchain version the JSONLoader may fall back to
+    putting the whole JSON object into ``page_content``.  Feeding the LLM a
+    serialised dict (``{"text": "..."}``) instead of the review itself is one of
+    the reasons the generated answers do not match the data, so normalise it.
+    """
+    for document in documents:
+        content = document.page_content
+        if isinstance(content, dict):
+            document.page_content = str(content.get(content_key, content))
+        elif isinstance(content, str) and content.lstrip().startswith("{"):
+            try:
+                parsed = json.loads(content)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict) and content_key in parsed:
+                document.page_content = str(parsed[content_key])
+    return documents
+
+
+def run_agent(queries):
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+
+    review_file = data_dir / "review.json"
+
+    if not review_file.exists():
+        _write_review_file(review_file)
+
+    # Enable to save to disk & reuse the model (for repeated queries on the same data)
+    PERSIST = False
+
+    # Number of reviews in the file. It is used as the retrieval depth so that
+    # every review is handed to the LLM (the default retriever only returns the
+    # 4 most similar documents, which makes "list/count all reviews" questions
+    # come back incomplete or plainly wrong).
+    payload = json.loads(review_file.read_text())
+    num_reviews = len(payload.get("reviews", []))
+    top_k = max(num_reviews, 1)
+
+    if PERSIST and os.path.exists("persist"):
+        print("Reusing index...\n")
+        vectorstore = Chroma(
+            persist_directory="persist",
+            embedding_function=OpenAIEmbeddings(),
+        )
+        index = VectorStoreIndexWrapper(vectorstore=vectorstore)
+    else:
+        # jq_schema ".reviews[]" yields one object per review and content_key
+        # "text" picks the review string out of that object, i.e. every review
+        # becomes its own Document whose page_content is the review text.
+        # (Equivalent alternative: jq_schema=".reviews[].text" with no content_key.)
+        loader = JSONLoader(
+            file_path=str(review_file),
+            jq_schema=".reviews[]",
+            content_key=CONTENT_KEY,
+            metadata_func=_review_metadata,
+        )
+
+        documents = _ensure_text_content(loader.load())
+
+        if PERSIST:
+            index = VectorstoreIndexCreator(
+                vectorstore_kwargs={"persist_directory": "persist"}
+            ).from_documents(documents)
+        else:
+            index = VectorstoreIndexCreator().from_documents(documents)
+
+        # keep the retrieval depth in sync with the number of ingested chunks
+        top_k = max(len(documents), 1)
+
+    retriever = index.vectorstore.as_retriever(search_kwargs={"k": top_k})
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
+        retriever=retriever,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+    )
+
+    chat_history = []
+    results = []
+    for query in queries:
+        if query in ["quit", "q", "exit"]:
+            break
+        result = chain({"question": query, "chat_history": chat_history})
+        print(result["answer"])
+        results.append(result["answer"])
+        chat_history.append((query, result["answer"]))
+    return results
+
+
+if __name__ == "__main__":
+    run_agent(sys.argv[1:])
+
+--------------------------------------------------------------------------------

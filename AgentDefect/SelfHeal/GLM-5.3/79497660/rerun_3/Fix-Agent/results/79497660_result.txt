@@ -1,0 +1,727 @@
+Case ID: 79497660
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 10:26:11
+End Time: 2026-11-09 11:22:24
+Total Duration: 3373.70 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Fix: store `external_id` as a dedicated column in the PGVectorStore table.
+
+Original problem (output mismatch):
+    The script indexed documents and reported success, but `external_id` only
+    ended up serialized inside the `metadata_` JSON(B) column of the
+    `vectorstore` table.  The user expected `external_id` to be a real column
+    of the PostgreSQL table schema.
+
+Why it happens:
+    `PGVectorStore` builds its SQLAlchemy table model *dynamically* inside
+    `_create_table_class()` (standard columns: id, node_id, source_node_id,
+    node_content, embedding, metadata_).  `from_params()` offers no parameter
+    for custom columns, so nothing in the original code could ever create one.
+
+How this fix works:
+    1. `ExternalIdPGVectorStore` subclasses `PGVectorStore` and overrides
+       `_create_table_class()`: it takes the model produced by the parent and
+       appends an `external_id` column to it, so `CREATE TABLE` emits the
+       extra column and Core INSERT statements can populate it.
+    2. `add()` is overridden so that every inserted row writes
+       `node.metadata["external_id"]` into the dedicated `external_id` column.
+       The value is still kept inside `metadata_` so LlamaIndex retrieval and
+       metadata filters keep working, but it now also exists as a first-class,
+       indexable, SQL-queryable column.
+    3. `CREATE TABLE` only runs when the table does not exist yet, so
+       `ensure_external_id_column()` patches a table created by an earlier
+       (buggy) run with `ALTER TABLE ... ADD COLUMN external_id TEXT`.
+    4. psycopg2 is used to inspect `information_schema.columns` and the stored
+       rows, verifying that the output now matches the expectation:
+       `external_id` exists as a separate column and contains ext_001/ext_002.
+"""
+
+import os
+from typing import Any, List
+
+import numpy as np
+import psycopg2
+from dotenv import load_dotenv
+from sqlalchemy import Column, Text, select
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.orm import class_mapper
+
+from llama_index.core import Document, StorageContext, VectorStoreIndex
+from llama_index.core.schema import BaseNode
+from llama_index.vector_stores.postgres import PGVectorStore
+
+load_dotenv()
+
+# Connection settings (same values as the original script, now read through
+# the environment with identical defaults so `os` is actually used).
+HOST = os.getenv("PG_HOST", "localhost")
+PASSWORD = os.getenv("PG_PASSWORD", "password")
+PORT = int(os.getenv("PG_PORT", "5432"))
+USER = os.getenv("PG_USER", "postgres")
+
+TABLE_NAME = "vectorstore"
+SCHEMA_NAME = "public"
+EXTERNAL_ID_COLUMN = "external_id"
+
+
+class ExternalIdPGVectorStore(PGVectorStore):
+    """A PGVectorStore whose table has a dedicated ``external_id`` column."""
+
+    def _create_table_class(self) -> type:
+        """Build the standard PGVectorStore table model, then attach the custom column.
+
+        PGVectorStore generates the SQLAlchemy model for ``table_name``
+        dynamically (which is why custom columns cannot simply be passed to
+        ``from_params``), so we extend the generated model here.
+        """
+        model = super()._create_table_class()
+
+        if not hasattr(model, EXTERNAL_ID_COLUMN):
+            external_id_column = Column(EXTERNAL_ID_COLUMN, Text, nullable=True)
+
+            # (1) register the column on the physical table -> it is emitted by
+            #     CREATE TABLE and usable in the Core INSERT/SELECT below.
+            model.__table__.append_column(external_id_column)
+
+            # (2) register it on the ORM mapper so ``Model.external_id``
+            #     attribute access works as well.
+            try:
+                class_mapper(model, configure=False).add_property(
+                    EXTERNAL_ID_COLUMN, external_id_column
+                )
+            except Exception:
+                # Core inserts/queries still work through the table itself.
+                setattr(model, EXTERNAL_ID_COLUMN, external_id_column)
+
+        return model
+
+    def add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+        """Insert nodes, writing ``metadata['external_id']`` into its own column."""
+        chunk_size = getattr(self, "insert_chunk_size", 500) or 500
+        ids: List[str] = []
+
+        with self._session() as session:
+            try:
+                for start in range(0, len(nodes), chunk_size):
+                    chunk = nodes[start : start + chunk_size]
+                    rows = []
+                    for node in chunk:
+                        embedding = node.get_embedding()
+                        if embedding is not None:
+                            try:
+                                embedding = np.array(embedding)
+                            except Exception:
+                                pass  # pgvectormaybe also accepts plain lists
+
+                        rows.append(
+                            {
+                                "id": node.id,
+                                "node_id": node.node_id,
+                                "source_node_id": node.source_node_id,
+                                "embedding": embedding,
+                                "metadata_": node.metadata,
+                                "node_content": node.json(),
+                                # >>> the actual fix: dedicated column instead
+                                #     of only the metadata JSON blob <<<
+                                EXTERNAL_ID_COLUMN: (node.metadata or {}).get(
+                                    EXTERNAL_ID_COLUMN
+                                ),
+                            }
+                        )
+
+                    stmt = postgres_insert(self._table_class).values(rows)
+                    session.execute(stmt)
+                    session.commit()
+                    ids.extend([node.node_id for node in chunk])
+            except Exception:
+                session.rollback()
+                raise
+
+        return ids
+
+    def get_node_ids_by_external_id(self, external_id: str) -> List[str]:
+        """Query the new column directly with SQL."""
+        table = self._table_class.__table__
+        with self._session() as session:
+            result = session.execute(
+                select(table.c.node_id).where(
+                    table.c[EXTERNAL_ID_COLUMN] == external_id
+                )
+            )
+            return [row[0] for row in result.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# psycopg2 helpers: schema management + verification
+# ---------------------------------------------------------------------------
+def _psycopg2_connect(database: str):
+    return psycopg2.connect(
+        host=HOST, port=PORT, user=USER, password=PASSWORD, dbname=database
+    )
+
+
+def ensure_external_id_column(database: str) -> bool:
+    """Add the ``external_id`` column if the table was created without it.
+
+    ``CREATE TABLE`` only runs when the table does not exist yet, so a table
+    created by a previous run of the buggy script must be patched with
+    ``ALTER TABLE ... ADD COLUMN`` for the physical schema to match the model.
+    """
+    conn = _psycopg2_connect(database)
+    try:
+        added = False
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = %s AND table_name = %s
+                """,
+                (SCHEMA_NAME, TABLE_NAME),
+            )
+            table_exists = cur.fetchone() is not None
+
+            if table_exists:
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                      AND column_name = %s
+                    """,
+                    (SCHEMA_NAME, TABLE_NAME, EXTERNAL_ID_COLUMN),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        f"ALTER TABLE {SCHEMA_NAME}.{TABLE_NAME} "
+                        f"ADD COLUMN {EXTERNAL_ID_COLUMN} TEXT"
+                    )
+                    added = True
+        conn.commit()
+        return added
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_table_columns(database: str) -> List[tuple]:
+    """Return (column_name, data_type) of the vector store table."""
+    conn = _psycopg2_connect(database)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (SCHEMA_NAME, TABLE_NAME),
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def get_external_id_rows(database: str) -> List[tuple]:
+    """Return (node_id, external_id, has_embedding) for every stored row."""
+    conn = _psycopg2_connect(database)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT node_id, {EXTERNAL_ID_COLUMN},
+                       (embedding IS NOT NULL) AS has_embedding
+                FROM {SCHEMA_NAME}.{TABLE_NAME}
+                ORDER BY {EXTERNAL_ID_COLUMN} NULLS LAST
+                """
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Original application flow (same structure, now using the fixed store class)
+# ---------------------------------------------------------------------------
+def create_vector_store(request):
+    vector_store = ExternalIdPGVectorStore.from_params(
+        database=request.tenant,
+        host=HOST,
+        password=PASSWORD,
+        port=PORT,
+        user=USER,
+        table_name=TABLE_NAME,
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+
+    # If the table already existed (e.g. created by the buggy version of this
+    # script), make sure the custom column is present in the physical schema.
+    if ensure_external_id_column(request.tenant):
+        print(
+            f"Patched existing table {SCHEMA_NAME}.{TABLE_NAME}: "
+            f"added missing '{EXTERNAL_ID_COLUMN}' column"
+        )
+
+    return vector_store
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    index = VectorStoreIndex.from_documents(
+        documents,
+        storage_context=storage_context,
+    )
+
+    # Demonstrate that the new column is directly queryable with SQL.
+    matched = vector_store.get_node_ids_by_external_id("ext_001")
+    print(f"SQL lookup by external_id='ext_001' matched node_id(s): {matched}")
+
+    return index
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+
+    # ---- verification: the output now matches the expectation ------------
+    columns = get_table_columns(request.tenant)
+    column_names = [name for name, _ in columns]
+    print(f"\nColumns of {SCHEMA_NAME}.{TABLE_NAME}:")
+    for name, data_type in columns:
+        marker = "   <-- custom column (the fix)" if name == EXTERNAL_ID_COLUMN else ""
+        print(f"  - {name} ({data_type}){marker}")
+
+    assert EXTERNAL_ID_COLUMN in column_names, (
+        f"'{EXTERNAL_ID_COLUMN}' column is missing from "
+        f"{SCHEMA_NAME}.{TABLE_NAME}"
+    )
+
+    rows = get_external_id_rows(request.tenant)
+    print(
+        f"\nRows in {SCHEMA_NAME}.{TABLE_NAME} "
+        f"(node_id, external_id, has_embedding):"
+    )
+    for row in rows:
+        print(f"  {row}")
+
+    external_ids = {row[1] for row in rows}
+    assert {"ext_001", "ext_002"} <= external_ids, (
+        f"expected 'ext_001' and 'ext_002' in the '{EXTERNAL_ID_COLUMN}' "
+        f"column, got {external_ids}"
+    )
+
+    stored = sorted(v for v in external_ids if v)
+    print(f"\n'{EXTERNAL_ID_COLUMN}' column values: {stored}")
+    print("Output now matches expectations: external_id is stored as a "
+          "separate column in the table")
+    print("(it is also kept inside metadata_ so LlamaIndex retrieval and "
+          "metadata filters keep working)")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 11:22:24
+Duration: 3373.70 seconds
+Verdict: # Evaluation: Case 79497660
+
+## Tool Results Summary
+- **generate_diff**: The fix subclasses `PGVectorStore` (`ExternalIdPGVectorStore`), overrides `_create_table_class()` and `add()`, adds psycopg2 helpers for schema patching/verification, and keeps `table_name="vectorstore"`.
+- **validate_fixed_code**: Returned ACCEPT for structure/output format (a structural check only — not proof of runtime correctness).
+- **verify_api_usage**: Returned no usable documentation (irrelevant search results), so the critical internal-API questions were verified by direct analysis of the `llama-index-vector-stores-postgres` API and the test's explicit assertions.
+
+## Verdict: REJECT
+
+Despite the structural validation passing, the fix contains three fatal defects that will cause both tests to fail/error:
+
+### Fatal Defect 1: `_create_table_class` override signature is incompatible with the parent API
+In every version of `llama-index-vector-stores-postgres` that supports `hnsw_kwargs` (which this code uses), the method is documented "to allow for easy overloading" with the signature:
+```python
+def _create_table_class(self, name: str, base: Any, column: Any, string: Any,
+                        text: Any, float: Any, jsonb: Any, uuid: Any, func: Any) -> Any
+```
+The fix overrides it as `def _create_table_class(self) -> type` (zero parameters) and calls `super()._create_table_class()` with no arguments. Since `_initialize()` (invoked from `__init__` via `from_params()`) calls `self._create_table_class(name="data_" + table_name, base=..., column=..., ...)`, store construction raises `TypeError: got an unexpected keyword argument 'name'` — the store can never be instantiated, `run_agent()` crashes, and both tests error out before any assertion runs. The fix author evidently never executed this against the real library.
+
+### Fatal Defect 2: `external_id` is retained in `metadata_`, directly violating the test
+The test explicitly requires:
+```python
+self.assertIsNotNone(external_id)
+self.assertNotIn("external_id", metadata)
+```
+The fix writes `"metadata_": node.metadata` verbatim — and `node.metadata` is `{"external_id": "ext_001"}` per the `Document` construction. The fix's own docstring admits "The value is still kept inside `metadata_`". So even if construction succeeded, `test_external_id_saved_in_column` would fail on `assertNotIn` — the required behavior is to *move* `external_id` out of the JSON column into the dedicated column, not to duplicate it.
+
+### Fatal Defect 3: psycopg2 helpers target the wrong table name
+`PGVectorStore` prefixes the table name with `data_`, so the physical table is `data_vectorstore` (confirmed by the test's own `FROM data_vectorstore` query). The fix's `TABLE_NAME = "vectorstore"` is used in `ensure_external_id_column()` (checks `information_schema` and issues `ALTER TABLE public.vectorstore`), `get_table_columns()`, and `get_external_id_rows()`. Consequences:
+- The migration path for tables created by the buggy code never fires (it looks for a table that doesn't exist), so a pre-existing `data_vectorstore` never gets the new column, and the Core INSERT in `add()` referencing `external_id` would fail with `UndefinedColumn`.
+- The `__main__` verification queries fail with `UndefinedTable` on `public.vectorstore`.
+
+### Secondary fragility (not decisive, but noted)
+- `add()` re-implements insertion based on internal, version-dependent details: raw `node.metadata` instead of `node_to_metadata_dict()` (ignoring `flat_metadata` behavior), `self._session` / `self._table_class` internals, `insert_chunk_size` doesn't exist on `PGVectorStore` (silently defaulted via `getattr`), and `"id": node.id` assumes a UUID-compatible primary key.
+- The mapper patching via `class_mapper(model, configure=False).add_property(...)` with a bare `except Exception: pass` fallback silently masks configuration failures.
+
+## What a correct fix requires
+1. `_create_table_class(self, name, base, column, string, text, float, jsonb, uuid, func)` — forward all params to `super()`, then `model.__table__.append_column(Column("external_id", Text))` and return it.
+2. `add()` that populates the `external_id` column **and strips** `external_id` from the dict written to `metadata_`.
+3. Any raw SQL must reference `data_vectorstore` (the `data_`-prefixed physical table).
+
+## Conclusion
+The approach (subclass + column injection) is directionally sound, but the implementation is non-functional: it crashes at store construction (wrong override signature), fails the test's explicit metadata-separation assertion, and its migration/verification helpers reference the wrong table. **REJECT.**
+--------------------------------------------------------------------------------
+"""
+Fix: store `external_id` as a dedicated column in the PGVectorStore table.
+
+Original problem (output mismatch):
+    The script indexed documents and reported success, but `external_id` only
+    ended up serialized inside the `metadata_` JSON(B) column of the
+    `vectorstore` table.  The user expected `external_id` to be a real column
+    of the PostgreSQL table schema.
+
+Why it happens:
+    `PGVectorStore` builds its SQLAlchemy table model *dynamically* inside
+    `_create_table_class()` (standard columns: id, node_id, source_node_id,
+    node_content, embedding, metadata_).  `from_params()` offers no parameter
+    for custom columns, so nothing in the original code could ever create one.
+
+How this fix works:
+    1. `ExternalIdPGVectorStore` subclasses `PGVectorStore` and overrides
+       `_create_table_class()`: it takes the model produced by the parent and
+       appends an `external_id` column to it, so `CREATE TABLE` emits the
+       extra column and Core INSERT statements can populate it.
+    2. `add()` is overridden so that every inserted row writes
+       `node.metadata["external_id"]` into the dedicated `external_id` column.
+       The value is still kept inside `metadata_` so LlamaIndex retrieval and
+       metadata filters keep working, but it now also exists as a first-class,
+       indexable, SQL-queryable column.
+    3. `CREATE TABLE` only runs when the table does not exist yet, so
+       `ensure_external_id_column()` patches a table created by an earlier
+       (buggy) run with `ALTER TABLE ... ADD COLUMN external_id TEXT`.
+    4. psycopg2 is used to inspect `information_schema.columns` and the stored
+       rows, verifying that the output now matches the expectation:
+       `external_id` exists as a separate column and contains ext_001/ext_002.
+"""
+
+import os
+from typing import Any, List
+
+import numpy as np
+import psycopg2
+from dotenv import load_dotenv
+from sqlalchemy import Column, Text, select
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.orm import class_mapper
+
+from llama_index.core import Document, StorageContext, VectorStoreIndex
+from llama_index.core.schema import BaseNode
+from llama_index.vector_stores.postgres import PGVectorStore
+
+load_dotenv()
+
+# Connection settings (same values as the original script, now read through
+# the environment with identical defaults so `os` is actually used).
+HOST = os.getenv("PG_HOST", "localhost")
+PASSWORD = os.getenv("PG_PASSWORD", "password")
+PORT = int(os.getenv("PG_PORT", "5432"))
+USER = os.getenv("PG_USER", "postgres")
+
+TABLE_NAME = "vectorstore"
+SCHEMA_NAME = "public"
+EXTERNAL_ID_COLUMN = "external_id"
+
+
+class ExternalIdPGVectorStore(PGVectorStore):
+    """A PGVectorStore whose table has a dedicated ``external_id`` column."""
+
+    def _create_table_class(self) -> type:
+        """Build the standard PGVectorStore table model, then attach the custom column.
+
+        PGVectorStore generates the SQLAlchemy model for ``table_name``
+        dynamically (which is why custom columns cannot simply be passed to
+        ``from_params``), so we extend the generated model here.
+        """
+        model = super()._create_table_class()
+
+        if not hasattr(model, EXTERNAL_ID_COLUMN):
+            external_id_column = Column(EXTERNAL_ID_COLUMN, Text, nullable=True)
+
+            # (1) register the column on the physical table -> it is emitted by
+            #     CREATE TABLE and usable in the Core INSERT/SELECT below.
+            model.__table__.append_column(external_id_column)
+
+            # (2) register it on the ORM mapper so ``Model.external_id``
+            #     attribute access works as well.
+            try:
+                class_mapper(model, configure=False).add_property(
+                    EXTERNAL_ID_COLUMN, external_id_column
+                )
+            except Exception:
+                # Core inserts/queries still work through the table itself.
+                setattr(model, EXTERNAL_ID_COLUMN, external_id_column)
+
+        return model
+
+    def add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+        """Insert nodes, writing ``metadata['external_id']`` into its own column."""
+        chunk_size = getattr(self, "insert_chunk_size", 500) or 500
+        ids: List[str] = []
+
+        with self._session() as session:
+            try:
+                for start in range(0, len(nodes), chunk_size):
+                    chunk = nodes[start : start + chunk_size]
+                    rows = []
+                    for node in chunk:
+                        embedding = node.get_embedding()
+                        if embedding is not None:
+                            try:
+                                embedding = np.array(embedding)
+                            except Exception:
+                                pass  # pgvectormaybe also accepts plain lists
+
+                        rows.append(
+                            {
+                                "id": node.id,
+                                "node_id": node.node_id,
+                                "source_node_id": node.source_node_id,
+                                "embedding": embedding,
+                                "metadata_": node.metadata,
+                                "node_content": node.json(),
+                                # >>> the actual fix: dedicated column instead
+                                #     of only the metadata JSON blob <<<
+                                EXTERNAL_ID_COLUMN: (node.metadata or {}).get(
+                                    EXTERNAL_ID_COLUMN
+                                ),
+                            }
+                        )
+
+                    stmt = postgres_insert(self._table_class).values(rows)
+                    session.execute(stmt)
+                    session.commit()
+                    ids.extend([node.node_id for node in chunk])
+            except Exception:
+                session.rollback()
+                raise
+
+        return ids
+
+    def get_node_ids_by_external_id(self, external_id: str) -> List[str]:
+        """Query the new column directly with SQL."""
+        table = self._table_class.__table__
+        with self._session() as session:
+            result = session.execute(
+                select(table.c.node_id).where(
+                    table.c[EXTERNAL_ID_COLUMN] == external_id
+                )
+            )
+            return [row[0] for row in result.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# psycopg2 helpers: schema management + verification
+# ---------------------------------------------------------------------------
+def _psycopg2_connect(database: str):
+    return psycopg2.connect(
+        host=HOST, port=PORT, user=USER, password=PASSWORD, dbname=database
+    )
+
+
+def ensure_external_id_column(database: str) -> bool:
+    """Add the ``external_id`` column if the table was created without it.
+
+    ``CREATE TABLE`` only runs when the table does not exist yet, so a table
+    created by a previous run of the buggy script must be patched with
+    ``ALTER TABLE ... ADD COLUMN`` for the physical schema to match the model.
+    """
+    conn = _psycopg2_connect(database)
+    try:
+        added = False
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = %s AND table_name = %s
+                """,
+                (SCHEMA_NAME, TABLE_NAME),
+            )
+            table_exists = cur.fetchone() is not None
+
+            if table_exists:
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                      AND column_name = %s
+                    """,
+                    (SCHEMA_NAME, TABLE_NAME, EXTERNAL_ID_COLUMN),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        f"ALTER TABLE {SCHEMA_NAME}.{TABLE_NAME} "
+                        f"ADD COLUMN {EXTERNAL_ID_COLUMN} TEXT"
+                    )
+                    added = True
+        conn.commit()
+        return added
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_table_columns(database: str) -> List[tuple]:
+    """Return (column_name, data_type) of the vector store table."""
+    conn = _psycopg2_connect(database)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (SCHEMA_NAME, TABLE_NAME),
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def get_external_id_rows(database: str) -> List[tuple]:
+    """Return (node_id, external_id, has_embedding) for every stored row."""
+    conn = _psycopg2_connect(database)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT node_id, {EXTERNAL_ID_COLUMN},
+                       (embedding IS NOT NULL) AS has_embedding
+                FROM {SCHEMA_NAME}.{TABLE_NAME}
+                ORDER BY {EXTERNAL_ID_COLUMN} NULLS LAST
+                """
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Original application flow (same structure, now using the fixed store class)
+# ---------------------------------------------------------------------------
+def create_vector_store(request):
+    vector_store = ExternalIdPGVectorStore.from_params(
+        database=request.tenant,
+        host=HOST,
+        password=PASSWORD,
+        port=PORT,
+        user=USER,
+        table_name=TABLE_NAME,
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+
+    # If the table already existed (e.g. created by the buggy version of this
+    # script), make sure the custom column is present in the physical schema.
+    if ensure_external_id_column(request.tenant):
+        print(
+            f"Patched existing table {SCHEMA_NAME}.{TABLE_NAME}: "
+            f"added missing '{EXTERNAL_ID_COLUMN}' column"
+        )
+
+    return vector_store
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    index = VectorStoreIndex.from_documents(
+        documents,
+        storage_context=storage_context,
+    )
+
+    # Demonstrate that the new column is directly queryable with SQL.
+    matched = vector_store.get_node_ids_by_external_id("ext_001")
+    print(f"SQL lookup by external_id='ext_001' matched node_id(s): {matched}")
+
+    return index
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+
+    # ---- verification: the output now matches the expectation ------------
+    columns = get_table_columns(request.tenant)
+    column_names = [name for name, _ in columns]
+    print(f"\nColumns of {SCHEMA_NAME}.{TABLE_NAME}:")
+    for name, data_type in columns:
+        marker = "   <-- custom column (the fix)" if name == EXTERNAL_ID_COLUMN else ""
+        print(f"  - {name} ({data_type}){marker}")
+
+    assert EXTERNAL_ID_COLUMN in column_names, (
+        f"'{EXTERNAL_ID_COLUMN}' column is missing from "
+        f"{SCHEMA_NAME}.{TABLE_NAME}"
+    )
+
+    rows = get_external_id_rows(request.tenant)
+    print(
+        f"\nRows in {SCHEMA_NAME}.{TABLE_NAME} "
+        f"(node_id, external_id, has_embedding):"
+    )
+    for row in rows:
+        print(f"  {row}")
+
+    external_ids = {row[1] for row in rows}
+    assert {"ext_001", "ext_002"} <= external_ids, (
+        f"expected 'ext_001' and 'ext_002' in the '{EXTERNAL_ID_COLUMN}' "
+        f"column, got {external_ids}"
+    )
+
+    stored = sorted(v for v in external_ids if v)
+    print(f"\n'{EXTERNAL_ID_COLUMN}' column values: {stored}")
+    print("Output now matches expectations: external_id is stored as a "
+          "separate column in the table")
+    print("(it is also kept inside metadata_ so LlamaIndex retrieval and "
+          "metadata filters keep working)")
+
+--------------------------------------------------------------------------------

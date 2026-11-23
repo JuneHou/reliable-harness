@@ -1,0 +1,552 @@
+Case ID: crewai_1723
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-11 09:24:01
+End Time: 2026-11-11 09:28:03
+Total Duration: 241.21 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### src/crewai/memory/storage/rag_storage.py
+import contextlib
+import io
+import logging
+import os
+import shutil
+import uuid
+from typing import Any, Dict, List, Optional
+
+from chromadb.api import ClientAPI
+
+from crewai.memory.storage.base_rag_storage import BaseRAGStorage
+from crewai.utilities import EmbeddingConfigurator
+from crewai.utilities.constants import MAX_FILE_NAME_LENGTH
+from crewai.utilities.paths import db_storage_path
+
+
+@contextlib.contextmanager
+def suppress_logging(
+    logger_name="chromadb.segment.impl.vector.local_persistent_hnsw",
+    level=logging.ERROR,
+):
+    logger = logging.getLogger(logger_name)
+    original_level = logger.getEffectiveLevel()
+    logger.setLevel(level)
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+        contextlib.suppress(UserWarning),
+    ):
+        yield
+    logger.setLevel(original_level)
+
+
+class RAGStorage(BaseRAGStorage):
+    """
+    Extends Storage to handle embeddings for memory entries, improving
+    search efficiency.
+    """
+
+    app: ClientAPI | None = None
+
+    def __init__(
+        self, type, allow_reset=True, embedder_config=None, crew=None, path=None
+    ):
+        super().__init__(type, allow_reset, embedder_config, crew)
+        agents = crew.agents if crew else []
+        agents = [self._sanitize_role(agent.role) for agent in agents]
+        agents = "_".join(agents)
+        self.agents = agents
+        self.storage_file_name = self._build_storage_file_name(type, agents)
+
+        self.type = type
+
+        self.allow_reset = allow_reset
+        self.path = path
+        self._initialize_app()
+
+    def _set_embedder_config(self):
+        configurator = EmbeddingConfigurator()
+        self.embedder_config = configurator.configure_embedder(self.embedder_config)
+
+    def _initialize_app(self):
+        import chromadb
+        from chromadb.config import Settings
+
+        self._set_embedder_config()
+        chroma_client = chromadb.PersistentClient(
+            path=self.path if self.path else self.storage_file_name,
+            settings=Settings(allow_reset=self.allow_reset),
+        )
+
+        self.app = chroma_client
+
+        try:
+            self.collection = self.app.get_collection(
+                name=self.type, embedding_function=self.embedder_config
+            )
+        except Exception:
+            self.collection = self.app.create_collection(
+                name=self.type, embedding_function=self.embedder_config
+            )
+
+    def _sanitize_role(self, role: str) -> str:
+        """
+        Sanitizes agent roles to ensure valid directory names.
+        """
+        return role.replace("\n", "").replace(" ", "_").replace("/", "_")
+
+    def _build_storage_file_name(self, type: str, file_name: str) -> str:
+        """
+        Ensures file name does not exceed max allowed by OS
+        """
+        base_path = f"{db_storage_path()}/{type}"
+
+        if len(file_name) > MAX_FILE_NAME_LENGTH:
+            logging.warning(
+                f"Trimming file name from {len(file_name)} to {MAX_FILE_NAME_LENGTH} characters."
+            )
+            file_name = file_name[:MAX_FILE_NAME_LENGTH]
+
+        return f"{base_path}/{file_name}"
+
+    def save(self, value: Any, metadata: Dict[str, Any]) -> None:
+        if not hasattr(self, "app") or not hasattr(self, "collection"):
+            self._initialize_app()
+        try:
+            self._generate_embedding(value, metadata)
+        except Exception as e:
+            logging.error(f"Error during {self.type} save: {str(e)}")
+
+    def search(
+        self,
+        query: str,
+        limit: int = 3,
+        filter: Optional[dict] = None,
+        score_threshold: float = 0.35,
+    ) -> List[Any]:
+        if not hasattr(self, "app"):
+            self._initialize_app()
+
+        try:
+            with suppress_logging():
+                response = self.collection.query(query_texts=query, n_results=limit)
+
+            results = []
+            for i in range(len(response["ids"][0])):
+                result = {
+                    "id": response["ids"][0][i],
+                    "metadata": response["metadatas"][0][i],
+                    "context": response["documents"][0][i],
+                    "score": response["distances"][0][i],
+                }
+                if result["score"] >= score_threshold:
+                    results.append(result)
+
+            return results
+        except Exception as e:
+            logging.error(f"Error during {self.type} search: {str(e)}")
+            return []
+
+    def _generate_embedding(self, text: str, metadata: Dict[str, Any]) -> None:  # type: ignore
+        if not hasattr(self, "app") or not hasattr(self, "collection"):
+            self._initialize_app()
+
+        self.collection.add(
+            documents=[text],
+            metadatas=[metadata or {}],
+            ids=[str(uuid.uuid4())],
+        )
+
+    def reset(self) -> None:
+        try:
+            # Reset through the client before removing the storage folder so that
+            # Chroma can release its open handles on the underlying files.
+            # Deleting the folder first caused "disk I/O error" failures.
+            if self.app:
+                self.app.reset()
+
+            storage_dir = f"{db_storage_path()}/{self.type}"
+            if os.path.exists(storage_dir):
+                shutil.rmtree(storage_dir)
+        except Exception as e:
+            if "attempt to write a readonly database" in str(e):
+                # Ignore this specific error
+                pass
+            else:
+                raise Exception(
+                    f"An error occurred while resetting the {self.type} memory: {e}"
+                )
+
+    def _create_default_embedding_function(self):
+        from chromadb.utils.embedding_functions.openai_embedding_function import (
+            OpenAIEmbeddingFunction,
+        )
+
+        return OpenAIEmbeddingFunction(
+            api_key=os.getenv("OPENAI_API_KEY"), model_name="text-embedding-3-small"
+        )
+
+
+### tests/memory/short_term_memory_test.py
+import pytest
+from unittest.mock import patch
+from crewai.agent import Agent
+from crewai.crew import Crew
+from crewai.memory.short_term.short_term_memory import ShortTermMemory
+from crewai.memory.short_term.short_term_memory_item import ShortTermMemoryItem
+from crewai.task import Task
+
+
+@pytest.fixture
+def short_term_memory():
+    """Fixture to create a ShortTermMemory instance"""
+    agent = Agent(
+        role="Researcher",
+        goal="Search relevant data and provide results",
+        backstory="You are a researcher at a leading tech think tank.",
+        tools=[],
+        verbose=True,
+    )
+
+    task = Task(
+        description="Perform a search on specific topics.",
+        expected_output="A list of relevant URLs based on the search query.",
+        agent=agent,
+    )
+    return ShortTermMemory(crew=Crew(agents=[agent], tasks=[task]))
+
+
+def test_save_and_search(short_term_memory):
+    memory = ShortTermMemoryItem(
+        data="""test value test value test value test value test value test value
+        test value test value test value test value test value test value
+        test value test value test value test value test value test value""",
+        agent="test_agent",
+        metadata={"task": "test_task"},
+    )
+
+    with patch.object(ShortTermMemory, "save") as mock_save:
+        short_term_memory.save(
+            value=memory.data,
+            metadata=memory.metadata,
+            agent=memory.agent,
+        )
+
+        mock_save.assert_called_once_with(
+            value=memory.data,
+            metadata=memory.metadata,
+            agent=memory.agent,
+        )
+
+    expected_result = [
+        {
+            "context": memory.data,
+            "metadata": {"agent": "test_agent"},
+            "score": 0.95,
+        }
+    ]
+    with patch.object(ShortTermMemory, "search", return_value=expected_result):
+        find = short_term_memory.search("test value", score_threshold=0.01)[0]
+        assert find["context"] == memory.data, "Data value mismatch."
+        assert find["metadata"]["agent"] == "test_agent", "Agent value mismatch."
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-11 09:28:03
+Duration: 241.21 seconds
+Verdict: ## Review of `crewai_1723` fix
+
+**Diff scope:** Only `RAGStorage.reset()` in `src/crewai/memory/storage/rag_storage.py` changed (plus trailing-whitespace cleanup).
+
+```python
+def reset(self) -> None:
+    try:
+        # Reset through the client before removing the storage folder so that
+        # Chroma can release its open handles on the underlying files.
+        if self.app:
+            self.app.reset()
+
+        storage_dir = f"{db_storage_path()}/{self.type}"
+        if os.path.exists(storage_dir):
+            shutil.rmtree(storage_dir)
+    except Exception as e:
+        ...
+```
+
+### 1. Does it address the reported bug?
+Yes, and the ordering matters precisely:
+
+- **Before:** `shutil.rmtree(f"{db_storage_path()}/{type}")` deleted `chroma.sqlite3` (and the HNSW segment files) *while* the `PersistentClient` still held open SQLite handles, then `self.app.reset()` tried to write to the now-unlinked database file → SQLite raises `disk I/O error`. This is exactly the failure the test's CLI invocation (`crewai reset-memories short-term`) was surfacing.
+- **After:** `app.reset()` runs first on a fully valid on-disk database (Chroma drops the collections / truncates its metadata tables), and the directory is removed only afterwards. On POSIX the later `unlink` of already-closed files is harmless, so no write ever targets a deleted database.
+
+### 2. Robustness of the new code
+- `os.path.exists(storage_dir)` guard prevents a `FileNotFoundError` on a second/concurrent reset (idempotent reset), which would otherwise be re-wrapped into the generic "An error occurred while resetting…" exception.
+- `os` is already imported at module top (`import os`), so no import error — this was the main thing worth checking for a diff that adds `os.path.exists`.
+- `shutil.rmtree` signature (`rmtree(path)`) is used correctly per the Python docs.
+- `self.app.reset()` is the correct ChromaDB client API and is permitted because the client is constructed with `Settings(allow_reset=self.allow_reset)` and `allow_reset` defaults to `True` (the on-disk path member of `ClientAPI`). No parameter or return-type misuse.
+- `if self.app:` preserves the falsy-`None` guard from the class attribute `app: ClientAPI | None = None`, so the directory removal still happens even if the client failed to construct.
+- Storage path is consistent with `_initialize_app`, which points `PersistentClient` at `self.storage_file_name` = `{db_storage_path()}/{type}/{agents}`; deleting the parent `{type}` directory correctly removes all agent sub-collections, matching the original semantics.
+
+### 3. Structural validation
+`validate_fixed_code` returned **ACCEPT** — all files present once with full text; no interface contract was required for this issue.
+
+### 4. Residual nits (non-blocking, pre-existing)
+- When a custom `self.path` is supplied, `reset()` still deletes `{db_storage_path()}/{type}` rather than `self.path`; this inconsistency exists in the original code and is out of scope for this bug.
+- The client keeps a stale connection to the removed file after `reset()` (attribute `app` still set, so the `hasattr` guards in `save`/`search` won't re-initialize). In the CLI flow each storage instance is short-lived, and the test only exercises the reset command, so this doesn't affect the outcome — and it is unchanged behavior from the buggy version.
+
+### Verdict
+The change is minimal, targeted at the actual root cause (delete-before-close ordering), uses the Chroma and stdlib APIs correctly, and adds an idempotency guard. Test expectations ("Short term memory has been reset" / no `disk I/O error`) are satisfiable.
+
+**ACCEPT**
+--------------------------------------------------------------------------------
+### src/crewai/memory/storage/rag_storage.py
+import contextlib
+import io
+import logging
+import os
+import shutil
+import uuid
+from typing import Any, Dict, List, Optional
+
+from chromadb.api import ClientAPI
+
+from crewai.memory.storage.base_rag_storage import BaseRAGStorage
+from crewai.utilities import EmbeddingConfigurator
+from crewai.utilities.constants import MAX_FILE_NAME_LENGTH
+from crewai.utilities.paths import db_storage_path
+
+
+@contextlib.contextmanager
+def suppress_logging(
+    logger_name="chromadb.segment.impl.vector.local_persistent_hnsw",
+    level=logging.ERROR,
+):
+    logger = logging.getLogger(logger_name)
+    original_level = logger.getEffectiveLevel()
+    logger.setLevel(level)
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+        contextlib.suppress(UserWarning),
+    ):
+        yield
+    logger.setLevel(original_level)
+
+
+class RAGStorage(BaseRAGStorage):
+    """
+    Extends Storage to handle embeddings for memory entries, improving
+    search efficiency.
+    """
+
+    app: ClientAPI | None = None
+
+    def __init__(
+        self, type, allow_reset=True, embedder_config=None, crew=None, path=None
+    ):
+        super().__init__(type, allow_reset, embedder_config, crew)
+        agents = crew.agents if crew else []
+        agents = [self._sanitize_role(agent.role) for agent in agents]
+        agents = "_".join(agents)
+        self.agents = agents
+        self.storage_file_name = self._build_storage_file_name(type, agents)
+
+        self.type = type
+
+        self.allow_reset = allow_reset
+        self.path = path
+        self._initialize_app()
+
+    def _set_embedder_config(self):
+        configurator = EmbeddingConfigurator()
+        self.embedder_config = configurator.configure_embedder(self.embedder_config)
+
+    def _initialize_app(self):
+        import chromadb
+        from chromadb.config import Settings
+
+        self._set_embedder_config()
+        chroma_client = chromadb.PersistentClient(
+            path=self.path if self.path else self.storage_file_name,
+            settings=Settings(allow_reset=self.allow_reset),
+        )
+
+        self.app = chroma_client
+
+        try:
+            self.collection = self.app.get_collection(
+                name=self.type, embedding_function=self.embedder_config
+            )
+        except Exception:
+            self.collection = self.app.create_collection(
+                name=self.type, embedding_function=self.embedder_config
+            )
+
+    def _sanitize_role(self, role: str) -> str:
+        """
+        Sanitizes agent roles to ensure valid directory names.
+        """
+        return role.replace("\n", "").replace(" ", "_").replace("/", "_")
+
+    def _build_storage_file_name(self, type: str, file_name: str) -> str:
+        """
+        Ensures file name does not exceed max allowed by OS
+        """
+        base_path = f"{db_storage_path()}/{type}"
+
+        if len(file_name) > MAX_FILE_NAME_LENGTH:
+            logging.warning(
+                f"Trimming file name from {len(file_name)} to {MAX_FILE_NAME_LENGTH} characters."
+            )
+            file_name = file_name[:MAX_FILE_NAME_LENGTH]
+
+        return f"{base_path}/{file_name}"
+
+    def save(self, value: Any, metadata: Dict[str, Any]) -> None:
+        if not hasattr(self, "app") or not hasattr(self, "collection"):
+            self._initialize_app()
+        try:
+            self._generate_embedding(value, metadata)
+        except Exception as e:
+            logging.error(f"Error during {self.type} save: {str(e)}")
+
+    def search(
+        self,
+        query: str,
+        limit: int = 3,
+        filter: Optional[dict] = None,
+        score_threshold: float = 0.35,
+    ) -> List[Any]:
+        if not hasattr(self, "app"):
+            self._initialize_app()
+
+        try:
+            with suppress_logging():
+                response = self.collection.query(query_texts=query, n_results=limit)
+
+            results = []
+            for i in range(len(response["ids"][0])):
+                result = {
+                    "id": response["ids"][0][i],
+                    "metadata": response["metadatas"][0][i],
+                    "context": response["documents"][0][i],
+                    "score": response["distances"][0][i],
+                }
+                if result["score"] >= score_threshold:
+                    results.append(result)
+
+            return results
+        except Exception as e:
+            logging.error(f"Error during {self.type} search: {str(e)}")
+            return []
+
+    def _generate_embedding(self, text: str, metadata: Dict[str, Any]) -> None:  # type: ignore
+        if not hasattr(self, "app") or not hasattr(self, "collection"):
+            self._initialize_app()
+
+        self.collection.add(
+            documents=[text],
+            metadatas=[metadata or {}],
+            ids=[str(uuid.uuid4())],
+        )
+
+    def reset(self) -> None:
+        try:
+            # Reset through the client before removing the storage folder so that
+            # Chroma can release its open handles on the underlying files.
+            # Deleting the folder first caused "disk I/O error" failures.
+            if self.app:
+                self.app.reset()
+
+            storage_dir = f"{db_storage_path()}/{self.type}"
+            if os.path.exists(storage_dir):
+                shutil.rmtree(storage_dir)
+        except Exception as e:
+            if "attempt to write a readonly database" in str(e):
+                # Ignore this specific error
+                pass
+            else:
+                raise Exception(
+                    f"An error occurred while resetting the {self.type} memory: {e}"
+                )
+
+    def _create_default_embedding_function(self):
+        from chromadb.utils.embedding_functions.openai_embedding_function import (
+            OpenAIEmbeddingFunction,
+        )
+
+        return OpenAIEmbeddingFunction(
+            api_key=os.getenv("OPENAI_API_KEY"), model_name="text-embedding-3-small"
+        )
+
+
+### tests/memory/short_term_memory_test.py
+import pytest
+from unittest.mock import patch
+from crewai.agent import Agent
+from crewai.crew import Crew
+from crewai.memory.short_term.short_term_memory import ShortTermMemory
+from crewai.memory.short_term.short_term_memory_item import ShortTermMemoryItem
+from crewai.task import Task
+
+
+@pytest.fixture
+def short_term_memory():
+    """Fixture to create a ShortTermMemory instance"""
+    agent = Agent(
+        role="Researcher",
+        goal="Search relevant data and provide results",
+        backstory="You are a researcher at a leading tech think tank.",
+        tools=[],
+        verbose=True,
+    )
+
+    task = Task(
+        description="Perform a search on specific topics.",
+        expected_output="A list of relevant URLs based on the search query.",
+        agent=agent,
+    )
+    return ShortTermMemory(crew=Crew(agents=[agent], tasks=[task]))
+
+
+def test_save_and_search(short_term_memory):
+    memory = ShortTermMemoryItem(
+        data="""test value test value test value test value test value test value
+        test value test value test value test value test value test value
+        test value test value test value test value test value test value""",
+        agent="test_agent",
+        metadata={"task": "test_task"},
+    )
+
+    with patch.object(ShortTermMemory, "save") as mock_save:
+        short_term_memory.save(
+            value=memory.data,
+            metadata=memory.metadata,
+            agent=memory.agent,
+        )
+
+        mock_save.assert_called_once_with(
+            value=memory.data,
+            metadata=memory.metadata,
+            agent=memory.agent,
+        )
+
+    expected_result = [
+        {
+            "context": memory.data,
+            "metadata": {"agent": "test_agent"},
+            "score": 0.95,
+        }
+    ]
+    with patch.object(ShortTermMemory, "search", return_value=expected_result):
+        find = short_term_memory.search("test value", score_threshold=0.01)[0]
+        assert find["context"] == memory.data, "Data value mismatch."
+        assert find["metadata"]["agent"] == "test_agent", "Agent value mismatch."
+
+--------------------------------------------------------------------------------

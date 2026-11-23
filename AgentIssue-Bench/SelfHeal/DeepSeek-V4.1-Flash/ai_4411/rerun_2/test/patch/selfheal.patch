@@ -1,0 +1,301 @@
+diff --git a/packages/ai/core/generate-object/output-strategy.ts b/packages/ai/core/generate-object/output-strategy.ts
+index e7c226b..3dabe6c 100644
+--- a/packages/ai/core/generate-object/output-strategy.ts
++++ b/packages/ai/core/generate-object/output-strategy.ts
+@@ -121,7 +121,7 @@ const arrayOutputStrategy = <ELEMENT>(
+   const { $schema, ...itemSchema } = schema.jsonSchema;
+ 
+   return {
+-    type: 'enum',
++    type: 'array',
+ 
+     // wrap in object that contains array of elements, since most LLMs will not
+     // be able to generate an array directly:
+diff --git a/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts b/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
+index a2b8e41..3f344cd 100644
+--- a/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
++++ b/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
+@@ -96,6 +96,75 @@ it('should correctly map tool properties', () => {
+   });
+ });
+ 
++it('should preserve parameter descriptions, including descriptions of optional fields', () => {
++  const tools: Record<string, CoreTool> = {
++    tool1: tool({
++      description: 'Tool 1 description',
++      parameters: z.object({
++        name: z.string().describe('The name of the city'),
++        nickname: z.string().optional().describe('An optional nickname'),
++      }),
++    }),
++  };
++
++  const result = prepareToolsAndToolChoice({
++    tools,
++    toolChoice: undefined,
++    activeTools: undefined,
++  });
++
++  expect(result.tools?.[0]).toMatchObject({
++    type: 'function',
++    name: 'tool1',
++    parameters: {
++      type: 'object',
++      properties: {
++        name: { type: 'string', description: 'The name of the city' },
++        nickname: { type: 'string', description: 'An optional nickname' },
++      },
++      required: ['name'],
++    },
++  });
++});
++
++it('should preserve parameter descriptions of nested optional objects and arrays', () => {
++  const tools: Record<string, CoreTool> = {
++    tool1: tool({
++      description: 'Tool 1 description',
++      parameters: z.object({
++        location: z
++          .object({ city: z.string() })
++          .optional()
++          .describe('The location of the user'),
++        tags: z.array(z.string()).describe('Tags of the user'),
++      }),
++    }),
++  };
++
++  const result = prepareToolsAndToolChoice({
++    tools,
++    toolChoice: undefined,
++    activeTools: undefined,
++  });
++
++  expect(result.tools?.[0]).toMatchObject({
++    parameters: {
++      properties: {
++        location: {
++          type: 'object',
++          description: 'The location of the user',
++          properties: { city: { type: 'string' } },
++        },
++        tags: {
++          type: 'array',
++          description: 'Tags of the user',
++          items: { type: 'string' },
++        },
++      },
++    },
++  });
++});
++
+ it('should handle provider-defined tool type', () => {
+   const result = prepareToolsAndToolChoice({
+     tools: mockToolsWithProviderDefined,
+diff --git a/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts b/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
+index 4cf62a2..1f90b0b 100644
+--- a/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
++++ b/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
+@@ -1,9 +1,11 @@
+ import {
++  JSONSchema7,
+   LanguageModelV1FunctionTool,
+   LanguageModelV1ProviderDefinedTool,
+   LanguageModelV1ToolChoice,
+ } from '@ai-sdk/provider';
+-import { asSchema } from '@ai-sdk/ui-utils';
++import { asSchema, Schema } from '@ai-sdk/ui-utils';
++import { z } from 'zod';
+ import { CoreTool } from '../tool/tool';
+ import { CoreToolChoice } from '../types/language-model';
+ import { isNonEmptyObject } from '../util/is-non-empty-object';
+@@ -49,7 +51,7 @@ export function prepareToolsAndToolChoice<
+             type: 'function' as const,
+             name,
+             description: tool.description,
+-            parameters: asSchema(tool.parameters).jsonSchema,
++            parameters: prepareParametersJsonSchema(tool.parameters),
+           };
+         case 'provider-defined':
+           return {
+@@ -72,3 +74,181 @@ export function prepareToolsAndToolChoice<
+         : { type: 'tool' as const, toolName: toolChoice.toolName as string },
+   };
+ }
++
++/**
++ * Creates the JSON schema for the tool parameters and makes sure that all
++ * descriptions defined in the zod schema are preserved.
++ */
++function prepareParametersJsonSchema(
++  parameters: z.ZodSchema<any> | Schema<any>,
++): JSONSchema7 {
++  // for zod schemas, asSchema converts the zod schema into a JSON schema.
++  // the conversion attaches the description of a schema to the generated JSON
++  // schema, but it loses the description of wrapper schemas, e.g.
++  // `z.string().optional().describe('...')`, because the wrapper is unwrapped
++  // without taking its description into account:
++  const jsonSchema = asSchema(parameters).jsonSchema;
++
++  return isZodSchema(parameters)
++    ? addZodDescriptions(jsonSchema, parameters)
++    : jsonSchema;
++}
++
++/**
++ * Walks the zod schema and the generated JSON schema in parallel and copies the
++ * descriptions of the zod schemas into the JSON schema.
++ *
++ * This restores descriptions that are defined on wrapper schemas, such as
++ * `z.string().optional().describe('...')`, which would otherwise be lost
++ * during the JSON schema conversion. The JSON schema passed in is the freshly
++ * generated JSON schema of the zod schema, so it is safe to modify it.
++ */
++function addZodDescriptions(
++  jsonSchema: JSONSchema7,
++  zodSchema: z.ZodTypeAny,
++): JSONSchema7 {
++  if (!isJsonSchemaObject(jsonSchema)) {
++    return jsonSchema;
++  }
++
++  const zodDef = (zodSchema as any)?._def;
++
++  if (zodDef == null) {
++    return jsonSchema;
++  }
++
++  const jsonSchemaObject = jsonSchema as any;
++
++  // add the description of the zod schema if the JSON schema does not
++  // already have one (the description might have been added by the
++  // conversion of the wrapped schema):
++  if (
++    typeof zodDef.description === 'string' &&
++    jsonSchemaObject.description == null
++  ) {
++    jsonSchemaObject.description = zodDef.description;
++  }
++
++  switch (zodDef.typeName) {
++    // wrapper schemas that do not change the shape of the wrapped schema:
++    case 'ZodOptional':
++    case 'ZodNullable':
++    case 'ZodDefault':
++    case 'ZodCatch':
++    case 'ZodReadonly':
++    case 'ZodBranded':
++    case 'ZodPromise': {
++      const innerSchema = zodDef.innerType ?? zodDef.type;
++
++      if (innerSchema != null) {
++        addZodDescriptions(jsonSchema, innerSchema);
++      }
++      break;
++    }
++
++    // refined schemas:
++    case 'ZodEffects': {
++      if (zodDef.schema != null) {
++        addZodDescriptions(jsonSchema, zodDef.schema);
++      }
++      break;
++    }
++
++    case 'ZodObject': {
++      const shape =
++        typeof zodDef.shape === 'function' ? zodDef.shape() : zodDef.shape;
++      const properties = jsonSchemaObject.properties;
++
++      if (shape == null || properties == null) {
++        break;
++      }
++
++      for (const key of Object.keys(shape)) {
++        const propertyJsonSchema = properties[key];
++
++        if (isJsonSchemaObject(propertyJsonSchema)) {
++          addZodDescriptions(propertyJsonSchema, shape[key]);
++        }
++      }
++      break;
++    }
++
++    case 'ZodArray': {
++      const items = jsonSchemaObject.items;
++
++      if (isJsonSchemaObject(items) && zodDef.type != null) {
++        addZodDescriptions(items, zodDef.type);
++      }
++      break;
++    }
++
++    case 'ZodUnion':
++    case 'ZodDiscriminatedUnion': {
++      const options: Array<z.ZodTypeAny> =
++        zodDef.options instanceof Map
++          ? Array.from(zodDef.options.values())
++          : zodDef.options;
++      const anyOf = jsonSchemaObject.anyOf;
++
++      if (!Array.isArray(anyOf) || !Array.isArray(options)) {
++        break;
++      }
++
++      for (
++        let index = 0;
++        index < anyOf.length && index < options.length;
++        index++
++      ) {
++        if (isJsonSchemaObject(anyOf[index])) {
++          addZodDescriptions(anyOf[index], options[index]);
++        }
++      }
++      break;
++    }
++
++    case 'ZodIntersection': {
++      const allOf = jsonSchemaObject.allOf;
++
++      if (Array.isArray(allOf) && allOf.length === 2) {
++        if (isJsonSchemaObject(allOf[0]) && zodDef.left != null) {
++          addZodDescriptions(allOf[0], zodDef.left);
++        }
++
++        if (isJsonSchemaObject(allOf[1]) && zodDef.right != null) {
++          addZodDescriptions(allOf[1], zodDef.right);
++        }
++      }
++      break;
++    }
++
++    case 'ZodRecord': {
++      const additionalProperties = jsonSchemaObject.additionalProperties;
++
++      if (isJsonSchemaObject(additionalProperties) && zodDef.valueType != null) {
++        addZodDescriptions(additionalProperties, zodDef.valueType);
++      }
++      break;
++    }
++
++    // all other zod types (strings, numbers, enums, literals, etc.)
++    // do not contain nested schemas:
++    default: {
++      break;
++    }
++  }
++
++  return jsonSchema;
++}
++
++function isZodSchema(schema: unknown): schema is z.ZodTypeAny {
++  return (
++    schema != null &&
++    typeof schema === 'object' &&
++    '_def' in schema &&
++    typeof (schema as any).parse === 'function'
++  );
++}
++
++function isJsonSchemaObject(value: unknown): value is JSONSchema7 {
++  return value != null && typeof value === 'object' && !Array.isArray(value);
++}

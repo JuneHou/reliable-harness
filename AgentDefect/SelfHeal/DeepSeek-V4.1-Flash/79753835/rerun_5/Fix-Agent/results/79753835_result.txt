@@ -1,0 +1,386 @@
+Case ID: 79753835
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 20:16:38
+End Time: 2026-11-05 20:27:48
+Total Duration: 669.66 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Reproduce the *exact* token count that BAAI/bge-m3 uses inside llama-index.
+
+Why the two numbers in the buggy snippet disagree
+-------------------------------------------------
+1. ``TokenCountingHandler()`` was created with its default tokenizer, which is
+   tiktoken's ``cl100k_base`` (the OpenAI tokenizer).  BGE-M3 is an XLM-RoBERTa
+   model and uses a *sentencepiece* tokenizer, so it splits the text very
+   differently -> the counter reported a number that has nothing to do with
+   BGE-M3.
+2. The embedding model was built *before* the ``TokenCountingHandler`` /
+   ``CallbackManager`` existed and only ``Settings.callback_manager`` was set
+   afterwards, so the embed model kept its default (empty) callback manager and
+   nothing was ever reported to the counter.  The callback manager must be
+   handed to ``HuggingFaceEmbedding(...)`` directly.
+3. Extra preprocessing that has to be taken into account when counting "by
+   hand": ``HuggingFaceEmbedding`` calls its tokenizer with
+   ``add_special_tokens=True`` (so ``<s> ... </s>`` are counted) and
+   ``truncation=True, max_length=max_length`` (default 512).  A bare
+   ``tokenizer(text)`` neither truncates nor knows about the chunk size.
+
+The fix below wires the counter to the embed model's *own* tokenizer, gives the
+callback manager to the embedding model at construction time, and computes the
+reference count with exactly the tokenizer call the model performs.
+"""
+
+import inspect
+import os
+from typing import Any, List, Tuple
+
+from llama_index.core import Settings
+from llama_index.core.callbacks import CallbackManager, TokenCountingHandler
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from transformers import AutoTokenizer
+
+MODEL_NAME = "BAAI/bge-m3"
+# Same value that is used as `max_length` on the embedding model; this is also
+# the truncation limit applied by HuggingFaceEmbedding before pooling.
+CHUNK_SIZE = 512
+CACHE_DIR = "./embeddings"
+
+
+def create_embedding_model(
+    _chunk_size: int = CHUNK_SIZE,
+    callback_manager: CallbackManager | None = None,
+) -> HuggingFaceEmbedding:
+    """Load the embed model and, importantly, give it OUR callback manager."""
+    print("loading embeddings...")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    _embed_model = HuggingFaceEmbedding(
+        model_name=MODEL_NAME,
+        max_length=_chunk_size,
+        cache_folder=CACHE_DIR,
+        # <- without this the TokenCountingHandler never sees the embedding call
+        callback_manager=callback_manager,
+        embed_batch_size=1,
+    )
+
+    print("embeddings loaded")
+    return _embed_model
+
+
+def get_embed_tokenizer(embed_model: Any) -> AutoTokenizer:
+    """Return the very tokenizer instance the embedding model tokenizes with."""
+    tokenizer = getattr(embed_model, "_tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+
+    # Fallback: the model loads it from the same checkpoint, so it is identical.
+    try:
+        return AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    except Exception:
+        return AutoTokenizer.from_pretrained(MODEL_NAME)
+
+
+def make_token_counter(tokenizer: AutoTokenizer) -> TokenCountingHandler:
+    """TokenCountingHandler that counts with the *embedding model's* tokenizer.
+
+    ``tokenizer.encode`` keeps the special tokens (``<s>``/``</s>``), which is
+    what the sentencepiece tokenizer adds for BGE-M3, so the handler's count
+    matches the model's real input length.
+    """
+    encode = tokenizer.encode  # Callable[[str], List[int]]
+
+    # Newer llama-index versions split the tokenizer per event type.
+    params = inspect.signature(TokenCountingHandler.__init__).parameters
+    if "embed_tokenizer" in params:
+        return TokenCountingHandler(embed_tokenizer=encode, verbose=True)
+    return TokenCountingHandler(tokenizer=encode, verbose=True)
+
+
+def count_tokens_for_embedding(
+    text: str,
+    tokenizer: AutoTokenizer,
+    max_length: int = CHUNK_SIZE,
+) -> int:
+    """Exact number of tokens the embedding model sees for `text`.
+
+    This mirrors HuggingFaceEmbedding's own call:
+        tokenizer(text, padding=True, truncation=True, max_length=max_length,
+                  return_tensors="pt")
+    i.e. special tokens are added and the sequence is truncated to max_length.
+    """
+    encoded = tokenizer(
+        text,
+        add_special_tokens=True,
+        truncation=True,
+        max_length=max_length,
+    )
+    return len(encoded["input_ids"])
+
+
+def run_agent(text: str) -> Tuple[int, int, int]:
+    """Return (tokens reported by llama-index, exact model tokens, naive count)."""
+    # The tokenizer has to exist *before* the embed model so the counter can use it.
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    token_counter = make_token_counter(tokenizer)
+    callback_manager = CallbackManager([token_counter])
+
+    # Set the callback manager first, then build the model WITH it.
+    Settings.callback_manager = callback_manager
+    embed_model = create_embedding_model(
+        _chunk_size=CHUNK_SIZE, callback_manager=callback_manager
+    )
+    Settings.embed_model = embed_model
+
+    # Use the identical tokenizer instance the embed model uses (guarantees exactness).
+    tokenizer = get_embed_tokenizer(embed_model)
+
+    token_counter.reset_counts()
+    Settings.embed_model.get_text_embedding(text)
+
+    embedding_tokens = token_counter.total_embedding_token_count
+
+    # what the model really consumes / what the buggy snippet printed
+    model_token_count = count_tokens_for_embedding(text, tokenizer, CHUNK_SIZE)
+    naive_token_count = len(tokenizer(text)["input_ids"])
+
+    return embedding_tokens, model_token_count, naive_token_count
+
+
+if __name__ == "__main__":
+    text = "Random words. This is a test! A very exciting test, indeed."
+    embedding_tokens, token_count, naive_token_count = run_agent(text)
+
+    print(f"The embedding model broke the text into: {embedding_tokens} tokens")
+    print(f"The tokenizer broke the text into {token_count} tokens "
+          f"(truncated to max_length={CHUNK_SIZE}, special tokens included)")
+
+    if embedding_tokens != token_count:
+        print(
+            "Mismatch detected. Most likely causes:\n"
+            "  * the embed model was created without our callback_manager,\n"
+            "  * the TokenCountingHandler still uses tiktoken instead of the "
+            "BGE-M3 tokenizer,\n"
+            "  * or the text is longer than max_length tokens, so the model "
+            "truncates while a plain tokenizer call does not "
+            f"(no-truncation count = {naive_token_count})."
+        )
+    else:
+        print("Both counts agree - this is exactly what BGE-M3 tokenizes.")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 20:27:48
+Duration: 669.66 seconds
+Verdict: ## REJECT
+
+### Fatal issue: `run_agent` no longer returns the contract the test expects
+
+The test imports and calls:
+
+```python
+embedding_tokens, token_count = run_agent(text)
+```
+
+But the fixed code changed the return type:
+
+```python
+def run_agent(text: str) -> Tuple[int, int, int]:
+    """Return (tokens reported by llama-index, exact model tokens, naive count)."""
+    ...
+    return embedding_tokens, model_token_count, naive_token_count
+```
+
+Unpacking a 3-tuple into 2 names raises:
+
+```
+ValueError: too many values to unpack (expected 2)
+```
+
+So every call of the test fails immediately, before any assertion on the values is reached. The `__main__` block was updated to unpack three values, but the unit test in the case was **not** updated — so the "fix" silently breaks the public contract it is supposed to satisfy. The structural validator returned `ACCEPT`, which shows it only checks shape/format, not call-site arity — this mismatch must be caught by review.
+
+### Secondary concerns (would matter even after the arity is fixed)
+
+1. **Equality is not guaranteed, only incidental.** `count_tokens_for_embedding` uses `add_special_tokens=True, truncation=True, max_length=512`, while the counter path goes through `tokenizer.encode` (defaults: special tokens added, no truncation). These agree only because the test sentence is far shorter than 512 tokens. For any input near/over the limit the two numbers diverge again — the exact class of bug being fixed. Since `truncation=True` is applied on one side and not the other, the "exactness" claim in the docstring is not actually enforced.
+
+2. **Version-dependent tokenizer wiring.** `inspect.signature(TokenCountingHandler.__init__)` branching between `embed_tokenizer=` and `tokenizer=` is fragile; if the installed version has neither keyword (or has `embed_tokenizer` typed as a `BaseTokenizer` rather than a plain callable), construction fails or silently falls back to `tiktoken` — reintroducing the original bug rather than fixing it.
+
+3. **`embed_model._tokenizer` is a private attribute.** `get_embed_tokenizer` relies on it and only falls back on `AttributeError`-free paths; there is no `hasattr` guard around the fallback ordering beyond `getattr(..., None)`, so a renamed private attribute would silently switch to a differently-configured tokenizer instance.
+
+4. **API verification was inconclusive.** `verify_api_usage` returned unrelated `llama`/Meta-LLaMA Wikipedia results for both `TokenCountingHandler` and `HuggingFaceEmbedding.get_text_embedding`, so the constructor kwargs (`callback_manager=`, `embed_batch_size=`) and `reset_counts()` could not be independently confirmed; this lowers confidence but is not by itself grounds for rejection.
+
+### Conclusion
+
+The fix does address the real root cause (wiring the callback manager into `HuggingFaceEmbedding` at construction time and counting with the model's own sentencepiece tokenizer instead of `tiktoken`), which is the right direction. But it changes `run_agent`'s return arity from 2 to 3 without updating the test, so the test suite cannot pass. Return exactly `(embedding_tokens, token_count)` — keeping the third value internal or debug-only — and align the truncation/special-token handling on both sides before this can be accepted.
+--------------------------------------------------------------------------------
+"""Reproduce the *exact* token count that BAAI/bge-m3 uses inside llama-index.
+
+Why the two numbers in the buggy snippet disagree
+-------------------------------------------------
+1. ``TokenCountingHandler()`` was created with its default tokenizer, which is
+   tiktoken's ``cl100k_base`` (the OpenAI tokenizer).  BGE-M3 is an XLM-RoBERTa
+   model and uses a *sentencepiece* tokenizer, so it splits the text very
+   differently -> the counter reported a number that has nothing to do with
+   BGE-M3.
+2. The embedding model was built *before* the ``TokenCountingHandler`` /
+   ``CallbackManager`` existed and only ``Settings.callback_manager`` was set
+   afterwards, so the embed model kept its default (empty) callback manager and
+   nothing was ever reported to the counter.  The callback manager must be
+   handed to ``HuggingFaceEmbedding(...)`` directly.
+3. Extra preprocessing that has to be taken into account when counting "by
+   hand": ``HuggingFaceEmbedding`` calls its tokenizer with
+   ``add_special_tokens=True`` (so ``<s> ... </s>`` are counted) and
+   ``truncation=True, max_length=max_length`` (default 512).  A bare
+   ``tokenizer(text)`` neither truncates nor knows about the chunk size.
+
+The fix below wires the counter to the embed model's *own* tokenizer, gives the
+callback manager to the embedding model at construction time, and computes the
+reference count with exactly the tokenizer call the model performs.
+"""
+
+import inspect
+import os
+from typing import Any, List, Tuple
+
+from llama_index.core import Settings
+from llama_index.core.callbacks import CallbackManager, TokenCountingHandler
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from transformers import AutoTokenizer
+
+MODEL_NAME = "BAAI/bge-m3"
+# Same value that is used as `max_length` on the embedding model; this is also
+# the truncation limit applied by HuggingFaceEmbedding before pooling.
+CHUNK_SIZE = 512
+CACHE_DIR = "./embeddings"
+
+
+def create_embedding_model(
+    _chunk_size: int = CHUNK_SIZE,
+    callback_manager: CallbackManager | None = None,
+) -> HuggingFaceEmbedding:
+    """Load the embed model and, importantly, give it OUR callback manager."""
+    print("loading embeddings...")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    _embed_model = HuggingFaceEmbedding(
+        model_name=MODEL_NAME,
+        max_length=_chunk_size,
+        cache_folder=CACHE_DIR,
+        # <- without this the TokenCountingHandler never sees the embedding call
+        callback_manager=callback_manager,
+        embed_batch_size=1,
+    )
+
+    print("embeddings loaded")
+    return _embed_model
+
+
+def get_embed_tokenizer(embed_model: Any) -> AutoTokenizer:
+    """Return the very tokenizer instance the embedding model tokenizes with."""
+    tokenizer = getattr(embed_model, "_tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+
+    # Fallback: the model loads it from the same checkpoint, so it is identical.
+    try:
+        return AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    except Exception:
+        return AutoTokenizer.from_pretrained(MODEL_NAME)
+
+
+def make_token_counter(tokenizer: AutoTokenizer) -> TokenCountingHandler:
+    """TokenCountingHandler that counts with the *embedding model's* tokenizer.
+
+    ``tokenizer.encode`` keeps the special tokens (``<s>``/``</s>``), which is
+    what the sentencepiece tokenizer adds for BGE-M3, so the handler's count
+    matches the model's real input length.
+    """
+    encode = tokenizer.encode  # Callable[[str], List[int]]
+
+    # Newer llama-index versions split the tokenizer per event type.
+    params = inspect.signature(TokenCountingHandler.__init__).parameters
+    if "embed_tokenizer" in params:
+        return TokenCountingHandler(embed_tokenizer=encode, verbose=True)
+    return TokenCountingHandler(tokenizer=encode, verbose=True)
+
+
+def count_tokens_for_embedding(
+    text: str,
+    tokenizer: AutoTokenizer,
+    max_length: int = CHUNK_SIZE,
+) -> int:
+    """Exact number of tokens the embedding model sees for `text`.
+
+    This mirrors HuggingFaceEmbedding's own call:
+        tokenizer(text, padding=True, truncation=True, max_length=max_length,
+                  return_tensors="pt")
+    i.e. special tokens are added and the sequence is truncated to max_length.
+    """
+    encoded = tokenizer(
+        text,
+        add_special_tokens=True,
+        truncation=True,
+        max_length=max_length,
+    )
+    return len(encoded["input_ids"])
+
+
+def run_agent(text: str) -> Tuple[int, int, int]:
+    """Return (tokens reported by llama-index, exact model tokens, naive count)."""
+    # The tokenizer has to exist *before* the embed model so the counter can use it.
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    token_counter = make_token_counter(tokenizer)
+    callback_manager = CallbackManager([token_counter])
+
+    # Set the callback manager first, then build the model WITH it.
+    Settings.callback_manager = callback_manager
+    embed_model = create_embedding_model(
+        _chunk_size=CHUNK_SIZE, callback_manager=callback_manager
+    )
+    Settings.embed_model = embed_model
+
+    # Use the identical tokenizer instance the embed model uses (guarantees exactness).
+    tokenizer = get_embed_tokenizer(embed_model)
+
+    token_counter.reset_counts()
+    Settings.embed_model.get_text_embedding(text)
+
+    embedding_tokens = token_counter.total_embedding_token_count
+
+    # what the model really consumes / what the buggy snippet printed
+    model_token_count = count_tokens_for_embedding(text, tokenizer, CHUNK_SIZE)
+    naive_token_count = len(tokenizer(text)["input_ids"])
+
+    return embedding_tokens, model_token_count, naive_token_count
+
+
+if __name__ == "__main__":
+    text = "Random words. This is a test! A very exciting test, indeed."
+    embedding_tokens, token_count, naive_token_count = run_agent(text)
+
+    print(f"The embedding model broke the text into: {embedding_tokens} tokens")
+    print(f"The tokenizer broke the text into {token_count} tokens "
+          f"(truncated to max_length={CHUNK_SIZE}, special tokens included)")
+
+    if embedding_tokens != token_count:
+        print(
+            "Mismatch detected. Most likely causes:\n"
+            "  * the embed model was created without our callback_manager,\n"
+            "  * the TokenCountingHandler still uses tiktoken instead of the "
+            "BGE-M3 tokenizer,\n"
+            "  * or the text is longer than max_length tokens, so the model "
+            "truncates while a plain tokenizer call does not "
+            f"(no-truncation count = {naive_token_count})."
+        )
+    else:
+        print("Both counts agree - this is exactly what BGE-M3 tokenizes.")
+
+--------------------------------------------------------------------------------

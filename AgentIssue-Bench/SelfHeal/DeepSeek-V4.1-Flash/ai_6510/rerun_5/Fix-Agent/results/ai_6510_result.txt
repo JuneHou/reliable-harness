@@ -1,0 +1,1837 @@
+Case ID: ai_6510
+Status: FAILED
+Final Attempt: 3
+Start Time: 2026-11-15 21:19:13
+End Time: 2026-11-16 00:17:37
+Total Duration: 10703.91 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### packages/ai/core/generate-object/output-strategy.ts
+import {
+  isJSONArray,
+  isJSONObject,
+  JSONObject,
+  JSONSchema7,
+  JSONValue,
+  TypeValidationError,
+  UnsupportedFunctionalityError,
+} from '@ai-sdk/provider';
+import {
+  asSchema,
+  safeValidateTypes,
+  Schema,
+  ValidationResult,
+} from '@ai-sdk/provider-utils';
+import { z } from 'zod';
+import { NoObjectGeneratedError } from '../../src/error/no-object-generated-error';
+import {
+  AsyncIterableStream,
+  createAsyncIterableStream,
+} from '../../src/util/async-iterable-stream';
+import { DeepPartial } from '../../src/util/deep-partial';
+import {
+  FinishReason,
+  LanguageModelResponseMetadata,
+  LanguageModelUsage,
+} from '../types';
+import { ObjectStreamPart } from './stream-object-result';
+
+export interface OutputStrategy<PARTIAL, RESULT, ELEMENT_STREAM> {
+  readonly type: 'object' | 'array' | 'enum' | 'no-schema';
+  readonly jsonSchema: JSONSchema7 | undefined;
+
+  validatePartialResult({
+    value,
+    textDelta,
+    isFinalDelta,
+  }: {
+    value: JSONValue;
+    textDelta: string;
+    isFirstDelta: boolean;
+    isFinalDelta: boolean;
+    latestObject: PARTIAL | undefined;
+  }): Promise<
+    ValidationResult<{
+      partial: PARTIAL;
+      textDelta: string;
+    }>
+  >;
+  validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+      finishReason: FinishReason;
+    },
+  ): Promise<ValidationResult<RESULT>>;
+
+  createElementStream(
+    originalStream: ReadableStream<ObjectStreamPart<PARTIAL>>,
+  ): ELEMENT_STREAM;
+}
+
+const noSchemaOutputStrategy: OutputStrategy<JSONValue, JSONValue, never> = {
+  type: 'no-schema',
+  jsonSchema: undefined,
+
+  async validatePartialResult({ value, textDelta }) {
+    return { success: true, value: { partial: value, textDelta } };
+  },
+
+  async validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+      finishReason: FinishReason;
+    },
+  ): Promise<ValidationResult<JSONValue>> {
+    return value === undefined
+      ? {
+          success: false,
+          error: new NoObjectGeneratedError({
+            message: 'No object generated: response did not match schema.',
+            text: context.text,
+            response: context.response,
+            usage: context.usage,
+            finishReason: context.finishReason,
+          }),
+        }
+      : { success: true, value };
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in no-schema mode',
+    });
+  },
+};
+
+const objectOutputStrategy = <OBJECT>(
+  schema: Schema<OBJECT>,
+): OutputStrategy<DeepPartial<OBJECT>, OBJECT, never> => ({
+  type: 'object',
+  jsonSchema: schema.jsonSchema,
+
+  async validatePartialResult({ value, textDelta }) {
+    return {
+      success: true,
+      value: {
+        // Note: currently no validation of partial results:
+        partial: value as DeepPartial<OBJECT>,
+        textDelta,
+      },
+    };
+  },
+
+  async validateFinalResult(
+    value: JSONValue | undefined,
+  ): Promise<ValidationResult<OBJECT>> {
+    return safeValidateTypes({ value, schema });
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in object mode',
+    });
+  },
+});
+
+const arrayOutputStrategy = <ELEMENT>(
+  schema: Schema<ELEMENT>,
+): OutputStrategy<ELEMENT[], ELEMENT[], AsyncIterableStream<ELEMENT>> => {
+  // remove $schema from schema.jsonSchema:
+  const { $schema, ...itemSchema } = schema.jsonSchema;
+
+  return {
+    type: 'array',
+
+    // wrap in object that contains array of elements, since most LLMs will not
+    // be able to generate an array directly:
+    // possible future optimization: use arrays directly when model supports grammar-guided generation
+    jsonSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        elements: { type: 'array', items: itemSchema },
+      },
+      required: ['elements'],
+      additionalProperties: false,
+    },
+
+    async validatePartialResult({
+      value,
+      latestObject,
+      isFirstDelta,
+      isFinalDelta,
+    }) {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+      const resultArray: Array<ELEMENT> = [];
+
+      for (let i = 0; i < inputArray.length; i++) {
+        const element = inputArray[i];
+        const result = await safeValidateTypes({ value: element, schema });
+
+        // special treatment for last processed element:
+        // ignore parse or validation failures, since they indicate that the
+        // last element is incomplete and should not be included in the result,
+        // unless it is the final delta
+        if (i === inputArray.length - 1 && !isFinalDelta) {
+          continue;
+        }
+
+        if (!result.success) {
+          return result;
+        }
+
+        resultArray.push(result.value);
+      }
+
+      // calculate delta:
+      const publishedElementCount = latestObject?.length ?? 0;
+
+      let textDelta = '';
+
+      if (isFirstDelta) {
+        textDelta += '[';
+      }
+
+      if (publishedElementCount > 0) {
+        textDelta += ',';
+      }
+
+      textDelta += resultArray
+        .slice(publishedElementCount) // only new elements
+        .map(element => JSON.stringify(element))
+        .join(',');
+
+      if (isFinalDelta) {
+        textDelta += ']';
+      }
+
+      return {
+        success: true,
+        value: {
+          partial: resultArray,
+          textDelta,
+        },
+      };
+    },
+
+    async validateFinalResult(
+      value: JSONValue | undefined,
+    ): Promise<ValidationResult<Array<ELEMENT>>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+
+      // check that each element in the array is of the correct type:
+      for (const element of inputArray) {
+        const result = await safeValidateTypes({ value: element, schema });
+        if (!result.success) {
+          return result;
+        }
+      }
+
+      return { success: true, value: inputArray as Array<ELEMENT> };
+    },
+
+    createElementStream(
+      originalStream: ReadableStream<ObjectStreamPart<ELEMENT[]>>,
+    ) {
+      let publishedElements = 0;
+
+      return createAsyncIterableStream(
+        originalStream.pipeThrough(
+          new TransformStream<ObjectStreamPart<ELEMENT[]>, ELEMENT>({
+            transform(chunk, controller) {
+              switch (chunk.type) {
+                case 'object': {
+                  const array = chunk.object;
+
+                  // publish new elements one by one:
+                  for (
+                    ;
+                    publishedElements < array.length;
+                    publishedElements++
+                  ) {
+                    controller.enqueue(array[publishedElements]);
+                  }
+
+                  break;
+                }
+
+                case 'text-delta':
+                case 'finish':
+                case 'error': // suppress error (use onError instead)
+                  break;
+
+                default: {
+                  const _exhaustiveCheck: never = chunk;
+                  throw new Error(
+                    `Unsupported chunk type: ${_exhaustiveCheck}`,
+                  );
+                }
+              }
+            },
+          }),
+        ),
+      );
+    },
+  };
+};
+
+const enumOutputStrategy = <ENUM extends string>(
+  enumValues: Array<ENUM>,
+): OutputStrategy<string, ENUM, never> => {
+  return {
+    type: 'enum',
+
+    // wrap in object that contains result, since most LLMs will not
+    // be able to generate an enum value directly:
+    // possible future optimization: use enums directly when model supports top-level enums
+    jsonSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        result: { type: 'string', enum: enumValues },
+      },
+      required: ['result'],
+      additionalProperties: false,
+    },
+
+    async validateFinalResult(
+      value: JSONValue | undefined,
+    ): Promise<ValidationResult<ENUM>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+
+      return enumValues.includes(result as ENUM)
+        ? { success: true, value: result as ENUM }
+        : {
+            success: false,
+            error: new TypeValidationError({
+              value,
+              cause: 'value must be a string in the enum',
+            }),
+          };
+    },
+
+    async validatePartialResult({ value, textDelta }) {
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+      const possibleEnumValues = enumValues.filter(enumValue =>
+        enumValue.startsWith(result),
+      );
+
+      if (value.result.length === 0 || possibleEnumValues.length === 0) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be a string in the enum',
+          }),
+        };
+      }
+
+      return {
+        success: true,
+        value: {
+          partial:
+            possibleEnumValues.length > 1 ? result : possibleEnumValues[0],
+          textDelta,
+        },
+      };
+    },
+
+    createElementStream() {
+      // no streaming in enum mode
+      throw new UnsupportedFunctionalityError({
+        functionality: 'element streams in enum mode',
+      });
+    },
+  };
+};
+
+export function getOutputStrategy<SCHEMA>({
+  output,
+  schema,
+  enumValues,
+}: {
+  output: 'object' | 'array' | 'enum' | 'no-schema';
+  schema?: z.Schema<SCHEMA, z.ZodTypeDef, any> | Schema<SCHEMA>;
+  enumValues?: Array<SCHEMA>;
+}): OutputStrategy<any, any, any> {
+  switch (output) {
+    case 'object':
+      return objectOutputStrategy(asSchema(schema!));
+    case 'array':
+      return arrayOutputStrategy(asSchema(schema!));
+    case 'enum':
+      return enumOutputStrategy(enumValues! as Array<string>);
+    case 'no-schema':
+      return noSchemaOutputStrategy;
+    default: {
+      const _exhaustiveCheck: never = output;
+      throw new Error(`Unsupported output: ${_exhaustiveCheck}`);
+    }
+  }
+}
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-15 22:37:52
+Duration: 4718.91 seconds
+Verdict: ## Evaluation: REJECT
+
+### 1. `generate_diff` — what actually changed
+
+The diff for case `ai_6510` contains only **three** effective deltas, and one of them is catastrophic:
+
+| # | Change | Assessment |
+|---|---|---|
+| 1 | `OutputStrategy.validateFinalResult` context now declares `finishReason: FinishReason` | Cosmetic type alignment. The `noSchemaOutputStrategy` implementation *already* had `finishReason` in its own signature in the buggy version, and **no other strategy** (object/array/enum) reads `finishReason` in the fixed code. Nothing consumes the new field → dead change, no behavioral fix. |
+| 2 | `arrayOutputStrategy.type: 'enum'` → `'array'` | Correcting a mislabeled discriminant, but this is an unrelated labeling issue; `getOutputStrategy` dispatches on the caller's `output` argument, not on `.type`, so it does not affect the reported bug. |
+| 3 | **Entire `generate-object.test.ts` and `stream-object.test.ts` suites deleted** (~2,580 lines removed) | Unacceptable. The fix removes the very tests that guard `generateObject`/`streamObject` behavior instead of making them pass. |
+
+### 2. `validate_fixed_code` — structural failure
+
+```
+REJECT: the line ### packages/ai/core/generate-object/generate-object.test.ts appears 0 times, expected once;
+        the line ### packages/ai/core/generate-object/stream-object.test.ts appears 0 times, expected once
+```
+
+The fixed snapshot lost both required test files entirely. Structural validation fails outright.
+
+### 3. Root cause is not addressed
+
+Issue #6510 is that `generateObject` throws `NoObjectGeneratedError` when a provider (Anthropic, OpenAI-compatible) returns **plain text / non-JSON payload** (the mock returns `content: [{ role: 'assistant', content: 'last 1.5 hours' }]`) instead of a schema-conforming JSON object.
+
+The actual fix must live where text is **extracted, parsed and validated** — `generate-object.ts` / `parse-and-validate-object-result.ts` (text-part extraction, `JSONParseError` → `NoObjectGeneratedError` mapping, `experimental_repairText`, finishReason plumbing). **None of those files are touched.** With the mock content shaped `{ role, content }` and no `type: 'text'` part, `getTextFromModelContent`-style extraction still yields `undefined`, so the fixed build still throws `NoObjectGeneratedError: the model did not return a response` — identical to the buggy build.
+
+### 4. The supplied test cannot discriminate the fix anyway
+
+- The test passes `mode: 'tool'`, which is a **v4-era option**; the code under test (`OutputStrategy`, `output: 'object' | 'array' | 'enum' | 'no-schema'`) is the v5 API. At runtime the property is silently ignored, so the intended "tool mode" path is never exercised.
+- Both branches of the fixed-version assertions exit `0` for a non-Anthropic provider (`provider: 'mock-provider'`), regardless of whether `generateObject` succeeds or throws. The test therefore passes trivially and proves nothing about the fix.
+
+### 5. `verify_api_usage` note
+
+The verification calls returned irrelevant, off-topic search results (football fixtures, etc.), so they provide **no corroboration** for the changed APIs. There is no external confirmation that adding `finishReason` to the strategy interface or relabeling `arrayOutputStrategy.type` is the sanctioned upstream resolution for #6510.
+
+### Verdict
+
+The fixed code fails structural validation (deleted test suites), makes no change to the code path that actually produces `NoObjectGeneratedError`, introduces a type-only change that is never consumed, and the accompanying test is both API-mismatched (`mode: 'tool'`) and non-discriminating.
+
+**REJECT** — needs a real fix in `generate-object.ts` (non-JSON / text-only response handling and finishReason/error plumbing) with the existing `generate-object.test.ts` and `stream-object.test.ts` suites preserved and passing.
+--------------------------------------------------------------------------------
+### packages/ai/core/generate-object/output-strategy.ts
+import {
+  isJSONArray,
+  isJSONObject,
+  JSONObject,
+  JSONSchema7,
+  JSONValue,
+  TypeValidationError,
+  UnsupportedFunctionalityError,
+} from '@ai-sdk/provider';
+import {
+  asSchema,
+  safeValidateTypes,
+  Schema,
+  ValidationResult,
+} from '@ai-sdk/provider-utils';
+import { z } from 'zod';
+import { NoObjectGeneratedError } from '../../src/error/no-object-generated-error';
+import {
+  AsyncIterableStream,
+  createAsyncIterableStream,
+} from '../../src/util/async-iterable-stream';
+import { DeepPartial } from '../../src/util/deep-partial';
+import {
+  FinishReason,
+  LanguageModelResponseMetadata,
+  LanguageModelUsage,
+} from '../types';
+import { ObjectStreamPart } from './stream-object-result';
+
+export interface OutputStrategy<PARTIAL, RESULT, ELEMENT_STREAM> {
+  readonly type: 'object' | 'array' | 'enum' | 'no-schema';
+  readonly jsonSchema: JSONSchema7 | undefined;
+
+  validatePartialResult({
+    value,
+    textDelta,
+    isFinalDelta,
+  }: {
+    value: JSONValue;
+    textDelta: string;
+    isFirstDelta: boolean;
+    isFinalDelta: boolean;
+    latestObject: PARTIAL | undefined;
+  }): Promise<
+    ValidationResult<{
+      partial: PARTIAL;
+      textDelta: string;
+    }>
+  >;
+  validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+      finishReason: FinishReason;
+    },
+  ): Promise<ValidationResult<RESULT>>;
+
+  createElementStream(
+    originalStream: ReadableStream<ObjectStreamPart<PARTIAL>>,
+  ): ELEMENT_STREAM;
+}
+
+const noSchemaOutputStrategy: OutputStrategy<JSONValue, JSONValue, never> = {
+  type: 'no-schema',
+  jsonSchema: undefined,
+
+  async validatePartialResult({ value, textDelta }) {
+    return { success: true, value: { partial: value, textDelta } };
+  },
+
+  async validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+      finishReason: FinishReason;
+    },
+  ): Promise<ValidationResult<JSONValue>> {
+    return value === undefined
+      ? {
+          success: false,
+          error: new NoObjectGeneratedError({
+            message: 'No object generated: response did not match schema.',
+            text: context.text,
+            response: context.response,
+            usage: context.usage,
+            finishReason: context.finishReason,
+          }),
+        }
+      : { success: true, value };
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in no-schema mode',
+    });
+  },
+};
+
+const objectOutputStrategy = <OBJECT>(
+  schema: Schema<OBJECT>,
+): OutputStrategy<DeepPartial<OBJECT>, OBJECT, never> => ({
+  type: 'object',
+  jsonSchema: schema.jsonSchema,
+
+  async validatePartialResult({ value, textDelta }) {
+    return {
+      success: true,
+      value: {
+        // Note: currently no validation of partial results:
+        partial: value as DeepPartial<OBJECT>,
+        textDelta,
+      },
+    };
+  },
+
+  async validateFinalResult(
+    value: JSONValue | undefined,
+  ): Promise<ValidationResult<OBJECT>> {
+    return safeValidateTypes({ value, schema });
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in object mode',
+    });
+  },
+});
+
+const arrayOutputStrategy = <ELEMENT>(
+  schema: Schema<ELEMENT>,
+): OutputStrategy<ELEMENT[], ELEMENT[], AsyncIterableStream<ELEMENT>> => {
+  // remove $schema from schema.jsonSchema:
+  const { $schema, ...itemSchema } = schema.jsonSchema;
+
+  return {
+    type: 'array',
+
+    // wrap in object that contains array of elements, since most LLMs will not
+    // be able to generate an array directly:
+    // possible future optimization: use arrays directly when model supports grammar-guided generation
+    jsonSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        elements: { type: 'array', items: itemSchema },
+      },
+      required: ['elements'],
+      additionalProperties: false,
+    },
+
+    async validatePartialResult({
+      value,
+      latestObject,
+      isFirstDelta,
+      isFinalDelta,
+    }) {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+      const resultArray: Array<ELEMENT> = [];
+
+      for (let i = 0; i < inputArray.length; i++) {
+        const element = inputArray[i];
+        const result = await safeValidateTypes({ value: element, schema });
+
+        // special treatment for last processed element:
+        // ignore parse or validation failures, since they indicate that the
+        // last element is incomplete and should not be included in the result,
+        // unless it is the final delta
+        if (i === inputArray.length - 1 && !isFinalDelta) {
+          continue;
+        }
+
+        if (!result.success) {
+          return result;
+        }
+
+        resultArray.push(result.value);
+      }
+
+      // calculate delta:
+      const publishedElementCount = latestObject?.length ?? 0;
+
+      let textDelta = '';
+
+      if (isFirstDelta) {
+        textDelta += '[';
+      }
+
+      if (publishedElementCount > 0) {
+        textDelta += ',';
+      }
+
+      textDelta += resultArray
+        .slice(publishedElementCount) // only new elements
+        .map(element => JSON.stringify(element))
+        .join(',');
+
+      if (isFinalDelta) {
+        textDelta += ']';
+      }
+
+      return {
+        success: true,
+        value: {
+          partial: resultArray,
+          textDelta,
+        },
+      };
+    },
+
+    async validateFinalResult(
+      value: JSONValue | undefined,
+    ): Promise<ValidationResult<Array<ELEMENT>>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+
+      // check that each element in the array is of the correct type:
+      for (const element of inputArray) {
+        const result = await safeValidateTypes({ value: element, schema });
+        if (!result.success) {
+          return result;
+        }
+      }
+
+      return { success: true, value: inputArray as Array<ELEMENT> };
+    },
+
+    createElementStream(
+      originalStream: ReadableStream<ObjectStreamPart<ELEMENT[]>>,
+    ) {
+      let publishedElements = 0;
+
+      return createAsyncIterableStream(
+        originalStream.pipeThrough(
+          new TransformStream<ObjectStreamPart<ELEMENT[]>, ELEMENT>({
+            transform(chunk, controller) {
+              switch (chunk.type) {
+                case 'object': {
+                  const array = chunk.object;
+
+                  // publish new elements one by one:
+                  for (
+                    ;
+                    publishedElements < array.length;
+                    publishedElements++
+                  ) {
+                    controller.enqueue(array[publishedElements]);
+                  }
+
+                  break;
+                }
+
+                case 'text-delta':
+                case 'finish':
+                case 'error': // suppress error (use onError instead)
+                  break;
+
+                default: {
+                  const _exhaustiveCheck: never = chunk;
+                  throw new Error(
+                    `Unsupported chunk type: ${_exhaustiveCheck}`,
+                  );
+                }
+              }
+            },
+          }),
+        ),
+      );
+    },
+  };
+};
+
+const enumOutputStrategy = <ENUM extends string>(
+  enumValues: Array<ENUM>,
+): OutputStrategy<string, ENUM, never> => {
+  return {
+    type: 'enum',
+
+    // wrap in object that contains result, since most LLMs will not
+    // be able to generate an enum value directly:
+    // possible future optimization: use enums directly when model supports top-level enums
+    jsonSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        result: { type: 'string', enum: enumValues },
+      },
+      required: ['result'],
+      additionalProperties: false,
+    },
+
+    async validateFinalResult(
+      value: JSONValue | undefined,
+    ): Promise<ValidationResult<ENUM>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+
+      return enumValues.includes(result as ENUM)
+        ? { success: true, value: result as ENUM }
+        : {
+            success: false,
+            error: new TypeValidationError({
+              value,
+              cause: 'value must be a string in the enum',
+            }),
+          };
+    },
+
+    async validatePartialResult({ value, textDelta }) {
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+      const possibleEnumValues = enumValues.filter(enumValue =>
+        enumValue.startsWith(result),
+      );
+
+      if (value.result.length === 0 || possibleEnumValues.length === 0) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be a string in the enum',
+          }),
+        };
+      }
+
+      return {
+        success: true,
+        value: {
+          partial:
+            possibleEnumValues.length > 1 ? result : possibleEnumValues[0],
+          textDelta,
+        },
+      };
+    },
+
+    createElementStream() {
+      // no streaming in enum mode
+      throw new UnsupportedFunctionalityError({
+        functionality: 'element streams in enum mode',
+      });
+    },
+  };
+};
+
+export function getOutputStrategy<SCHEMA>({
+  output,
+  schema,
+  enumValues,
+}: {
+  output: 'object' | 'array' | 'enum' | 'no-schema';
+  schema?: z.Schema<SCHEMA, z.ZodTypeDef, any> | Schema<SCHEMA>;
+  enumValues?: Array<SCHEMA>;
+}): OutputStrategy<any, any, any> {
+  switch (output) {
+    case 'object':
+      return objectOutputStrategy(asSchema(schema!));
+    case 'array':
+      return arrayOutputStrategy(asSchema(schema!));
+    case 'enum':
+      return enumOutputStrategy(enumValues! as Array<string>);
+    case 'no-schema':
+      return noSchemaOutputStrategy;
+    default: {
+      const _exhaustiveCheck: never = output;
+      throw new Error(`Unsupported output: ${_exhaustiveCheck}`);
+    }
+  }
+}
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-15 23:10:04
+Duration: 1932.44 seconds
+Verdict: ## Review of case `ai_6510`
+
+### 1. What the diff actually changes
+The diff touches only `packages/ai/core/generate-object/output-strategy.ts`, with two semantic edits:
+
+1. **Interface: added `finishReason: FinishReason;`** to the `context` argument of `OutputStrategy.validateFinalResult`.
+2. **`arrayOutputStrategy`: changed `type: 'enum'` → `type: 'array'`.**
+
+Everything else in the diff is the *removal* of `generate-object.test.ts` and `stream-object.test.ts` from the "fixed code" document.
+
+### 2. Structural validation → FAILED
+`validate_fixed_code` rejected the submission:
+
+> "the line `### packages/ai/core/generate-object/generate-object.test.ts` appears 0 times, expected once; the line `### packages/ai/core/generate-object/stream-object.test.ts` appears 0 times, expected once"
+
+The fixed-code payload is not a complete snapshot of the expected files — the two test modules are missing entirely, so the artifact violates the required output format.
+
+### 3. Does the change fix the reported bug? No.
+The reported problem is: *`generateObject` throws `NoObjectGeneratedError` with some providers* — the triggering scenario being a model/provider that does not return the object as plain JSON text (the test's mock returns `content: [{ role: 'assistant', content: 'last 1.5 hours' }]`, i.e. no `{type:'text'}` part at all, or with `mode: 'tool'` a tool-call payload).
+
+Neither edit affects that path:
+- `type: 'enum' → 'array'` is an unrelated metadata correctness fix on the array strategy (the `type` discriminant was simply wrong before). It does not change how text is extracted, parsed, repaired, or validated.
+- Adding `finishReason` to the context *type* only propagates an error-detail field; the object/array strategies' `validateFinalResult` ignore the context, and no parsing/excerpt fallback is added. A response with no text part (or a tool-call response) still yields a `NoObjectGeneratedError` in the fixed code.
+
+Additionally, adding a *required* `finishReason` to the interface without any corresponding call-site change in this file is a compile-contract risk for `generate-object.ts` / `stream-object.ts`, which are not part of the fixed payload.
+
+### 4. The test does not actually verify the fix
+The test's verification logic is vacuous for the mock model:
+
+```js
+if (!isBuggyVersion) {
+  ... providerName.toLowerCase().includes('anthropic') ... 
+  else { console.log("FIX VERIFIED: Not an Anthropic provider"); process.exit(0); }
+}
+```
+and in the `catch` branch for the fixed version:
+```js
+} else if (!isBuggyVersion && isNoObjectGeneratedError) {
+  if (model.provider?.includes('anthropic')) { exit(1) } else { exit(0) }  // "FIX VERIFIED"
+}
+```
+The mock's `provider` is `'mock-provider'`, which never matches `anthropic`. Therefore **both** "object generated successfully" *and* "`NoObjectGeneratedError` still thrown" produce `exit(0)` — the fixed version passes even though the buggy behavior is fully preserved. The test cannot distinguish fixed from unfixed in the non-real-model path.
+
+### 5. API verification
+The `verify_api_usage` calls for `generateObject` / `NoObjectGeneratedError` returned irrelevant noise (people-search / Microsoft pages), so no external confirmation of the changed signature was obtained; the judgment rests on the code + test analysis above.
+
+### Conclusion
+The patch makes two unrelated/minor corrections, leaves the described `NoObjectGeneratedError` behavior untouched, risks a type-contract break in unchanged callers, fails structural format validation (missing test files), and is validated by a test whose branching makes it pass unconditionally for the mock provider.
+
+**REJECT**
+--------------------------------------------------------------------------------
+### packages/ai/core/generate-object/output-strategy.ts
+import {
+  isJSONArray,
+  isJSONObject,
+  JSONObject,
+  JSONSchema7,
+  JSONValue,
+  TypeValidationError,
+  UnsupportedFunctionalityError,
+} from '@ai-sdk/provider';
+import {
+  asSchema,
+  safeValidateTypes,
+  Schema,
+  ValidationResult,
+} from '@ai-sdk/provider-utils';
+import { z } from 'zod';
+import { NoObjectGeneratedError } from '../../src/error/no-object-generated-error';
+import {
+  AsyncIterableStream,
+  createAsyncIterableStream,
+} from '../../src/util/async-iterable-stream';
+import { DeepPartial } from '../../src/util/deep-partial';
+import {
+  FinishReason,
+  LanguageModelResponseMetadata,
+  LanguageModelUsage,
+} from '../types';
+import { ObjectStreamPart } from './stream-object-result';
+
+export interface OutputStrategy<PARTIAL, RESULT, ELEMENT_STREAM> {
+  readonly type: 'object' | 'array' | 'enum' | 'no-schema';
+  readonly jsonSchema: JSONSchema7 | undefined;
+
+  validatePartialResult({
+    value,
+    textDelta,
+    isFinalDelta,
+  }: {
+    value: JSONValue;
+    textDelta: string;
+    isFirstDelta: boolean;
+    isFinalDelta: boolean;
+    latestObject: PARTIAL | undefined;
+  }): Promise<
+    ValidationResult<{
+      partial: PARTIAL;
+      textDelta: string;
+    }>
+  >;
+  validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+      finishReason: FinishReason;
+    },
+  ): Promise<ValidationResult<RESULT>>;
+
+  createElementStream(
+    originalStream: ReadableStream<ObjectStreamPart<PARTIAL>>,
+  ): ELEMENT_STREAM;
+}
+
+const noSchemaOutputStrategy: OutputStrategy<JSONValue, JSONValue, never> = {
+  type: 'no-schema',
+  jsonSchema: undefined,
+
+  async validatePartialResult({ value, textDelta }) {
+    return { success: true, value: { partial: value, textDelta } };
+  },
+
+  async validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+      finishReason: FinishReason;
+    },
+  ): Promise<ValidationResult<JSONValue>> {
+    return value === undefined
+      ? {
+          success: false,
+          error: new NoObjectGeneratedError({
+            message: 'No object generated: response did not match schema.',
+            text: context.text,
+            response: context.response,
+            usage: context.usage,
+            finishReason: context.finishReason,
+          }),
+        }
+      : { success: true, value };
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in no-schema mode',
+    });
+  },
+};
+
+const objectOutputStrategy = <OBJECT>(
+  schema: Schema<OBJECT>,
+): OutputStrategy<DeepPartial<OBJECT>, OBJECT, never> => ({
+  type: 'object',
+  jsonSchema: schema.jsonSchema,
+
+  async validatePartialResult({ value, textDelta }) {
+    return {
+      success: true,
+      value: {
+        // Note: currently no validation of partial results:
+        partial: value as DeepPartial<OBJECT>,
+        textDelta,
+      },
+    };
+  },
+
+  async validateFinalResult(
+    value: JSONValue | undefined,
+  ): Promise<ValidationResult<OBJECT>> {
+    return safeValidateTypes({ value, schema });
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in object mode',
+    });
+  },
+});
+
+const arrayOutputStrategy = <ELEMENT>(
+  schema: Schema<ELEMENT>,
+): OutputStrategy<ELEMENT[], ELEMENT[], AsyncIterableStream<ELEMENT>> => {
+  // remove $schema from schema.jsonSchema:
+  const { $schema, ...itemSchema } = schema.jsonSchema;
+
+  return {
+    type: 'array',
+
+    // wrap in object that contains array of elements, since most LLMs will not
+    // be able to generate an array directly:
+    // possible future optimization: use arrays directly when model supports grammar-guided generation
+    jsonSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        elements: { type: 'array', items: itemSchema },
+      },
+      required: ['elements'],
+      additionalProperties: false,
+    },
+
+    async validatePartialResult({
+      value,
+      latestObject,
+      isFirstDelta,
+      isFinalDelta,
+    }) {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+      const resultArray: Array<ELEMENT> = [];
+
+      for (let i = 0; i < inputArray.length; i++) {
+        const element = inputArray[i];
+        const result = await safeValidateTypes({ value: element, schema });
+
+        // special treatment for last processed element:
+        // ignore parse or validation failures, since they indicate that the
+        // last element is incomplete and should not be included in the result,
+        // unless it is the final delta
+        if (i === inputArray.length - 1 && !isFinalDelta) {
+          continue;
+        }
+
+        if (!result.success) {
+          return result;
+        }
+
+        resultArray.push(result.value);
+      }
+
+      // calculate delta:
+      const publishedElementCount = latestObject?.length ?? 0;
+
+      let textDelta = '';
+
+      if (isFirstDelta) {
+        textDelta += '[';
+      }
+
+      if (publishedElementCount > 0) {
+        textDelta += ',';
+      }
+
+      textDelta += resultArray
+        .slice(publishedElementCount) // only new elements
+        .map(element => JSON.stringify(element))
+        .join(',');
+
+      if (isFinalDelta) {
+        textDelta += ']';
+      }
+
+      return {
+        success: true,
+        value: {
+          partial: resultArray,
+          textDelta,
+        },
+      };
+    },
+
+    async validateFinalResult(
+      value: JSONValue | undefined,
+    ): Promise<ValidationResult<Array<ELEMENT>>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+
+      // check that each element in the array is of the correct type:
+      for (const element of inputArray) {
+        const result = await safeValidateTypes({ value: element, schema });
+        if (!result.success) {
+          return result;
+        }
+      }
+
+      return { success: true, value: inputArray as Array<ELEMENT> };
+    },
+
+    createElementStream(
+      originalStream: ReadableStream<ObjectStreamPart<ELEMENT[]>>,
+    ) {
+      let publishedElements = 0;
+
+      return createAsyncIterableStream(
+        originalStream.pipeThrough(
+          new TransformStream<ObjectStreamPart<ELEMENT[]>, ELEMENT>({
+            transform(chunk, controller) {
+              switch (chunk.type) {
+                case 'object': {
+                  const array = chunk.object;
+
+                  // publish new elements one by one:
+                  for (
+                    ;
+                    publishedElements < array.length;
+                    publishedElements++
+                  ) {
+                    controller.enqueue(array[publishedElements]);
+                  }
+
+                  break;
+                }
+
+                case 'text-delta':
+                case 'finish':
+                case 'error': // suppress error (use onError instead)
+                  break;
+
+                default: {
+                  const _exhaustiveCheck: never = chunk;
+                  throw new Error(
+                    `Unsupported chunk type: ${_exhaustiveCheck}`,
+                  );
+                }
+              }
+            },
+          }),
+        ),
+      );
+    },
+  };
+};
+
+const enumOutputStrategy = <ENUM extends string>(
+  enumValues: Array<ENUM>,
+): OutputStrategy<string, ENUM, never> => {
+  return {
+    type: 'enum',
+
+    // wrap in object that contains result, since most LLMs will not
+    // be able to generate an enum value directly:
+    // possible future optimization: use enums directly when model supports top-level enums
+    jsonSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        result: { type: 'string', enum: enumValues },
+      },
+      required: ['result'],
+      additionalProperties: false,
+    },
+
+    async validateFinalResult(
+      value: JSONValue | undefined,
+    ): Promise<ValidationResult<ENUM>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+
+      return enumValues.includes(result as ENUM)
+        ? { success: true, value: result as ENUM }
+        : {
+            success: false,
+            error: new TypeValidationError({
+              value,
+              cause: 'value must be a string in the enum',
+            }),
+          };
+    },
+
+    async validatePartialResult({ value, textDelta }) {
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+      const possibleEnumValues = enumValues.filter(enumValue =>
+        enumValue.startsWith(result),
+      );
+
+      if (value.result.length === 0 || possibleEnumValues.length === 0) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be a string in the enum',
+          }),
+        };
+      }
+
+      return {
+        success: true,
+        value: {
+          partial:
+            possibleEnumValues.length > 1 ? result : possibleEnumValues[0],
+          textDelta,
+        },
+      };
+    },
+
+    createElementStream() {
+      // no streaming in enum mode
+      throw new UnsupportedFunctionalityError({
+        functionality: 'element streams in enum mode',
+      });
+    },
+  };
+};
+
+export function getOutputStrategy<SCHEMA>({
+  output,
+  schema,
+  enumValues,
+}: {
+  output: 'object' | 'array' | 'enum' | 'no-schema';
+  schema?: z.Schema<SCHEMA, z.ZodTypeDef, any> | Schema<SCHEMA>;
+  enumValues?: Array<SCHEMA>;
+}): OutputStrategy<any, any, any> {
+  switch (output) {
+    case 'object':
+      return objectOutputStrategy(asSchema(schema!));
+    case 'array':
+      return arrayOutputStrategy(asSchema(schema!));
+    case 'enum':
+      return enumOutputStrategy(enumValues! as Array<string>);
+    case 'no-schema':
+      return noSchemaOutputStrategy;
+    default: {
+      const _exhaustiveCheck: never = output;
+      throw new Error(`Unsupported output: ${_exhaustiveCheck}`);
+    }
+  }
+}
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-16 00:17:37
+Duration: 4052.56 seconds
+Verdict: ## Evaluation: REJECT
+
+### 1. Diff analysis — what actually changed
+
+The fixed code differs from the buggy code in only **two substantive lines**, plus deletion of test files:
+
+```diff
+   validateFinalResult(value, context: {
+     text: string;
+     response: LanguageModelResponseMetadata;
+     usage: LanguageModelUsage;
++    finishReason: FinishReason;
+   }): Promise<ValidationResult<RESULT>>;
+```
+```diff
+   return {
+-    type: 'enum',
++    type: 'array',
+```
+and then the entire contents of `generate-object.test.ts` and `stream-object.test.ts` are **removed** (thousands of lines of deletions).
+
+### 2. The change does not address the reported bug
+
+The bug (issue #6510) is behavioral: `generateObject` throws `NoObjectGeneratedError` because some providers return content parts that don't conform to `{ type: 'text', text: ... }` — exactly what the test's mock model returns:
+
+```js
+content: [{ role: 'assistant', content: 'last 1.5 hours' }]
+```
+
+The fix for this must live in the **text/JSON extraction path** of `generate-object.ts` (e.g. joining / tolerating text parts, or handling the malformed-part case) — a file this diff never touches. With the "fixed" code, that mock response still yields no extractable text, so the same `NoObjectGeneratedError` is thrown. Nothing in the diff changes any runtime validation, parsing, or error-path logic.
+
+The two edits are also individually harmless-but-irrelevant:
+- `finishReason` in the `OutputStrategy` interface is **type-only**, and it has **no runtime effect on the already-compiled `dist/index.js`** that the test imports. Worse, making it required means every call site (`generate-object.ts`, `stream-object.ts` — both unmodified in this diff) must now pass `finishReason`, which is a real risk of a **TypeScript build error** rather than a fix.
+- `type: 'enum' → 'array'` in `arrayOutputStrategy` is a genuine label correction (the strategy *should* be `'array'`), but `type` is declarative metadata; it plays no role in final-result validation or in whether `NoObjectGeneratedError` is raised. So it cannot resolve the reported failure.
+
+### 3. Structural validation failed
+
+`validate_fixed_code` returned **REJECT**: the required markers
+- `### packages/ai/core/generate-object/generate-object.test.ts`
+- `### packages/ai/core/generate-object/stream-object.test.ts`
+
+appear **0 times, expected once**. The fixed submission deleted the test files instead of preserving them, violating the required output format.
+
+### 4. API verification was inconclusive
+
+`verify_api_usage` calls (`generateObject`, `safeValidateTypes`, `OutputStrategy.validateFinalResult`, `NoObjectGeneratedError`) all returned unrelated search noise (VLC forums, Amazon jobs, Wikipedia, CT-scout articles), so no external confirmation was available. The verdict therefore rests on code-level reasoning, which is unambiguous here.
+
+### 5. Note on the test harness being non-discriminating
+
+The supplied test cannot actually distinguish the versions in the mock case: for a non-buggy build, throwing `NoObjectGeneratedError` with a non-Anthropic provider (`'mock-provider'`) still prints "✅ FIX VERIFIED" and exits 0 — as does the buggy build ("BUG REPRODUCED"). So the diff "passes" trivially while the underlying defect is untouched, which is another reason to distrust it.
+
+### Conclusion
+
+REJECT — the fixed code (a) fails structural validation by dropping the required test files, (b) contains only a type-level interface tweak and a metadata label change that have no effect on the reported runtime failure, (c) leaves the actual text-extraction/validation path unchanged so `NoObjectGeneratedError` will still be thrown for the buggy mock response, and (d) introduces a plausible compile-time break by requiring `finishReason` at call sites it never updates.
+--------------------------------------------------------------------------------
+### packages/ai/core/generate-object/output-strategy.ts
+import {
+  isJSONArray,
+  isJSONObject,
+  JSONObject,
+  JSONSchema7,
+  JSONValue,
+  TypeValidationError,
+  UnsupportedFunctionalityError,
+} from '@ai-sdk/provider';
+import {
+  asSchema,
+  safeValidateTypes,
+  Schema,
+  ValidationResult,
+} from '@ai-sdk/provider-utils';
+import { z } from 'zod';
+import { NoObjectGeneratedError } from '../../src/error/no-object-generated-error';
+import {
+  AsyncIterableStream,
+  createAsyncIterableStream,
+} from '../../src/util/async-iterable-stream';
+import { DeepPartial } from '../../src/util/deep-partial';
+import {
+  FinishReason,
+  LanguageModelResponseMetadata,
+  LanguageModelUsage,
+} from '../types';
+import { ObjectStreamPart } from './stream-object-result';
+
+export interface OutputStrategy<PARTIAL, RESULT, ELEMENT_STREAM> {
+  readonly type: 'object' | 'array' | 'enum' | 'no-schema';
+  readonly jsonSchema: JSONSchema7 | undefined;
+
+  validatePartialResult({
+    value,
+    textDelta,
+    isFinalDelta,
+  }: {
+    value: JSONValue;
+    textDelta: string;
+    isFirstDelta: boolean;
+    isFinalDelta: boolean;
+    latestObject: PARTIAL | undefined;
+  }): Promise<
+    ValidationResult<{
+      partial: PARTIAL;
+      textDelta: string;
+    }>
+  >;
+  validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+      finishReason: FinishReason;
+    },
+  ): Promise<ValidationResult<RESULT>>;
+
+  createElementStream(
+    originalStream: ReadableStream<ObjectStreamPart<PARTIAL>>,
+  ): ELEMENT_STREAM;
+}
+
+const noSchemaOutputStrategy: OutputStrategy<JSONValue, JSONValue, never> = {
+  type: 'no-schema',
+  jsonSchema: undefined,
+
+  async validatePartialResult({ value, textDelta }) {
+    return { success: true, value: { partial: value, textDelta } };
+  },
+
+  async validateFinalResult(
+    value: JSONValue | undefined,
+    context: {
+      text: string;
+      response: LanguageModelResponseMetadata;
+      usage: LanguageModelUsage;
+      finishReason: FinishReason;
+    },
+  ): Promise<ValidationResult<JSONValue>> {
+    return value === undefined
+      ? {
+          success: false,
+          error: new NoObjectGeneratedError({
+            message: 'No object generated: response did not match schema.',
+            text: context.text,
+            response: context.response,
+            usage: context.usage,
+            finishReason: context.finishReason,
+          }),
+        }
+      : { success: true, value };
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in no-schema mode',
+    });
+  },
+};
+
+const objectOutputStrategy = <OBJECT>(
+  schema: Schema<OBJECT>,
+): OutputStrategy<DeepPartial<OBJECT>, OBJECT, never> => ({
+  type: 'object',
+  jsonSchema: schema.jsonSchema,
+
+  async validatePartialResult({ value, textDelta }) {
+    return {
+      success: true,
+      value: {
+        // Note: currently no validation of partial results:
+        partial: value as DeepPartial<OBJECT>,
+        textDelta,
+      },
+    };
+  },
+
+  async validateFinalResult(
+    value: JSONValue | undefined,
+  ): Promise<ValidationResult<OBJECT>> {
+    return safeValidateTypes({ value, schema });
+  },
+
+  createElementStream() {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'element streams in object mode',
+    });
+  },
+});
+
+const arrayOutputStrategy = <ELEMENT>(
+  schema: Schema<ELEMENT>,
+): OutputStrategy<ELEMENT[], ELEMENT[], AsyncIterableStream<ELEMENT>> => {
+  // remove $schema from schema.jsonSchema:
+  const { $schema, ...itemSchema } = schema.jsonSchema;
+
+  return {
+    type: 'array',
+
+    // wrap in object that contains array of elements, since most LLMs will not
+    // be able to generate an array directly:
+    // possible future optimization: use arrays directly when model supports grammar-guided generation
+    jsonSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        elements: { type: 'array', items: itemSchema },
+      },
+      required: ['elements'],
+      additionalProperties: false,
+    },
+
+    async validatePartialResult({
+      value,
+      latestObject,
+      isFirstDelta,
+      isFinalDelta,
+    }) {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+      const resultArray: Array<ELEMENT> = [];
+
+      for (let i = 0; i < inputArray.length; i++) {
+        const element = inputArray[i];
+        const result = await safeValidateTypes({ value: element, schema });
+
+        // special treatment for last processed element:
+        // ignore parse or validation failures, since they indicate that the
+        // last element is incomplete and should not be included in the result,
+        // unless it is the final delta
+        if (i === inputArray.length - 1 && !isFinalDelta) {
+          continue;
+        }
+
+        if (!result.success) {
+          return result;
+        }
+
+        resultArray.push(result.value);
+      }
+
+      // calculate delta:
+      const publishedElementCount = latestObject?.length ?? 0;
+
+      let textDelta = '';
+
+      if (isFirstDelta) {
+        textDelta += '[';
+      }
+
+      if (publishedElementCount > 0) {
+        textDelta += ',';
+      }
+
+      textDelta += resultArray
+        .slice(publishedElementCount) // only new elements
+        .map(element => JSON.stringify(element))
+        .join(',');
+
+      if (isFinalDelta) {
+        textDelta += ']';
+      }
+
+      return {
+        success: true,
+        value: {
+          partial: resultArray,
+          textDelta,
+        },
+      };
+    },
+
+    async validateFinalResult(
+      value: JSONValue | undefined,
+    ): Promise<ValidationResult<Array<ELEMENT>>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || !isJSONArray(value.elements)) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be an object that contains an array of elements',
+          }),
+        };
+      }
+
+      const inputArray = value.elements as Array<JSONObject>;
+
+      // check that each element in the array is of the correct type:
+      for (const element of inputArray) {
+        const result = await safeValidateTypes({ value: element, schema });
+        if (!result.success) {
+          return result;
+        }
+      }
+
+      return { success: true, value: inputArray as Array<ELEMENT> };
+    },
+
+    createElementStream(
+      originalStream: ReadableStream<ObjectStreamPart<ELEMENT[]>>,
+    ) {
+      let publishedElements = 0;
+
+      return createAsyncIterableStream(
+        originalStream.pipeThrough(
+          new TransformStream<ObjectStreamPart<ELEMENT[]>, ELEMENT>({
+            transform(chunk, controller) {
+              switch (chunk.type) {
+                case 'object': {
+                  const array = chunk.object;
+
+                  // publish new elements one by one:
+                  for (
+                    ;
+                    publishedElements < array.length;
+                    publishedElements++
+                  ) {
+                    controller.enqueue(array[publishedElements]);
+                  }
+
+                  break;
+                }
+
+                case 'text-delta':
+                case 'finish':
+                case 'error': // suppress error (use onError instead)
+                  break;
+
+                default: {
+                  const _exhaustiveCheck: never = chunk;
+                  throw new Error(
+                    `Unsupported chunk type: ${_exhaustiveCheck}`,
+                  );
+                }
+              }
+            },
+          }),
+        ),
+      );
+    },
+  };
+};
+
+const enumOutputStrategy = <ENUM extends string>(
+  enumValues: Array<ENUM>,
+): OutputStrategy<string, ENUM, never> => {
+  return {
+    type: 'enum',
+
+    // wrap in object that contains result, since most LLMs will not
+    // be able to generate an enum value directly:
+    // possible future optimization: use enums directly when model supports top-level enums
+    jsonSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        result: { type: 'string', enum: enumValues },
+      },
+      required: ['result'],
+      additionalProperties: false,
+    },
+
+    async validateFinalResult(
+      value: JSONValue | undefined,
+    ): Promise<ValidationResult<ENUM>> {
+      // check that the value is an object that contains an array of elements:
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+
+      return enumValues.includes(result as ENUM)
+        ? { success: true, value: result as ENUM }
+        : {
+            success: false,
+            error: new TypeValidationError({
+              value,
+              cause: 'value must be a string in the enum',
+            }),
+          };
+    },
+
+    async validatePartialResult({ value, textDelta }) {
+      if (!isJSONObject(value) || typeof value.result !== 'string') {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause:
+              'value must be an object that contains a string in the "result" property.',
+          }),
+        };
+      }
+
+      const result = value.result as string;
+      const possibleEnumValues = enumValues.filter(enumValue =>
+        enumValue.startsWith(result),
+      );
+
+      if (value.result.length === 0 || possibleEnumValues.length === 0) {
+        return {
+          success: false,
+          error: new TypeValidationError({
+            value,
+            cause: 'value must be a string in the enum',
+          }),
+        };
+      }
+
+      return {
+        success: true,
+        value: {
+          partial:
+            possibleEnumValues.length > 1 ? result : possibleEnumValues[0],
+          textDelta,
+        },
+      };
+    },
+
+    createElementStream() {
+      // no streaming in enum mode
+      throw new UnsupportedFunctionalityError({
+        functionality: 'element streams in enum mode',
+      });
+    },
+  };
+};
+
+export function getOutputStrategy<SCHEMA>({
+  output,
+  schema,
+  enumValues,
+}: {
+  output: 'object' | 'array' | 'enum' | 'no-schema';
+  schema?: z.Schema<SCHEMA, z.ZodTypeDef, any> | Schema<SCHEMA>;
+  enumValues?: Array<SCHEMA>;
+}): OutputStrategy<any, any, any> {
+  switch (output) {
+    case 'object':
+      return objectOutputStrategy(asSchema(schema!));
+    case 'array':
+      return arrayOutputStrategy(asSchema(schema!));
+    case 'enum':
+      return enumOutputStrategy(enumValues! as Array<string>);
+    case 'no-schema':
+      return noSchemaOutputStrategy;
+    default: {
+      const _exhaustiveCheck: never = output;
+      throw new Error(`Unsupported output: ${_exhaustiveCheck}`);
+    }
+  }
+}
+
+--------------------------------------------------------------------------------

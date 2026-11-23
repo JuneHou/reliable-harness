@@ -1,0 +1,402 @@
+Case ID: 78235199
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 18:47:47
+End Time: 2026-11-04 18:54:29
+Total Duration: 402.49 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import json
+import os
+
+
+class OpenAIFineTuningHandler:
+    """Callback handler that records all LLM inputs/outputs in a format
+    suitable for fine-tuning with OpenAI.
+
+    The handler *accumulates* events while queries are being executed (via
+    on_event_end). Without this collection, save_finetuning_events() has
+    nothing to write and would always report "Wrote 0 examples".
+    """
+
+    def __init__(self):
+        # Collected (question, messages) pairs, filled in as queries run.
+        self.finetuning_events = []
+        self._cur_query = None
+
+    def start_trace(self, trace_id=None):
+        """Start trace - reset the current query."""
+        self._cur_query = None
+
+    def end_trace(self, trace_id=None, trace_map=None):
+        """End trace - reset the current query."""
+        self._cur_query = None
+
+    def on_event_end(self, event_type, payload=None, event_id="", **kwargs):
+        """Store events so they can later be written to the JSONL file."""
+        if payload is None:
+            return
+
+        # A new query started: remember the query string and start a new event.
+        if event_type == "query" and payload.get("query_str") is not None:
+            self._cur_query = payload.get("query_str")
+            self.finetuning_events.append(
+                {
+                    "query": self._cur_query,
+                    "messages": [
+                        {"role": "user", "content": self._cur_query},
+                    ],
+                }
+            )
+        # An LLM response finished: attach it to the current event.
+        elif event_type == "llm" and payload.get("response") is not None:
+            if self.finetuning_events:
+                self.finetuning_events[-1]["messages"].append(
+                    {"role": "assistant", "content": str(payload.get("response"))}
+                )
+
+    def get_finetuning_events(self):
+        """Return the events collected so far."""
+        return self.finetuning_events
+
+    def save_finetuning_events(self, path):
+        """Save the collected events to a JSONL file in OpenAI fine-tuning format."""
+        with open(path, "w", encoding="utf-8") as f:
+            for event in self.finetuning_events:
+                f.write(json.dumps({"messages": event["messages"]}) + "\n")
+        print(f"Wrote {len(self.finetuning_events)} examples to {path}")
+
+
+class CallbackManager:
+    """Broadcasts callback events to all registered handlers."""
+
+    def __init__(self, handlers=None):
+        self.handlers = list(handlers) if handlers else []
+
+    def add_handler(self, handler):
+        if handler not in self.handlers:
+            self.handlers.append(handler)
+
+    def on_event_end(self, event_type, payload=None):
+        """Forward the event to every handler (e.g. OpenAIFineTuningHandler)."""
+        for handler in self.handlers:
+            on_event_end = getattr(handler, "on_event_end", None)
+            if callable(on_event_end):
+                on_event_end(event_type, payload=payload)
+
+
+class MockLLM:
+    """Minimal stand-in for an LLM whose callback manager dispatches events."""
+
+    def __init__(self, callback_manager=None):
+        self.callback_manager = callback_manager
+
+    def complete(self, prompt):
+        # Generate the response, then dispatch the LLM end event so the
+        # fine-tuning handler records the output.
+        response = f"Answer to: {prompt}"
+        if self.callback_manager is not None:
+            self.callback_manager.on_event_end("llm", payload={"response": response})
+        return response
+
+
+class VectorStoreIndex:
+    def __init__(self, documents=None):
+        self.documents = documents or []
+        self._llm = None
+        self._similarity_top_k = None
+
+    @staticmethod
+    def from_documents(docs):
+        return VectorStoreIndex(docs)
+
+    def as_query_engine(self, similarity_top_k, llm):
+        # Keep a reference to the LLM so that its callback manager (which holds
+        # the finetuning handler) actually receives events during queries.
+        self._similarity_top_k = similarity_top_k
+        self._llm = llm
+        return self
+
+    def query(self, question):
+        callback_manager = getattr(self._llm, "callback_manager", None)
+
+        # Notify the handlers that a query started (this records the input).
+        if callback_manager is not None:
+            callback_manager.on_event_end("query", payload={"query_str": question})
+
+        # Run the query through the LLM (dispatches the LLM end event).
+        response = None
+        if self._llm is not None:
+            response = self._llm.complete(question)
+
+        return response
+
+
+class FineTuningExample:
+
+    def __init__(self, dataset_path, documents):
+        self.dataset_path = dataset_path
+        self.documents = documents
+        self.llm = None
+
+    def jsonl_generation(self):
+        """Generate JSONL file for fine-tuning events."""
+        os.makedirs(self.dataset_path, exist_ok=True)
+
+        finetuning_handler = OpenAIFineTuningHandler()
+        callback_manager = CallbackManager([finetuning_handler])
+        self.llm = MockLLM(callback_manager=callback_manager)
+
+        questions = []
+        with open(f'{self.dataset_path}/train_questions.txt', "r", encoding='utf-8') as f:
+            for line in f:
+                question = line.strip()
+                if question:
+                    questions.append(question)
+
+        try:
+            index = VectorStoreIndex.from_documents(self.documents)
+            query_engine = index.as_query_engine(similarity_top_k=2, llm=self.llm)
+            for question in questions:
+                response = query_engine.query(question)
+        except Exception as e:
+            print(f"An error occurred: {e}")
+        finally:
+            finetuning_handler.save_finetuning_events(
+                f'{self.dataset_path}/finetuning_events.jsonl'
+            )
+
+
+def prepare_test_data(questions_path):
+    os.makedirs(os.path.dirname(questions_path), exist_ok=True)
+    with open(questions_path, "w", encoding="utf-8") as f:
+        f.write("Question 1\nQuestion 2\n")
+
+
+def run_agent(questions_path):
+    dataset_path = os.path.dirname(questions_path)
+    ft = FineTuningExample(dataset_path=dataset_path, documents=[])
+    ft.jsonl_generation()
+
+
+if __name__ == "__main__":
+    questions_path = "./dataset_data/train_questions.txt"
+    prepare_test_data(questions_path)
+    run_agent(questions_path)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 18:54:29
+Duration: 402.49 seconds
+Verdict: ## Analysis
+
+**Root cause of the bug:** `OpenAIFineTuningHandler.save_finetuning_events()` unconditionally wrote an empty string to the file and printed "Wrote 0 examples". The handler never collected any events, so the output JSONL file always had zero lines, failing the test's `assertGreater(len(lines), 0)`.
+
+**What the fix does:**
+
+1. **`OpenAIFineTuningHandler`** now actually accumulates events:
+   - `on_event_end("query", ...)` records each query string as a `{"role": "user"}` message.
+   - `on_event_end("llm", ...)` attaches the LLM response as a `{"role": "assistant"}` message to the current event.
+   - `save_finetuning_events()` writes each collected event as a JSON line via `json.dumps({"messages": [...]})` and reports the true count.
+
+2. **`CallbackManager`** now broadcasts `on_event_end` events to its registered handlers (the buggy version stored handlers but never dispatched anything).
+
+3. **`MockLLM`** replaces the bare `type("LLM", (), {...})` stub with a real object whose `complete()` dispatches the "llm" end event through the callback manager.
+
+4. **`VectorStoreIndex.query()`** keeps a reference to the LLM (set in `as_query_engine`), dispatches the "query" event (recording the input), and calls `llm.complete()` to produce the response.
+
+**Trace through the test:** `prepare_test_data` writes 2 questions → `jsonl_generation` reads them → each `query()` emits a "query" event and an "llm" event → handler accumulates 2 events → `finally` block writes 2 JSON lines to `finetuning_events.jsonl` → test assertions (file exists, `len(lines) > 0`) pass. Blank lines in the questions file are also now filtered, a defensive improvement.
+
+**Verification results:**
+- `validate_fixed_code` → **ACCEPT**: fixed code matches expected structure and output format.
+- `verify_api_usage("json.dumps")` → Confirmed correct: `json.dumps()` serializes a Python dict to a JSON string, exactly how it's used here (`json.dumps({"messages": event["messages"]}) + "\n"`), producing valid JSONL (one JSON object per line).
+
+No issues found: the event flow is properly wired end-to-end, the output format matches OpenAI fine-tuning conventions, the write happens in `finally` (guaranteeing the file is produced even on error), and all test-visible behavior is satisfied.
+
+**ACCEPT**
+--------------------------------------------------------------------------------
+import json
+import os
+
+
+class OpenAIFineTuningHandler:
+    """Callback handler that records all LLM inputs/outputs in a format
+    suitable for fine-tuning with OpenAI.
+
+    The handler *accumulates* events while queries are being executed (via
+    on_event_end). Without this collection, save_finetuning_events() has
+    nothing to write and would always report "Wrote 0 examples".
+    """
+
+    def __init__(self):
+        # Collected (question, messages) pairs, filled in as queries run.
+        self.finetuning_events = []
+        self._cur_query = None
+
+    def start_trace(self, trace_id=None):
+        """Start trace - reset the current query."""
+        self._cur_query = None
+
+    def end_trace(self, trace_id=None, trace_map=None):
+        """End trace - reset the current query."""
+        self._cur_query = None
+
+    def on_event_end(self, event_type, payload=None, event_id="", **kwargs):
+        """Store events so they can later be written to the JSONL file."""
+        if payload is None:
+            return
+
+        # A new query started: remember the query string and start a new event.
+        if event_type == "query" and payload.get("query_str") is not None:
+            self._cur_query = payload.get("query_str")
+            self.finetuning_events.append(
+                {
+                    "query": self._cur_query,
+                    "messages": [
+                        {"role": "user", "content": self._cur_query},
+                    ],
+                }
+            )
+        # An LLM response finished: attach it to the current event.
+        elif event_type == "llm" and payload.get("response") is not None:
+            if self.finetuning_events:
+                self.finetuning_events[-1]["messages"].append(
+                    {"role": "assistant", "content": str(payload.get("response"))}
+                )
+
+    def get_finetuning_events(self):
+        """Return the events collected so far."""
+        return self.finetuning_events
+
+    def save_finetuning_events(self, path):
+        """Save the collected events to a JSONL file in OpenAI fine-tuning format."""
+        with open(path, "w", encoding="utf-8") as f:
+            for event in self.finetuning_events:
+                f.write(json.dumps({"messages": event["messages"]}) + "\n")
+        print(f"Wrote {len(self.finetuning_events)} examples to {path}")
+
+
+class CallbackManager:
+    """Broadcasts callback events to all registered handlers."""
+
+    def __init__(self, handlers=None):
+        self.handlers = list(handlers) if handlers else []
+
+    def add_handler(self, handler):
+        if handler not in self.handlers:
+            self.handlers.append(handler)
+
+    def on_event_end(self, event_type, payload=None):
+        """Forward the event to every handler (e.g. OpenAIFineTuningHandler)."""
+        for handler in self.handlers:
+            on_event_end = getattr(handler, "on_event_end", None)
+            if callable(on_event_end):
+                on_event_end(event_type, payload=payload)
+
+
+class MockLLM:
+    """Minimal stand-in for an LLM whose callback manager dispatches events."""
+
+    def __init__(self, callback_manager=None):
+        self.callback_manager = callback_manager
+
+    def complete(self, prompt):
+        # Generate the response, then dispatch the LLM end event so the
+        # fine-tuning handler records the output.
+        response = f"Answer to: {prompt}"
+        if self.callback_manager is not None:
+            self.callback_manager.on_event_end("llm", payload={"response": response})
+        return response
+
+
+class VectorStoreIndex:
+    def __init__(self, documents=None):
+        self.documents = documents or []
+        self._llm = None
+        self._similarity_top_k = None
+
+    @staticmethod
+    def from_documents(docs):
+        return VectorStoreIndex(docs)
+
+    def as_query_engine(self, similarity_top_k, llm):
+        # Keep a reference to the LLM so that its callback manager (which holds
+        # the finetuning handler) actually receives events during queries.
+        self._similarity_top_k = similarity_top_k
+        self._llm = llm
+        return self
+
+    def query(self, question):
+        callback_manager = getattr(self._llm, "callback_manager", None)
+
+        # Notify the handlers that a query started (this records the input).
+        if callback_manager is not None:
+            callback_manager.on_event_end("query", payload={"query_str": question})
+
+        # Run the query through the LLM (dispatches the LLM end event).
+        response = None
+        if self._llm is not None:
+            response = self._llm.complete(question)
+
+        return response
+
+
+class FineTuningExample:
+
+    def __init__(self, dataset_path, documents):
+        self.dataset_path = dataset_path
+        self.documents = documents
+        self.llm = None
+
+    def jsonl_generation(self):
+        """Generate JSONL file for fine-tuning events."""
+        os.makedirs(self.dataset_path, exist_ok=True)
+
+        finetuning_handler = OpenAIFineTuningHandler()
+        callback_manager = CallbackManager([finetuning_handler])
+        self.llm = MockLLM(callback_manager=callback_manager)
+
+        questions = []
+        with open(f'{self.dataset_path}/train_questions.txt', "r", encoding='utf-8') as f:
+            for line in f:
+                question = line.strip()
+                if question:
+                    questions.append(question)
+
+        try:
+            index = VectorStoreIndex.from_documents(self.documents)
+            query_engine = index.as_query_engine(similarity_top_k=2, llm=self.llm)
+            for question in questions:
+                response = query_engine.query(question)
+        except Exception as e:
+            print(f"An error occurred: {e}")
+        finally:
+            finetuning_handler.save_finetuning_events(
+                f'{self.dataset_path}/finetuning_events.jsonl'
+            )
+
+
+def prepare_test_data(questions_path):
+    os.makedirs(os.path.dirname(questions_path), exist_ok=True)
+    with open(questions_path, "w", encoding="utf-8") as f:
+        f.write("Question 1\nQuestion 2\n")
+
+
+def run_agent(questions_path):
+    dataset_path = os.path.dirname(questions_path)
+    ft = FineTuningExample(dataset_path=dataset_path, documents=[])
+    ft.jsonl_generation()
+
+
+if __name__ == "__main__":
+    questions_path = "./dataset_data/train_questions.txt"
+    prepare_test_data(questions_path)
+    run_agent(questions_path)
+
+--------------------------------------------------------------------------------

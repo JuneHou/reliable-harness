@@ -1,0 +1,1634 @@
+Case ID: crewai_1463
+Status: FAILED
+Final Attempt: 3
+Start Time: 2026-11-14 05:32:48
+End Time: 2026-11-14 09:58:36
+Total Duration: 15948.24 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+# flow.py
+
+import asyncio
+import inspect
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
+
+from pydantic import BaseModel
+
+from crewai.flow.flow_visualizer import plot_flow
+from crewai.flow.utils import get_possible_return_constants
+from crewai.telemetry import Telemetry
+
+T = TypeVar("T", bound=Union[BaseModel, Dict[str, Any]])
+
+
+def _resolve_condition(condition: Any) -> Tuple[str, List[str]]:
+    """Normalize a decorator condition into a (condition_type, methods) tuple."""
+    if isinstance(condition, str):
+        return "OR", [condition]
+
+    if isinstance(condition, dict) and "type" in condition and "methods" in condition:
+        return condition["type"], list(condition["methods"])
+
+    if callable(condition) and hasattr(condition, "__name__"):
+        return "OR", [condition.__name__]
+
+    raise ValueError(
+        "Condition must be a method, string, or a result of or_() or and_()"
+    )
+
+
+def _collect_method_names(conditions: Tuple[Any, ...], function_name: str) -> List[str]:
+    """Collect the method names referenced by the arguments of or_() / and_()."""
+    methods: List[str] = []
+    for condition in conditions:
+        if isinstance(condition, dict) and "methods" in condition:
+            methods.extend(condition["methods"])
+        elif isinstance(condition, str):
+            methods.append(condition)
+        elif callable(condition):
+            methods.append(getattr(condition, "__name__", repr(condition)))
+        else:
+            raise ValueError(f"Invalid condition in {function_name}()")
+    return methods
+
+
+def start(condition=None):
+    def decorator(func):
+        func.__is_start_method__ = True
+        if condition is not None:
+            condition_type, methods = _resolve_condition(condition)
+            func.__trigger_methods__ = methods
+            func.__condition_type__ = condition_type
+        return func
+
+    return decorator
+
+
+def listen(condition):
+    def decorator(func):
+        condition_type, methods = _resolve_condition(condition)
+        func.__trigger_methods__ = methods
+        func.__condition_type__ = condition_type
+        return func
+
+    return decorator
+
+
+def router(method):
+    def decorator(func):
+        func.__is_router__ = True
+        func.__router_for__ = (
+            method.__name__ if hasattr(method, "__name__") else method
+        )
+        return func
+
+    return decorator
+
+
+def or_(*conditions):
+    return {"type": "OR", "methods": _collect_method_names(conditions, "or_")}
+
+
+def and_(*conditions):
+    return {"type": "AND", "methods": _collect_method_names(conditions, "and_")}
+
+
+class FlowMeta(type):
+    def __new__(mcs, name, bases, dct):
+        cls = super().__new__(mcs, name, bases, dct)
+
+        start_methods = []
+        listeners = {}
+        routers = {}
+        router_paths = {}
+
+        for attr_name, attr_value in dct.items():
+            if hasattr(attr_value, "__is_start_method__"):
+                start_methods.append(attr_name)
+                if hasattr(attr_value, "__trigger_methods__"):
+                    methods = attr_value.__trigger_methods__
+                    condition_type = getattr(attr_value, "__condition_type__", "OR")
+                    listeners[attr_name] = (condition_type, methods)
+            elif hasattr(attr_value, "__trigger_methods__"):
+                methods = attr_value.__trigger_methods__
+                condition_type = getattr(attr_value, "__condition_type__", "OR")
+                listeners[attr_name] = (condition_type, methods)
+            elif hasattr(attr_value, "__is_router__"):
+                routers[attr_value.__router_for__] = attr_name
+                possible_returns = get_possible_return_constants(attr_value)
+                if possible_returns:
+                    router_paths[attr_name] = possible_returns
+
+                # Register the router as a listener of the method it routes so
+                # the flow graph (and the visualizer) stays consistent. Routers
+                # are never executed as plain listeners though, they are always
+                # resolved by Flow._execute_listeners.
+                trigger_method_name = attr_value.__router_for__
+                listeners[attr_name] = ("OR", [trigger_method_name])
+
+        setattr(cls, "_start_methods", start_methods)
+        setattr(cls, "_listeners", listeners)
+        setattr(cls, "_routers", routers)
+        setattr(cls, "_router_paths", router_paths)
+
+        return cls
+
+
+class Flow(Generic[T], metaclass=FlowMeta):
+    _telemetry = Telemetry()
+
+    _start_methods: List[str] = []
+    _listeners: Dict[str, tuple[str, List[str]]] = {}
+    _routers: Dict[str, str] = {}
+    _router_paths: Dict[str, List[str]] = {}
+    initial_state: Union[Type[T], T, None] = None
+
+    def __class_getitem__(cls: Type["Flow"], item: Type[T]) -> Type["Flow"]:
+        class _FlowGeneric(cls):  # type: ignore
+            _initial_state_T = item  # type: ignore
+
+        _FlowGeneric.__name__ = f"{cls.__name__}[{item.__name__}]"
+        return _FlowGeneric
+
+    def __init__(self) -> None:
+        self._methods: Dict[str, Callable] = {}
+        self._state: T = self._create_initial_state()
+        self._executed_methods: Set[str] = set()
+        self._scheduled_tasks: Set[str] = set()
+        # Conditions (methods or router paths) already triggered per AND listener
+        self._pending_and_listeners: Dict[str, Set[str]] = {}
+        self._method_outputs: List[Any] = []  # List to store all method outputs
+
+        self._telemetry.flow_creation_span(self.__class__.__name__)
+
+        for method_name in dir(self):
+            if callable(getattr(self, method_name)) and not method_name.startswith(
+                "__"
+            ):
+                self._methods[method_name] = getattr(self, method_name)
+
+    def _create_initial_state(self) -> T:
+        if self.initial_state is None and hasattr(self, "_initial_state_T"):
+            return self._initial_state_T()  # type: ignore
+        if self.initial_state is None:
+            return {}  # type: ignore
+        elif isinstance(self.initial_state, type):
+            return self.initial_state()
+        else:
+            return self.initial_state
+
+    @property
+    def state(self) -> T:
+        return self._state
+
+    @property
+    def method_outputs(self) -> List[Any]:
+        """Returns the list of all outputs from executed methods."""
+        return self._method_outputs
+
+    def kickoff(self) -> Any:
+        return asyncio.run(self.kickoff_async())
+
+    async def kickoff_async(self) -> Any:
+        if not self._start_methods:
+            raise ValueError("No start method defined")
+
+        self._telemetry.flow_execution_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        # Create tasks for all start methods
+        tasks = [
+            self._execute_start_method(start_method)
+            for start_method in self._start_methods
+        ]
+
+        # Run all start methods concurrently
+        await asyncio.gather(*tasks)
+
+        # An AND condition might only be satisfied once every start method and
+        # its listeners finished executing, so make sure any listener that is
+        # ready but was never triggered gets executed before returning.
+        await self._execute_pending_and_listeners()
+
+        # Return the final output (from the last executed method)
+        if self._method_outputs:
+            return self._method_outputs[-1]
+        else:
+            return None  # Or raise an exception if no methods were executed
+
+    async def _execute_start_method(self, start_method_name: str) -> None:
+        result = await self._execute_method(
+            start_method_name, self._methods[start_method_name]
+        )
+        await self._execute_listeners(start_method_name, result)
+
+    async def _execute_method(
+        self, method_name: str, method: Callable, *args: Any, **kwargs: Any
+    ) -> Any:
+        if asyncio.iscoroutinefunction(method):
+            result = await method(*args, **kwargs)
+        else:
+            result = method(*args, **kwargs)
+            # Support callables that return an awaitable without being
+            # coroutine functions themselves.
+            if inspect.isawaitable(result):
+                result = await result
+
+        self._method_outputs.append(result)  # Store the output
+
+        self._executed_methods.add(method_name)
+
+        return result
+
+    def _is_listener_done(self, listener_name: str) -> bool:
+        """Whether a listener already executed or is already scheduled."""
+        return (
+            listener_name in self._executed_methods
+            or listener_name in self._scheduled_tasks
+        )
+
+    def _is_and_condition_met(self, listener_name: str, methods: List[str]) -> bool:
+        """Check whether every method of an AND condition has been triggered.
+
+        A condition can be a regular method (tracked in ``_executed_methods``)
+        or a router path, which is just a string returned by a router and thus
+        only tracked in ``_pending_and_listeners``.
+        """
+        if not methods:
+            return False
+
+        triggered_conditions = self._pending_and_listeners.get(listener_name, set())
+        return all(
+            method in self._executed_methods or method in triggered_conditions
+            for method in methods
+        )
+
+    async def _execute_listeners(self, trigger_method: str, result: Any) -> None:
+        """Execute all listeners that depend on the provided method."""
+        # If the trigger method has a router, execute it and use the returned
+        # path as the new trigger method.
+        if trigger_method in self._routers:
+            router_method_name = self._routers[trigger_method]
+            router_method = self._methods[router_method_name]
+            path = await self._execute_method(router_method_name, router_method)
+
+            # Use the path as the new trigger method
+            if isinstance(path, str):
+                trigger_method = path
+
+        router_methods = set(self._routers.values())
+        listener_tasks = []
+
+        for listener_name, (condition_type, methods) in self._listeners.items():
+            # Routers are resolved above and never run as regular listeners
+            if listener_name in router_methods:
+                continue
+
+            # A listener must never run twice
+            if self._is_listener_done(listener_name):
+                continue
+
+            if condition_type == "AND":
+                # Keep track of every condition triggered so far for this
+                # listener, so the AND condition can be evaluated no matter the
+                # order in which the triggering methods were executed.
+                pending_conditions = self._pending_and_listeners.setdefault(
+                    listener_name, set()
+                )
+                if trigger_method in methods:
+                    pending_conditions.add(trigger_method)
+
+                if not self._is_and_condition_met(listener_name, methods):
+                    continue
+            else:
+                if trigger_method not in methods:
+                    continue
+
+            self._scheduled_tasks.add(listener_name)
+            listener_tasks.append(
+                self._execute_single_listener(listener_name, result)
+            )
+
+        # Run all listener tasks concurrently and wait for them to complete
+        await asyncio.gather(*listener_tasks)
+
+    async def _execute_pending_and_listeners(self) -> None:
+        """Execute AND listeners whose conditions are met but never triggered."""
+        while True:
+            ready_listeners = [
+                listener_name
+                for listener_name, (condition_type, methods) in self._listeners.items()
+                if condition_type == "AND"
+                and listener_name not in set(self._routers.values())
+                and not self._is_listener_done(listener_name)
+                and self._is_and_condition_met(listener_name, methods)
+            ]
+
+            if not ready_listeners:
+                return
+
+            last_result = self._method_outputs[-1] if self._method_outputs else None
+            listener_tasks = []
+
+            for listener_name in ready_listeners:
+                if self._is_listener_done(listener_name):
+                    continue
+
+                self._scheduled_tasks.add(listener_name)
+                listener_tasks.append(
+                    self._execute_single_listener(listener_name, last_result)
+                )
+
+            if not listener_tasks:
+                return
+
+            await asyncio.gather(*listener_tasks)
+
+    async def _execute_single_listener(self, listener_name: str, result: Any) -> None:
+        try:
+            method = self._methods[listener_name]
+            sig = inspect.signature(method)
+            params = list(sig.parameters.values())
+
+            # Exclude 'self' parameter
+            method_params = [p for p in params if p.name != "self"]
+
+            if method_params:
+                # If listener expects parameters, pass the result
+                listener_result = await self._execute_method(
+                    listener_name, method, result
+                )
+            else:
+                # If listener does not expect parameters, call without arguments
+                listener_result = await self._execute_method(listener_name, method)
+
+            # Execute listeners of this listener
+            await self._execute_listeners(listener_name, listener_result)
+        except Exception as e:
+            print(
+                f"[Flow._execute_single_listener] Error in method {listener_name}: {e}"
+            )
+            import traceback
+
+            traceback.print_exc()
+        finally:
+            # Remove from scheduled tasks after execution
+            self._scheduled_tasks.discard(listener_name)
+            self._pending_and_listeners.pop(listener_name, None)
+
+    def plot(self, filename: str = "crewai_flow") -> None:
+        self._telemetry.flow_plotting_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        plot_flow(self, filename)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-14 06:19:09
+Duration: 2780.70 seconds
+Verdict: ## Evaluation
+
+### 1. Diff analysis
+
+The fixed code makes these changes:
+
+**Functional (the intended fix):**
+- Replaces the inline `OR`/`AND` branch logic in `_execute_listeners` with a new helper `_is_listener_ready(...)`.
+- For `AND` listeners, uses `self._pending_and_listeners` as a per-listener set of outstanding triggers, initialized from `methods`, pruned against `self._executed_methods` and the just-finished `trigger_method`. It returns ready only when the set becomes empty, then pops the entry.
+- Early-skips listeners already executed/scheduled before evaluating readiness.
+- Fixes router dispatch: `path = await self._execute_method(router_method_name, router_method)` instead of registering the *trigger* method name as executed (the old code recorded the wrong method in `_executed_methods`).
+
+**Cosmetic:** removal of the four `print(...)` debug statements in `FlowMeta.__new__` and the `print("Method", ...)` in `__init__`, plus a TODO comment.
+
+### 2. Traced behavior against the test
+
+Manually tracing the flow: `step_1_1` → schedules `step_2`; both `step_4_1`/`step_4_2` pending sets become `{step_3}` → not ready. `step_1_2` (concurrent) → `step_2` already scheduled → skip; AND listeners still `{step_3}`. `step_2` → `step_3` runs → `_execute_listeners("step_3", …)` → pending sets drain to empty → both AND listeners become ready and are scheduled/executed. So the `STEP_4_1_EXECUTED` / `STEP_4_2_EXECUTED` behavior the fixed-version test asserts would indeed now occur — the core fix is semantically sound and order-independent.
+
+### 3. Validation result
+
+`validate_fixed_code` returned **REJECT**:
+
+> `the line ### src/crewai/flow/flow.py appears 0 times, expected once`
+
+This is a hard output-format rule failure. The buggy file began with the file-path header line `### src/crewai/flow/flow.py`, and it is visible as a deletion in the very first diff hunk. The fixed submission strips it, so the required header is missing. The case contains no separate "required interface" check, so this format violation is the authoritative structural signal — and it fails.
+
+### 4. Additional concerns (secondary)
+
+- **Argument contract for AND listeners unchanged/unresolved:** `_execute_single_listener` still receives only the single `result` of the last-firing trigger, so a listener written like `step_4_1(self, step_1_1_output, step_3_output)` (the realistic form from the issue) still raises a signature mismatch. The fix only makes the listener be *attempted*; it does not deliver multiple trigger outputs. The "fixed" test dodges this by defining zero-argument listeners, so the code passes the test while the actual user-facing bug (multi-input AND listeners) remains.
+- **Router result semantics changed silently:** the router's return value is now appended to `_method_outputs` and the router method name (correctly) marked executed, which alters `method_outputs`/final kickoff return contents relative to before.
+- **Lazy pruning fragility:** pending sets are only cleaned on later evaluations, and the new early `continue` for scheduled listeners skips readiness evaluation entirely; combined with concurrent `asyncio.gather` interleavings this is workable but brittle.
+- **Style:** `_is_listener_ready` signature line exceeds typical line-length limits.
+
+### Verdict
+
+**REJECT**
+
+The AND-listener logic itself is directionally correct and would satisfy the fixed-version script, but the submission fails the structural/format validation (dropped the mandatory `### src/crewai/flow/flow.py` header line), and it additionally does not address the multi-argument AND-listener failure mode described in the issue, so it is not a complete, conformant fix.
+--------------------------------------------------------------------------------
+# flow.py
+
+import asyncio
+import inspect
+from typing import Any, Callable, Dict, Generic, List, Set, Type, TypeVar, Union
+
+from pydantic import BaseModel
+
+from crewai.flow.flow_visualizer import plot_flow
+from crewai.flow.utils import get_possible_return_constants
+from crewai.telemetry import Telemetry
+
+T = TypeVar("T", bound=Union[BaseModel, Dict[str, Any]])
+
+
+def start(condition=None):
+    def decorator(func):
+        func.__is_start_method__ = True
+        if condition is not None:
+            if isinstance(condition, str):
+                func.__trigger_methods__ = [condition]
+                func.__condition_type__ = "OR"
+            elif (
+                isinstance(condition, dict)
+                and "type" in condition
+                and "methods" in condition
+            ):
+                func.__trigger_methods__ = condition["methods"]
+                func.__condition_type__ = condition["type"]
+            elif callable(condition) and hasattr(condition, "__name__"):
+                func.__trigger_methods__ = [condition.__name__]
+                func.__condition_type__ = "OR"
+            else:
+                raise ValueError(
+                    "Condition must be a method, string, or a result of or_() or and_()"
+                )
+        return func
+
+    return decorator
+
+
+def listen(condition):
+    def decorator(func):
+        if isinstance(condition, str):
+            func.__trigger_methods__ = [condition]
+            func.__condition_type__ = "OR"
+        elif (
+            isinstance(condition, dict)
+            and "type" in condition
+            and "methods" in condition
+        ):
+            func.__trigger_methods__ = condition["methods"]
+            func.__condition_type__ = condition["type"]
+        elif callable(condition) and hasattr(condition, "__name__"):
+            func.__trigger_methods__ = [condition.__name__]
+            func.__condition_type__ = "OR"
+        else:
+            raise ValueError(
+                "Condition must be a method, string, or a result of or_() or and_()"
+            )
+        return func
+
+    return decorator
+
+
+def router(method):
+    def decorator(func):
+        func.__is_router__ = True
+        func.__router_for__ = method.__name__
+        return func
+
+    return decorator
+
+
+def or_(*conditions):
+    methods = []
+    for condition in conditions:
+        if isinstance(condition, dict) and "methods" in condition:
+            methods.extend(condition["methods"])
+        elif isinstance(condition, str):
+            methods.append(condition)
+        elif callable(condition):
+            methods.append(getattr(condition, "__name__", repr(condition)))
+        else:
+            raise ValueError("Invalid condition in or_()")
+    return {"type": "OR", "methods": methods}
+
+
+def and_(*conditions):
+    methods = []
+    for condition in conditions:
+        if isinstance(condition, dict) and "methods" in condition:
+            methods.extend(condition["methods"])
+        elif isinstance(condition, str):
+            methods.append(condition)
+        elif callable(condition):
+            methods.append(getattr(condition, "__name__", repr(condition)))
+        else:
+            raise ValueError("Invalid condition in and_()")
+    return {"type": "AND", "methods": methods}
+
+
+class FlowMeta(type):
+    def __new__(mcs, name, bases, dct):
+        cls = super().__new__(mcs, name, bases, dct)
+
+        start_methods = []
+        listeners = {}
+        routers = {}
+        router_paths = {}
+
+        for attr_name, attr_value in dct.items():
+            if hasattr(attr_value, "__is_start_method__"):
+                start_methods.append(attr_name)
+                if hasattr(attr_value, "__trigger_methods__"):
+                    methods = attr_value.__trigger_methods__
+                    condition_type = getattr(attr_value, "__condition_type__", "OR")
+                    listeners[attr_name] = (condition_type, methods)
+            elif hasattr(attr_value, "__trigger_methods__"):
+                methods = attr_value.__trigger_methods__
+                condition_type = getattr(attr_value, "__condition_type__", "OR")
+                listeners[attr_name] = (condition_type, methods)
+
+            elif hasattr(attr_value, "__is_router__"):
+                routers[attr_value.__router_for__] = attr_name
+                possible_returns = get_possible_return_constants(attr_value)
+                if possible_returns:
+                    router_paths[attr_name] = possible_returns
+
+                # Register router as a listener to its triggering method
+                trigger_method_name = attr_value.__router_for__
+                methods = [trigger_method_name]
+                condition_type = "OR"
+                listeners[attr_name] = (condition_type, methods)
+
+        setattr(cls, "_start_methods", start_methods)
+        setattr(cls, "_listeners", listeners)
+        setattr(cls, "_routers", routers)
+        setattr(cls, "_router_paths", router_paths)
+
+        return cls
+
+
+class Flow(Generic[T], metaclass=FlowMeta):
+    _telemetry = Telemetry()
+
+    _start_methods: List[str] = []
+    _listeners: Dict[str, tuple[str, List[str]]] = {}
+    _routers: Dict[str, str] = {}
+    _router_paths: Dict[str, List[str]] = {}
+    initial_state: Union[Type[T], T, None] = None
+
+    def __class_getitem__(cls: Type["Flow"], item: Type[T]) -> Type["Flow"]:
+        class _FlowGeneric(cls):  # type: ignore
+            _initial_state_T = item  # type: ignore
+
+        _FlowGeneric.__name__ = f"{cls.__name__}[{item.__name__}]"
+        return _FlowGeneric
+
+    def __init__(self) -> None:
+        self._methods: Dict[str, Callable] = {}
+        self._state: T = self._create_initial_state()
+        self._executed_methods: Set[str] = set()
+        self._scheduled_tasks: Set[str] = set()
+        # Tracks, per AND-listener, the trigger methods that have not completed yet
+        self._pending_and_listeners: Dict[str, Set[str]] = {}
+        self._method_outputs: List[Any] = []  # List to store all method outputs
+
+        self._telemetry.flow_creation_span(self.__class__.__name__)
+
+        for method_name in dir(self):
+            if callable(getattr(self, method_name)) and not method_name.startswith(
+                "__"
+            ):
+                self._methods[method_name] = getattr(self, method_name)
+
+    def _create_initial_state(self) -> T:
+        if self.initial_state is None and hasattr(self, "_initial_state_T"):
+            return self._initial_state_T()  # type: ignore
+        if self.initial_state is None:
+            return {}  # type: ignore
+        elif isinstance(self.initial_state, type):
+            return self.initial_state()
+        else:
+            return self.initial_state
+
+    @property
+    def state(self) -> T:
+        return self._state
+
+    @property
+    def method_outputs(self) -> List[Any]:
+        """Returns the list of all outputs from executed methods."""
+        return self._method_outputs
+
+    def kickoff(self) -> Any:
+        return asyncio.run(self.kickoff_async())
+
+    async def kickoff_async(self) -> Any:
+        if not self._start_methods:
+            raise ValueError("No start method defined")
+
+        self._telemetry.flow_execution_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        # Create tasks for all start methods
+        tasks = [
+            self._execute_start_method(start_method)
+            for start_method in self._start_methods
+        ]
+
+        # Run all start methods concurrently
+        await asyncio.gather(*tasks)
+
+        # Return the final output (from the last executed method)
+        if self._method_outputs:
+            return self._method_outputs[-1]
+        else:
+            return None  # Or raise an exception if no methods were executed
+
+    async def _execute_start_method(self, start_method_name: str) -> None:
+        result = await self._execute_method(
+            start_method_name, self._methods[start_method_name]
+        )
+        await self._execute_listeners(start_method_name, result)
+
+    async def _execute_method(
+        self, method_name: str, method: Callable, *args: Any, **kwargs: Any
+    ) -> Any:
+        result = (
+            await method(*args, **kwargs)
+            if asyncio.iscoroutinefunction(method)
+            else method(*args, **kwargs)
+        )
+        self._method_outputs.append(result)  # Store the output
+
+        self._executed_methods.add(method_name)
+
+        return result
+
+    def _is_listener_ready(
+        self, listener_name: str, condition_type: str, methods: List[str], trigger_method: str
+    ) -> bool:
+        """Determines whether a listener condition is fulfilled.
+
+        OR conditions are satisfied as soon as one of their triggers runs, while
+        AND conditions are only satisfied once every trigger has completed.
+        """
+        if condition_type == "AND":
+            # Keep track of the triggers that are still pending for this listener.
+            # This makes the AND condition order independent, so it does not matter
+            # in which order (or concurrently) the trigger methods finish.
+            pending = self._pending_and_listeners.get(listener_name)
+            if pending is None:
+                pending = set(methods)
+                self._pending_and_listeners[listener_name] = pending
+
+            # Any trigger that already completed can no longer be pending.
+            for method in tuple(pending):
+                if method in self._executed_methods:
+                    pending.discard(method)
+
+            # The method that just finished is, by definition, done.
+            pending.discard(trigger_method)
+
+            if pending:
+                return False
+
+            self._pending_and_listeners.pop(listener_name, None)
+            return True
+
+        # OR (default) condition
+        return trigger_method in methods
+
+    async def _execute_listeners(self, trigger_method: str, result: Any) -> None:
+        listener_tasks = []
+
+        if trigger_method in self._routers:
+            router_method_name = self._routers[trigger_method]
+            router_method = self._methods[router_method_name]
+            path = await self._execute_method(router_method_name, router_method)
+            # Use the path as the new trigger method
+            trigger_method = path
+
+        for listener_name, (condition_type, methods) in self._listeners.items():
+            if (
+                listener_name in self._executed_methods
+                or listener_name in self._scheduled_tasks
+            ):
+                continue
+
+            if not self._is_listener_ready(
+                listener_name, condition_type, methods, trigger_method
+            ):
+                continue
+
+            self._scheduled_tasks.add(listener_name)
+            listener_tasks.append(
+                self._execute_single_listener(listener_name, result)
+            )
+
+        # Run all listener tasks concurrently and wait for them to complete
+        await asyncio.gather(*listener_tasks)
+
+    async def _execute_single_listener(self, listener_name: str, result: Any) -> None:
+        try:
+            method = self._methods[listener_name]
+            sig = inspect.signature(method)
+            params = list(sig.parameters.values())
+
+            # Exclude 'self' parameter
+            method_params = [p for p in params if p.name != "self"]
+
+            if method_params:
+                # If listener expects parameters, pass the result
+                listener_result = await self._execute_method(
+                    listener_name, method, result
+                )
+            else:
+                # If listener does not expect parameters, call without arguments
+                listener_result = await self._execute_method(listener_name, method)
+
+            # Remove from scheduled tasks after execution
+            self._scheduled_tasks.discard(listener_name)
+
+            # Execute listeners of this listener
+            await self._execute_listeners(listener_name, listener_result)
+        except Exception as e:
+            print(
+                f"[Flow._execute_single_listener] Error in method {listener_name}: {e}"
+            )
+            import traceback
+
+            traceback.print_exc()
+
+    def plot(self, filename: str = "crewai_flow") -> None:
+        self._telemetry.flow_plotting_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        plot_flow(self, filename)
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-14 08:03:31
+Duration: 6261.89 seconds
+Verdict: ## Analysis
+
+### 1. Diff review
+The change is confined to `src/crewai/flow/flow.py` and makes sense for the reported issue:
+
+- **Removed debug noise**: the `print("_start_methods", ...)`, `print("Method", ...)` statements and the stale `# TODO` are gone — good.
+- **New helper `_execute_method_with_optional_result`**: unifies the "does this method declare a parameter?" check that was previously duplicated only for listeners, and now also applies to routers (which previously were always invoked as `_execute_method(trigger_method, router_method)` with the *trigger's* name and no result).
+- **`_execute_listeners` rework**: introduces `triggered_events` (a list of the event names listeners may react to) and replaces the raw `trigger_method = path` mutation. For `AND` listeners, it switches from a global `all(m in self._executed_methods)` check to a per‑listener `_pending_and_listeners` set, discarded by both trigger events and already-executed methods. Since `pending` is created from `set(methods)` and then `pending -= self._executed_methods`, the fire condition is a **superset** of the old one, so previously-triggered `AND` listeners still trigger and router-branch-name conditions now also resolve (they never land in `_executed_methods`).
+- **`_execute_single_listener`** now delegates to the helper (behavior preserved).
+
+Tracing the fixed test flow: `step_1_1` → `_execute_listeners("step_1_1")` schedules `step_2` → `step_3` → `_execute_listeners("step_3")`; for `step_4_1`/`step_4_2` `pending = {"step_1_1","step_3"} - {"step_3"} = {"step_1_1"}`, then `-= executed_methods` clears it, so both `AND` listeners are scheduled and executed. The patched `_execute_single_listener(self, method_name, *args, **kwargs)` signature matches the call site, so the flow logic itself is sound.
+
+The API calls in play (`inspect.signature`, `asyncio.iscoroutinefunction`, `asyncio.gather`) are used in their standard, documented form; nothing suspicious.
+
+### 2. Structural validation — this is the blocker
+`validate_fixed_code` returns:
+
+> `REJECT the line ### src/crewai/flow/flow.py appears 0 times, expected once`
+
+The diff shows the fixed code **deleted the required file marker header `### src/crewai/flow/flow.py`** (first hunk: `-# ### src/crewai/flow/flow.py`) and also stripped the trailing blank lines. That header is part of the mandated output format — without it the patch cannot be mapped back to the file it is supposed to modify. The submission therefore fails the contract regardless of how good the logic is.
+
+### 3. Secondary concerns worth flagging
+- When a router returns a non-`str` (e.g. `None`), `triggered_events` becomes `[]`, so *no* listener fires — this silently swallows the event instead of at least notifying listeners of the router method's own name.
+- `_pending_and_listeners` entries are never discarded after a listener fires, so on any later re-scheduling the set is empty and the listener would fire immediately.
+- The router is now executed directly and never routed through `_execute_listeners(router_name, ...)`, so listeners keyed on the router's *method name* only fire if the returned path happens to equal it.
+
+## Verdict
+
+**REJECT**
+
+Reasoning: the functional fix is a reasonable and arguably correct improvement (stateful per-listener `AND` tracking, `triggered_events` supporting router branch names, unified optional-result invocation, removal of stray debug prints), but the submitted fixed code **fails the structural/format validation because it dropped the mandatory `### src/crewai/flow/flow.py` header line**, so it cannot be reliably applied as a patch to the target file. The header (and file boundary) must be restored; ideally the un-cleaned `_pending_and_listeners` state and the non-`str` router-path case should also be addressed.
+--------------------------------------------------------------------------------
+# flow.py
+
+import asyncio
+import inspect
+from typing import Any, Callable, Dict, Generic, List, Set, Type, TypeVar, Union
+
+from pydantic import BaseModel
+
+from crewai.flow.flow_visualizer import plot_flow
+from crewai.flow.utils import get_possible_return_constants
+from crewai.telemetry import Telemetry
+
+T = TypeVar("T", bound=Union[BaseModel, Dict[str, Any]])
+
+
+def start(condition=None):
+    def decorator(func):
+        func.__is_start_method__ = True
+        if condition is not None:
+            if isinstance(condition, str):
+                func.__trigger_methods__ = [condition]
+                func.__condition_type__ = "OR"
+            elif (
+                isinstance(condition, dict)
+                and "type" in condition
+                and "methods" in condition
+            ):
+                func.__trigger_methods__ = condition["methods"]
+                func.__condition_type__ = condition["type"]
+            elif callable(condition) and hasattr(condition, "__name__"):
+                func.__trigger_methods__ = [condition.__name__]
+                func.__condition_type__ = "OR"
+            else:
+                raise ValueError(
+                    "Condition must be a method, string, or a result of or_() or and_()"
+                )
+        return func
+
+    return decorator
+
+
+def listen(condition):
+    def decorator(func):
+        if isinstance(condition, str):
+            func.__trigger_methods__ = [condition]
+            func.__condition_type__ = "OR"
+        elif (
+            isinstance(condition, dict)
+            and "type" in condition
+            and "methods" in condition
+        ):
+            func.__trigger_methods__ = condition["methods"]
+            func.__condition_type__ = condition["type"]
+        elif callable(condition) and hasattr(condition, "__name__"):
+            func.__trigger_methods__ = [condition.__name__]
+            func.__condition_type__ = "OR"
+        else:
+            raise ValueError(
+                "Condition must be a method, string, or a result of or_() or and_()"
+            )
+        return func
+
+    return decorator
+
+
+def router(method):
+    def decorator(func):
+        func.__is_router__ = True
+        func.__router_for__ = method.__name__
+        return func
+
+    return decorator
+
+
+def or_(*conditions):
+    methods = []
+    for condition in conditions:
+        if isinstance(condition, dict) and "methods" in condition:
+            methods.extend(condition["methods"])
+        elif isinstance(condition, str):
+            methods.append(condition)
+        elif callable(condition):
+            methods.append(getattr(condition, "__name__", repr(condition)))
+        else:
+            raise ValueError("Invalid condition in or_()")
+    return {"type": "OR", "methods": methods}
+
+
+def and_(*conditions):
+    methods = []
+    for condition in conditions:
+        if isinstance(condition, dict) and "methods" in condition:
+            methods.extend(condition["methods"])
+        elif isinstance(condition, str):
+            methods.append(condition)
+        elif callable(condition):
+            methods.append(getattr(condition, "__name__", repr(condition)))
+        else:
+            raise ValueError("Invalid condition in and_()")
+    return {"type": "AND", "methods": methods}
+
+
+class FlowMeta(type):
+    def __new__(mcs, name, bases, dct):
+        cls = super().__new__(mcs, name, bases, dct)
+
+        start_methods = []
+        listeners = {}
+        routers = {}
+        router_paths = {}
+
+        for attr_name, attr_value in dct.items():
+            if hasattr(attr_value, "__is_start_method__"):
+                start_methods.append(attr_name)
+                if hasattr(attr_value, "__trigger_methods__"):
+                    methods = attr_value.__trigger_methods__
+                    condition_type = getattr(attr_value, "__condition_type__", "OR")
+                    listeners[attr_name] = (condition_type, methods)
+            elif hasattr(attr_value, "__trigger_methods__"):
+                methods = attr_value.__trigger_methods__
+                condition_type = getattr(attr_value, "__condition_type__", "OR")
+                listeners[attr_name] = (condition_type, methods)
+            elif hasattr(attr_value, "__is_router__"):
+                routers[attr_value.__router_for__] = attr_name
+                possible_returns = get_possible_return_constants(attr_value)
+                if possible_returns:
+                    router_paths[attr_name] = possible_returns
+
+                # Register router as a listener to its triggering method
+                trigger_method_name = attr_value.__router_for__
+                methods = [trigger_method_name]
+                condition_type = "OR"
+                listeners[attr_name] = (condition_type, methods)
+
+        setattr(cls, "_start_methods", start_methods)
+        setattr(cls, "_listeners", listeners)
+        setattr(cls, "_routers", routers)
+        setattr(cls, "_router_paths", router_paths)
+
+        return cls
+
+
+class Flow(Generic[T], metaclass=FlowMeta):
+    _telemetry = Telemetry()
+
+    _start_methods: List[str] = []
+    _listeners: Dict[str, tuple[str, List[str]]] = {}
+    _routers: Dict[str, str] = {}
+    _router_paths: Dict[str, List[str]] = {}
+    initial_state: Union[Type[T], T, None] = None
+
+    def __class_getitem__(cls: Type["Flow"], item: Type[T]) -> Type["Flow"]:
+        class _FlowGeneric(cls):  # type: ignore
+            _initial_state_T = item  # type: ignore
+
+        _FlowGeneric.__name__ = f"{cls.__name__}[{item.__name__}]"
+        return _FlowGeneric
+
+    def __init__(self) -> None:
+        self._methods: Dict[str, Callable] = {}
+        self._state: T = self._create_initial_state()
+        self._executed_methods: Set[str] = set()
+        self._scheduled_tasks: Set[str] = set()
+        # Keeps track of the trigger methods each "AND" listener is still
+        # waiting for, so a listener is only triggered once every condition
+        # has been satisfied (no matter in which order they happened).
+        self._pending_and_listeners: Dict[str, Set[str]] = {}
+        self._method_outputs: List[Any] = []  # List to store all method outputs
+
+        self._telemetry.flow_creation_span(self.__class__.__name__)
+
+        for method_name in dir(self):
+            if callable(getattr(self, method_name)) and not method_name.startswith(
+                "__"
+            ):
+                self._methods[method_name] = getattr(self, method_name)
+
+    def _create_initial_state(self) -> T:
+        if self.initial_state is None and hasattr(self, "_initial_state_T"):
+            return self._initial_state_T()  # type: ignore
+        if self.initial_state is None:
+            return {}  # type: ignore
+        elif isinstance(self.initial_state, type):
+            return self.initial_state()
+        else:
+            return self.initial_state
+
+    @property
+    def state(self) -> T:
+        return self._state
+
+    @property
+    def method_outputs(self) -> List[Any]:
+        """Returns the list of all outputs from executed methods."""
+        return self._method_outputs
+
+    def kickoff(self) -> Any:
+        return asyncio.run(self.kickoff_async())
+
+    async def kickoff_async(self) -> Any:
+        if not self._start_methods:
+            raise ValueError("No start method defined")
+
+        self._telemetry.flow_execution_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        # Create tasks for all start methods
+        tasks = [
+            self._execute_start_method(start_method)
+            for start_method in self._start_methods
+        ]
+
+        # Run all start methods concurrently
+        await asyncio.gather(*tasks)
+
+        # Return the final output (from the last executed method)
+        if self._method_outputs:
+            return self._method_outputs[-1]
+        else:
+            return None  # Or raise an exception if no methods were executed
+
+    async def _execute_start_method(self, start_method_name: str) -> None:
+        result = await self._execute_method(
+            start_method_name, self._methods[start_method_name]
+        )
+        await self._execute_listeners(start_method_name, result)
+
+    async def _execute_method(
+        self, method_name: str, method: Callable, *args: Any, **kwargs: Any
+    ) -> Any:
+        result = (
+            await method(*args, **kwargs)
+            if asyncio.iscoroutinefunction(method)
+            else method(*args, **kwargs)
+        )
+        self._method_outputs.append(result)  # Store the output
+
+        self._executed_methods.add(method_name)
+
+        return result
+
+    async def _execute_method_with_optional_result(
+        self, method_name: str, method: Callable, result: Any
+    ) -> Any:
+        """Execute ``method`` passing ``result`` only when it accepts arguments.
+
+        Both routers and listeners are user defined, some of them declare a
+        parameter to receive the output of the method that triggered them and
+        some of them don't, this keeps both styles working.
+        """
+        sig = inspect.signature(method)
+        method_params = [p for p in sig.parameters.values() if p.name != "self"]
+
+        if method_params:
+            return await self._execute_method(method_name, method, result)
+
+        return await self._execute_method(method_name, method)
+
+    async def _execute_listeners(self, trigger_method: str, result: Any) -> None:
+        """Execute every listener whose condition has been fulfilled.
+
+        ``trigger_method`` is the name of the method that just finished. When
+        that method is a router, the router itself is executed (and registered
+        as executed under its own name) and the value it returns becomes the
+        event listeners react to. This is what allows flows such as::
+
+            @listen(and_(step_1_1, step_3))   # step_3 being a router
+            def step_4(self):
+                ...
+
+        to be triggered, no matter whether the conditions are expressed with
+        method references, plain strings or router branch names.
+        """
+        listener_tasks = []
+
+        # Names that listeners can react to. It defaults to the method that
+        # just executed but is replaced by the path returned by a router.
+        triggered_events: List[str] = [trigger_method]
+
+        if trigger_method in self._routers:
+            router_method_name = self._routers[trigger_method]
+            router_method = self._methods[router_method_name]
+            path = await self._execute_method_with_optional_result(
+                router_method_name, router_method, result
+            )
+            # The router now decides which listeners must run
+            triggered_events = [path] if isinstance(path, str) else []
+
+        for listener_name, (condition_type, methods) in self._listeners.items():
+            if condition_type == "OR":
+                if not any(event in methods for event in triggered_events):
+                    continue
+                if (
+                    listener_name in self._executed_methods
+                    or listener_name in self._scheduled_tasks
+                ):
+                    continue
+                self._scheduled_tasks.add(listener_name)
+                listener_tasks.append(
+                    self._execute_single_listener(listener_name, result)
+                )
+            elif condition_type == "AND":
+                # Track, per listener, which conditions are still missing
+                pending = self._pending_and_listeners.setdefault(
+                    listener_name, set(methods)
+                )
+                for event in triggered_events:
+                    pending.discard(event)
+                # Methods that already completed (e.g. the router itself, or
+                # conditions satisfied before tracking started) also count.
+                pending -= self._executed_methods
+
+                if pending:
+                    # Still waiting on other conditions
+                    continue
+                if (
+                    listener_name in self._executed_methods
+                    or listener_name in self._scheduled_tasks
+                ):
+                    continue
+                self._scheduled_tasks.add(listener_name)
+                listener_tasks.append(
+                    self._execute_single_listener(listener_name, result)
+                )
+
+        # Run all listener tasks concurrently and wait for them to complete
+        await asyncio.gather(*listener_tasks)
+
+    async def _execute_single_listener(self, listener_name: str, result: Any) -> None:
+        try:
+            method = self._methods[listener_name]
+            listener_result = await self._execute_method_with_optional_result(
+                listener_name, method, result
+            )
+
+            # Remove from scheduled tasks after execution
+            self._scheduled_tasks.discard(listener_name)
+
+            # Execute listeners of this listener
+            await self._execute_listeners(listener_name, listener_result)
+        except Exception as e:
+            print(
+                f"[Flow._execute_single_listener] Error in method {listener_name}: {e}"
+            )
+            import traceback
+
+            traceback.print_exc()
+
+    def plot(self, filename: str = "crewai_flow") -> None:
+        self._telemetry.flow_plotting_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        plot_flow(self, filename)
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-14 09:58:36
+Duration: 6905.64 seconds
+Verdict: ## Evaluation
+
+### 1. Diff review
+The fix is a substantial rewrite of `src/crewai/flow/flow.py`:
+
+**Positive aspects**
+- `_resolve_condition` / `_collect_method_names` deduplicate decorator logic — clean refactor.
+- Removed stray `print()` debug statements in the metaclass and `__init__`.
+- AND evaluation now tracks per-listener triggered conditions in `_pending_and_listeners`, so order-independent AND (`and_(step_1_1, step_3)`) works. This addresses the root cause of issue #1463 where `all(m in _executed_methods)` was evaluated only in the frame of the triggering method.
+- Router dispatch fixed (`_execute_method(router_method_name, router_method)` instead of passing the *trigger* method name), and routers are no longer executed as plain listeners.
+- `_scheduled_tasks` cleanup moved into `finally`, `inspect.isawaitable` support added.
+
+### 2. Structural validation — FAILED
+`validate_fixed_code` returned:
+
+> `REJECT the line ### src/crewai/flow/flow.py appears 0 times, expected once`
+
+The diff confirms the file-path marker at the top of the module was **deleted**:
+
+```
+-### src/crewai/flow/flow.py
+ # flow.py
+```
+
+The required `### <path>` header is what the harness uses to map the patched snippet to its target file. Without it the fix cannot be applied/installed, so the format rules are violated regardless of code quality.
+
+### 3. Functional defect found in the new logic
+`_execute_pending_and_listeners` contains an **unbounded retry loop**:
+
+```python
+while True:
+    ready_listeners = [... and not self._is_listener_done(...) and self._is_and_condition_met(...)]
+    ...
+    await asyncio.gather(*listener_tasks)
+```
+
+`_execute_single_listener` catches every exception and does **not** re-raise, and the `finally` block discards the listener from `_scheduled_tasks` without recording it in `_executed_methods`. Consequently, any AND listener that raises (e.g. an argument-count mismatch — precisely the scenario from the original issue, where `step_4_1` declares parameters but only one result is forwarded) stays "ready", is re-scheduled, re-executed, and fails again **forever** — the flow hangs instead of erroring out. The provided test only avoids this because the fixed-version test defines zero-argument listeners; it does not cover the failing case.
+
+Additional smaller issues:
+- `_execute_pending_and_listeners` pushes `self._method_outputs[-1]` into listeners that may expect multiple arguments, making that TypeError path (and thus the hang above) more likely.
+- `set(self._routers.values())` is rebuilt on every loop iteration.
+- Router results that are not `str` silently fall through, so path-keyed listeners never fire.
+
+### 4. API usage verification
+The `inspect.isawaitable` / `asyncio.iscoroutinefunction` usages are semantically correct (the search returned only generic docs), so no API misuse — the problems are the packaging/format violation and the retry-loop regression.
+
+## Verdict
+
+**REJECT**
+
+Reasons:
+1. Structural validation fails: the mandatory `### src/crewai/flow/flow.py` header was removed from the fixed code, so it cannot be applied to the repo.
+2. Real correctness regression: `_execute_pending_and_listeners` retries failing AND listeners indefinitely, hanging the process for the exact argument-mismatch situation this issue is about.
+3. Inconsistent result forwarding (`last_result` as sole argument) makes that hang easy to trigger.
+
+The core AND-condition tracking idea is right, but the patch must restore the file header and guard the pending-listener loop (e.g. record attempted listeners / re-raise or mark as failed) before it can be accepted.
+--------------------------------------------------------------------------------
+# flow.py
+
+import asyncio
+import inspect
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
+
+from pydantic import BaseModel
+
+from crewai.flow.flow_visualizer import plot_flow
+from crewai.flow.utils import get_possible_return_constants
+from crewai.telemetry import Telemetry
+
+T = TypeVar("T", bound=Union[BaseModel, Dict[str, Any]])
+
+
+def _resolve_condition(condition: Any) -> Tuple[str, List[str]]:
+    """Normalize a decorator condition into a (condition_type, methods) tuple."""
+    if isinstance(condition, str):
+        return "OR", [condition]
+
+    if isinstance(condition, dict) and "type" in condition and "methods" in condition:
+        return condition["type"], list(condition["methods"])
+
+    if callable(condition) and hasattr(condition, "__name__"):
+        return "OR", [condition.__name__]
+
+    raise ValueError(
+        "Condition must be a method, string, or a result of or_() or and_()"
+    )
+
+
+def _collect_method_names(conditions: Tuple[Any, ...], function_name: str) -> List[str]:
+    """Collect the method names referenced by the arguments of or_() / and_()."""
+    methods: List[str] = []
+    for condition in conditions:
+        if isinstance(condition, dict) and "methods" in condition:
+            methods.extend(condition["methods"])
+        elif isinstance(condition, str):
+            methods.append(condition)
+        elif callable(condition):
+            methods.append(getattr(condition, "__name__", repr(condition)))
+        else:
+            raise ValueError(f"Invalid condition in {function_name}()")
+    return methods
+
+
+def start(condition=None):
+    def decorator(func):
+        func.__is_start_method__ = True
+        if condition is not None:
+            condition_type, methods = _resolve_condition(condition)
+            func.__trigger_methods__ = methods
+            func.__condition_type__ = condition_type
+        return func
+
+    return decorator
+
+
+def listen(condition):
+    def decorator(func):
+        condition_type, methods = _resolve_condition(condition)
+        func.__trigger_methods__ = methods
+        func.__condition_type__ = condition_type
+        return func
+
+    return decorator
+
+
+def router(method):
+    def decorator(func):
+        func.__is_router__ = True
+        func.__router_for__ = (
+            method.__name__ if hasattr(method, "__name__") else method
+        )
+        return func
+
+    return decorator
+
+
+def or_(*conditions):
+    return {"type": "OR", "methods": _collect_method_names(conditions, "or_")}
+
+
+def and_(*conditions):
+    return {"type": "AND", "methods": _collect_method_names(conditions, "and_")}
+
+
+class FlowMeta(type):
+    def __new__(mcs, name, bases, dct):
+        cls = super().__new__(mcs, name, bases, dct)
+
+        start_methods = []
+        listeners = {}
+        routers = {}
+        router_paths = {}
+
+        for attr_name, attr_value in dct.items():
+            if hasattr(attr_value, "__is_start_method__"):
+                start_methods.append(attr_name)
+                if hasattr(attr_value, "__trigger_methods__"):
+                    methods = attr_value.__trigger_methods__
+                    condition_type = getattr(attr_value, "__condition_type__", "OR")
+                    listeners[attr_name] = (condition_type, methods)
+            elif hasattr(attr_value, "__trigger_methods__"):
+                methods = attr_value.__trigger_methods__
+                condition_type = getattr(attr_value, "__condition_type__", "OR")
+                listeners[attr_name] = (condition_type, methods)
+            elif hasattr(attr_value, "__is_router__"):
+                routers[attr_value.__router_for__] = attr_name
+                possible_returns = get_possible_return_constants(attr_value)
+                if possible_returns:
+                    router_paths[attr_name] = possible_returns
+
+                # Register the router as a listener of the method it routes so
+                # the flow graph (and the visualizer) stays consistent. Routers
+                # are never executed as plain listeners though, they are always
+                # resolved by Flow._execute_listeners.
+                trigger_method_name = attr_value.__router_for__
+                listeners[attr_name] = ("OR", [trigger_method_name])
+
+        setattr(cls, "_start_methods", start_methods)
+        setattr(cls, "_listeners", listeners)
+        setattr(cls, "_routers", routers)
+        setattr(cls, "_router_paths", router_paths)
+
+        return cls
+
+
+class Flow(Generic[T], metaclass=FlowMeta):
+    _telemetry = Telemetry()
+
+    _start_methods: List[str] = []
+    _listeners: Dict[str, tuple[str, List[str]]] = {}
+    _routers: Dict[str, str] = {}
+    _router_paths: Dict[str, List[str]] = {}
+    initial_state: Union[Type[T], T, None] = None
+
+    def __class_getitem__(cls: Type["Flow"], item: Type[T]) -> Type["Flow"]:
+        class _FlowGeneric(cls):  # type: ignore
+            _initial_state_T = item  # type: ignore
+
+        _FlowGeneric.__name__ = f"{cls.__name__}[{item.__name__}]"
+        return _FlowGeneric
+
+    def __init__(self) -> None:
+        self._methods: Dict[str, Callable] = {}
+        self._state: T = self._create_initial_state()
+        self._executed_methods: Set[str] = set()
+        self._scheduled_tasks: Set[str] = set()
+        # Conditions (methods or router paths) already triggered per AND listener
+        self._pending_and_listeners: Dict[str, Set[str]] = {}
+        self._method_outputs: List[Any] = []  # List to store all method outputs
+
+        self._telemetry.flow_creation_span(self.__class__.__name__)
+
+        for method_name in dir(self):
+            if callable(getattr(self, method_name)) and not method_name.startswith(
+                "__"
+            ):
+                self._methods[method_name] = getattr(self, method_name)
+
+    def _create_initial_state(self) -> T:
+        if self.initial_state is None and hasattr(self, "_initial_state_T"):
+            return self._initial_state_T()  # type: ignore
+        if self.initial_state is None:
+            return {}  # type: ignore
+        elif isinstance(self.initial_state, type):
+            return self.initial_state()
+        else:
+            return self.initial_state
+
+    @property
+    def state(self) -> T:
+        return self._state
+
+    @property
+    def method_outputs(self) -> List[Any]:
+        """Returns the list of all outputs from executed methods."""
+        return self._method_outputs
+
+    def kickoff(self) -> Any:
+        return asyncio.run(self.kickoff_async())
+
+    async def kickoff_async(self) -> Any:
+        if not self._start_methods:
+            raise ValueError("No start method defined")
+
+        self._telemetry.flow_execution_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        # Create tasks for all start methods
+        tasks = [
+            self._execute_start_method(start_method)
+            for start_method in self._start_methods
+        ]
+
+        # Run all start methods concurrently
+        await asyncio.gather(*tasks)
+
+        # An AND condition might only be satisfied once every start method and
+        # its listeners finished executing, so make sure any listener that is
+        # ready but was never triggered gets executed before returning.
+        await self._execute_pending_and_listeners()
+
+        # Return the final output (from the last executed method)
+        if self._method_outputs:
+            return self._method_outputs[-1]
+        else:
+            return None  # Or raise an exception if no methods were executed
+
+    async def _execute_start_method(self, start_method_name: str) -> None:
+        result = await self._execute_method(
+            start_method_name, self._methods[start_method_name]
+        )
+        await self._execute_listeners(start_method_name, result)
+
+    async def _execute_method(
+        self, method_name: str, method: Callable, *args: Any, **kwargs: Any
+    ) -> Any:
+        if asyncio.iscoroutinefunction(method):
+            result = await method(*args, **kwargs)
+        else:
+            result = method(*args, **kwargs)
+            # Support callables that return an awaitable without being
+            # coroutine functions themselves.
+            if inspect.isawaitable(result):
+                result = await result
+
+        self._method_outputs.append(result)  # Store the output
+
+        self._executed_methods.add(method_name)
+
+        return result
+
+    def _is_listener_done(self, listener_name: str) -> bool:
+        """Whether a listener already executed or is already scheduled."""
+        return (
+            listener_name in self._executed_methods
+            or listener_name in self._scheduled_tasks
+        )
+
+    def _is_and_condition_met(self, listener_name: str, methods: List[str]) -> bool:
+        """Check whether every method of an AND condition has been triggered.
+
+        A condition can be a regular method (tracked in ``_executed_methods``)
+        or a router path, which is just a string returned by a router and thus
+        only tracked in ``_pending_and_listeners``.
+        """
+        if not methods:
+            return False
+
+        triggered_conditions = self._pending_and_listeners.get(listener_name, set())
+        return all(
+            method in self._executed_methods or method in triggered_conditions
+            for method in methods
+        )
+
+    async def _execute_listeners(self, trigger_method: str, result: Any) -> None:
+        """Execute all listeners that depend on the provided method."""
+        # If the trigger method has a router, execute it and use the returned
+        # path as the new trigger method.
+        if trigger_method in self._routers:
+            router_method_name = self._routers[trigger_method]
+            router_method = self._methods[router_method_name]
+            path = await self._execute_method(router_method_name, router_method)
+
+            # Use the path as the new trigger method
+            if isinstance(path, str):
+                trigger_method = path
+
+        router_methods = set(self._routers.values())
+        listener_tasks = []
+
+        for listener_name, (condition_type, methods) in self._listeners.items():
+            # Routers are resolved above and never run as regular listeners
+            if listener_name in router_methods:
+                continue
+
+            # A listener must never run twice
+            if self._is_listener_done(listener_name):
+                continue
+
+            if condition_type == "AND":
+                # Keep track of every condition triggered so far for this
+                # listener, so the AND condition can be evaluated no matter the
+                # order in which the triggering methods were executed.
+                pending_conditions = self._pending_and_listeners.setdefault(
+                    listener_name, set()
+                )
+                if trigger_method in methods:
+                    pending_conditions.add(trigger_method)
+
+                if not self._is_and_condition_met(listener_name, methods):
+                    continue
+            else:
+                if trigger_method not in methods:
+                    continue
+
+            self._scheduled_tasks.add(listener_name)
+            listener_tasks.append(
+                self._execute_single_listener(listener_name, result)
+            )
+
+        # Run all listener tasks concurrently and wait for them to complete
+        await asyncio.gather(*listener_tasks)
+
+    async def _execute_pending_and_listeners(self) -> None:
+        """Execute AND listeners whose conditions are met but never triggered."""
+        while True:
+            ready_listeners = [
+                listener_name
+                for listener_name, (condition_type, methods) in self._listeners.items()
+                if condition_type == "AND"
+                and listener_name not in set(self._routers.values())
+                and not self._is_listener_done(listener_name)
+                and self._is_and_condition_met(listener_name, methods)
+            ]
+
+            if not ready_listeners:
+                return
+
+            last_result = self._method_outputs[-1] if self._method_outputs else None
+            listener_tasks = []
+
+            for listener_name in ready_listeners:
+                if self._is_listener_done(listener_name):
+                    continue
+
+                self._scheduled_tasks.add(listener_name)
+                listener_tasks.append(
+                    self._execute_single_listener(listener_name, last_result)
+                )
+
+            if not listener_tasks:
+                return
+
+            await asyncio.gather(*listener_tasks)
+
+    async def _execute_single_listener(self, listener_name: str, result: Any) -> None:
+        try:
+            method = self._methods[listener_name]
+            sig = inspect.signature(method)
+            params = list(sig.parameters.values())
+
+            # Exclude 'self' parameter
+            method_params = [p for p in params if p.name != "self"]
+
+            if method_params:
+                # If listener expects parameters, pass the result
+                listener_result = await self._execute_method(
+                    listener_name, method, result
+                )
+            else:
+                # If listener does not expect parameters, call without arguments
+                listener_result = await self._execute_method(listener_name, method)
+
+            # Execute listeners of this listener
+            await self._execute_listeners(listener_name, listener_result)
+        except Exception as e:
+            print(
+                f"[Flow._execute_single_listener] Error in method {listener_name}: {e}"
+            )
+            import traceback
+
+            traceback.print_exc()
+        finally:
+            # Remove from scheduled tasks after execution
+            self._scheduled_tasks.discard(listener_name)
+            self._pending_and_listeners.pop(listener_name, None)
+
+    def plot(self, filename: str = "crewai_flow") -> None:
+        self._telemetry.flow_plotting_span(
+            self.__class__.__name__, list(self._methods.keys())
+        )
+
+        plot_flow(self, filename)
+
+--------------------------------------------------------------------------------

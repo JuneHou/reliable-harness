@@ -1,0 +1,451 @@
+Case ID: 76456041
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 04:29:52
+End Time: 2026-11-09 04:53:16
+Total Duration: 1404.13 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Corrected version.
+
+WHY THE ORIGINAL CODE FAILED
+----------------------------
+1. CSVLoader turns every CSV row into its own Document.  A "map_reduce"
+   chain sends the question to the LLM once per document, so a single
+   question over the full file fired hundreds of API calls (that is the
+   high cost) while every call only ever saw ONE driver.  A question such
+   as "Tell me the name of every driver who is German" can never be
+   answered that way.  This is also why "stuff" worked on the small
+   subset: there everything fits into a single prompt.
+
+2. The default map_reduce prompts are written for summarising long
+   documents.  The map step only asks the model to copy out "any relevant
+   text verbatim" instead of actually answering the question, so the
+   combine step cannot rebuild the complete list of German drivers.
+
+3. RetrievalQA's similarity retriever (k=1000) only returns the rows whose
+   embeddings are closest to the question; for an exhaustive question rows
+   can be silently dropped, and embedding every single row only adds cost.
+
+4. OpenAI() caps the answer at 256 tokens by default, which truncates a
+   long answer such as the full list of German drivers.
+
+HOW IT IS FIXED
+---------------
+* The CSV rows are merged into a few large documents (one LLM call per
+  chunk instead of one per row -> far cheaper, and every call now sees
+  many drivers at once).  No row is ever cut in half.
+* Explicit question-answering map / combine prompts are given to the
+  map_reduce chain.
+* The documents are handed to the chain directly instead of going through
+  a similarity retriever, so no row can be missed.
+* Enough output tokens are allowed for the complete answer.
+"""
+
+import os
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.docstore.document import Document
+from langchain.document_loaders import CSVLoader
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+
+try:
+    from langchain.chains.question_answering import load_qa_chain
+except ImportError:  # very old langchain versions
+    from langchain.chains import load_qa_chain
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# ~1.5k-2k tokens per chunk: fits comfortably into the model context window
+# together with the prompt and the answer, and keeps the number of LLM
+# calls (and therefore the cost) low.  With a larger-context model this
+# value can simply be increased to make even fewer calls.
+MAX_CHARS_PER_DOCUMENT = 6000
+
+# Custom prompts.  The default map_reduce prompts are built for
+# summarisation ("Provide any relevant text verbatim"), which is why the
+# chain could not answer the question correctly.
+QUESTION_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "The following text is a portion of a CSV file. Every blank-line "
+        "separated block is one record (one row) of the CSV.\n\n"
+        "Answer the question using only this portion. List every record of "
+        "this portion that matches the question, one per line. If no record "
+        "of this portion matches, reply with exactly: No matches\n\n"
+        "CSV portion:\n{context}\n\nQuestion: {question}\nAnswer:"
+    ),
+)
+
+COMBINE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "The following are answers extracted from different portions of the "
+        "same CSV file.\n\n"
+        "Merge them into one final answer to the question. Keep every record "
+        "found in any portion - do not drop any - remove duplicates and "
+        "ignore portions that answered 'No matches'.\n\n"
+        "Extracted answers:\n{summaries}\n\nQuestion: {question}\nFinal answer:"
+    ),
+)
+
+# Used when the extracted answers are too long to be combined in one call.
+COLLAPSE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "The following are answers extracted from different portions of the "
+        "same CSV file.\n\n"
+        "Merge them into a single list. Keep every record that appears in "
+        "any of them, remove duplicates and ignore 'No matches'.\n\n"
+        "Extracted answers:\n{summaries}\n\nQuestion: {question}\nMerged answer:"
+    ),
+)
+
+
+def load_csv_documents(file_path, max_chars=MAX_CHARS_PER_DOCUMENT):
+    """Load a CSV and merge its rows into a few large documents.
+
+    CSVLoader returns one Document per CSV row.  Feeding those documents to
+    a map_reduce chain makes the chain call the LLM once per row (hundreds
+    of calls and a huge bill for the full file) while each call only sees a
+    single row, so questions about the whole file cannot be answered.
+    Merging the rows into a handful of big documents fixes both problems,
+    and no row is ever split across two documents.
+    """
+    loader = CSVLoader(file_path=file_path, encoding='utf-8')
+    rows = loader.load()
+
+    documents = []
+    batch = []
+    size = 0
+
+    for row in rows:
+        text = row.page_content
+        if batch and size + len(text) + 2 > max_chars:
+            documents.append(
+                Document(
+                    page_content="\n\n".join(batch),
+                    metadata={"source": file_path},
+                )
+            )
+            batch, size = [], 0
+        batch.append(text)
+        size += len(text) + 2
+
+    if batch:
+        documents.append(
+            Document(
+                page_content="\n\n".join(batch),
+                metadata={"source": file_path},
+            )
+        )
+
+    return documents
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as cb:
+
+            docs = load_csv_documents(file)
+            print(f"{len(docs)} document(s) will be processed for {file}")
+
+            if not docs:
+                print(f"{file} contains no rows, skipping.")
+                continue
+
+            # NOTE: no vector store / similarity retriever is used any more.
+            # A retriever only returns the chunks that are most similar to
+            # the question, so for a question such as "Tell me the name of
+            # every driver who is German" rows can be missed silently.  For
+            # exhaustive questions over a whole file every chunk has to be
+            # seen by the chain, therefore the documents are passed
+            # directly to the question-answering chain (this also removes
+            # the cost of embedding every single row).
+            qa_chain = load_qa_chain(
+                llm=OpenAI(temperature=0, batch_size=20, max_tokens=1024),
+                chain_type="map_reduce",
+                question_prompt=QUESTION_PROMPT,
+                combine_prompt=COMBINE_PROMPT,
+                collapse_prompt=COLLAPSE_PROMPT,
+                token_max=2000,
+                verbose=True,
+            )
+
+            for query in queries:
+                print(query)
+                result = qa_chain(
+                    {"input_documents": docs, "question": query},
+                    return_only_outputs=True,
+                )["output_text"]
+                results.append(result)
+
+                print(result)
+
+            print(cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 04:53:16
+Duration: 1404.13 seconds
+Verdict: The API verification tool only returned generic search results without specific documentation, so I'll rely on my analysis of the diff and my knowledge of the LangChain API to evaluate the fix.
+
+## Analysis
+
+**Bugs identified in the original code:**
+
+1. **Cost explosion / incorrect map-reduce granularity**: `CSVLoader` creates one `Document` per CSV row. With `chain_type="map_reduce"`, the chain fires one LLM call *per document*, so a single query over a full CSV triggered hundreds of API calls — each seeing only a single row, making an exhaustive question like "name every German driver" unanswerable in one pass.
+
+2. **Default prompts are summarization-oriented**: The default map prompt instructs "return any relevant text verbatim" rather than answering the question, so the combine step can't reliably reconstruct a complete answer list.
+
+3. **Similarity retriever drops rows**: For exhaustive questions, k-NN retrieval can silently omit rows, and embedding every row adds cost with no benefit.
+
+4. **Token truncation**: `OpenAI()` defaults to a 256-token completion cap, truncating long answers.
+
+**How the fix addresses these:**
+
+- ✅ Merges CSV rows into ~6000-char documents (one LLM call per chunk instead of per row) — massively reduces cost; batching logic never splits a row across documents.
+- ✅ Removes the vector store/retriever and passes documents directly to the QA chain — correct for exhaustive questions, guaranteeing no row is missed.
+- ✅ Uses `load_qa_chain(chain_type="map_reduce", question_prompt=..., combine_prompt=..., collapse_prompt=..., token_max=...)` — these are the correct parameter names for the map-reduce QA chain in modern LangChain, and the prompt templates correctly use the expected input variables (`context`/`question` for the map step, `summaries`/`question` for combine/collapse), matching the chain's defaults.
+- ✅ Chain invocation `qa_chain({"input_documents": docs, "question": query}, return_only_outputs=True)["output_text"]` is valid usage of a combine-documents chain.
+- ✅ `OpenAI(temperature=0, batch_size=20, max_tokens=1024)` — `max_tokens` is a valid parameter that fixes truncation.
+- ✅ `Document` import from `langchain.docstore.document` is correct, with an `ImportError` fallback for the `load_qa_chain` module location across LangChain versions.
+- ✅ Handles the empty-file edge case (`if not docs: continue`), and reuses the chain across queries (better than rebuilding per query in the original).
+
+**Validation result**: The `validate_fixed_code` output "REJECT test code unavailable" simply reflects that no test code exists for this case — it is not an indication that the fix is structurally broken.
+
+The fix is well-reasoned, addresses the root causes (cost, correctness for exhaustive queries, truncation), and uses valid LangChain APIs.
+
+## Verdict: **ACCEPT**
+--------------------------------------------------------------------------------
+"""
+Corrected version.
+
+WHY THE ORIGINAL CODE FAILED
+----------------------------
+1. CSVLoader turns every CSV row into its own Document.  A "map_reduce"
+   chain sends the question to the LLM once per document, so a single
+   question over the full file fired hundreds of API calls (that is the
+   high cost) while every call only ever saw ONE driver.  A question such
+   as "Tell me the name of every driver who is German" can never be
+   answered that way.  This is also why "stuff" worked on the small
+   subset: there everything fits into a single prompt.
+
+2. The default map_reduce prompts are written for summarising long
+   documents.  The map step only asks the model to copy out "any relevant
+   text verbatim" instead of actually answering the question, so the
+   combine step cannot rebuild the complete list of German drivers.
+
+3. RetrievalQA's similarity retriever (k=1000) only returns the rows whose
+   embeddings are closest to the question; for an exhaustive question rows
+   can be silently dropped, and embedding every single row only adds cost.
+
+4. OpenAI() caps the answer at 256 tokens by default, which truncates a
+   long answer such as the full list of German drivers.
+
+HOW IT IS FIXED
+---------------
+* The CSV rows are merged into a few large documents (one LLM call per
+  chunk instead of one per row -> far cheaper, and every call now sees
+  many drivers at once).  No row is ever cut in half.
+* Explicit question-answering map / combine prompts are given to the
+  map_reduce chain.
+* The documents are handed to the chain directly instead of going through
+  a similarity retriever, so no row can be missed.
+* Enough output tokens are allowed for the complete answer.
+"""
+
+import os
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.docstore.document import Document
+from langchain.document_loaders import CSVLoader
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+
+try:
+    from langchain.chains.question_answering import load_qa_chain
+except ImportError:  # very old langchain versions
+    from langchain.chains import load_qa_chain
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# ~1.5k-2k tokens per chunk: fits comfortably into the model context window
+# together with the prompt and the answer, and keeps the number of LLM
+# calls (and therefore the cost) low.  With a larger-context model this
+# value can simply be increased to make even fewer calls.
+MAX_CHARS_PER_DOCUMENT = 6000
+
+# Custom prompts.  The default map_reduce prompts are built for
+# summarisation ("Provide any relevant text verbatim"), which is why the
+# chain could not answer the question correctly.
+QUESTION_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "The following text is a portion of a CSV file. Every blank-line "
+        "separated block is one record (one row) of the CSV.\n\n"
+        "Answer the question using only this portion. List every record of "
+        "this portion that matches the question, one per line. If no record "
+        "of this portion matches, reply with exactly: No matches\n\n"
+        "CSV portion:\n{context}\n\nQuestion: {question}\nAnswer:"
+    ),
+)
+
+COMBINE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "The following are answers extracted from different portions of the "
+        "same CSV file.\n\n"
+        "Merge them into one final answer to the question. Keep every record "
+        "found in any portion - do not drop any - remove duplicates and "
+        "ignore portions that answered 'No matches'.\n\n"
+        "Extracted answers:\n{summaries}\n\nQuestion: {question}\nFinal answer:"
+    ),
+)
+
+# Used when the extracted answers are too long to be combined in one call.
+COLLAPSE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "The following are answers extracted from different portions of the "
+        "same CSV file.\n\n"
+        "Merge them into a single list. Keep every record that appears in "
+        "any of them, remove duplicates and ignore 'No matches'.\n\n"
+        "Extracted answers:\n{summaries}\n\nQuestion: {question}\nMerged answer:"
+    ),
+)
+
+
+def load_csv_documents(file_path, max_chars=MAX_CHARS_PER_DOCUMENT):
+    """Load a CSV and merge its rows into a few large documents.
+
+    CSVLoader returns one Document per CSV row.  Feeding those documents to
+    a map_reduce chain makes the chain call the LLM once per row (hundreds
+    of calls and a huge bill for the full file) while each call only sees a
+    single row, so questions about the whole file cannot be answered.
+    Merging the rows into a handful of big documents fixes both problems,
+    and no row is ever split across two documents.
+    """
+    loader = CSVLoader(file_path=file_path, encoding='utf-8')
+    rows = loader.load()
+
+    documents = []
+    batch = []
+    size = 0
+
+    for row in rows:
+        text = row.page_content
+        if batch and size + len(text) + 2 > max_chars:
+            documents.append(
+                Document(
+                    page_content="\n\n".join(batch),
+                    metadata={"source": file_path},
+                )
+            )
+            batch, size = [], 0
+        batch.append(text)
+        size += len(text) + 2
+
+    if batch:
+        documents.append(
+            Document(
+                page_content="\n\n".join(batch),
+                metadata={"source": file_path},
+            )
+        )
+
+    return documents
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as cb:
+
+            docs = load_csv_documents(file)
+            print(f"{len(docs)} document(s) will be processed for {file}")
+
+            if not docs:
+                print(f"{file} contains no rows, skipping.")
+                continue
+
+            # NOTE: no vector store / similarity retriever is used any more.
+            # A retriever only returns the chunks that are most similar to
+            # the question, so for a question such as "Tell me the name of
+            # every driver who is German" rows can be missed silently.  For
+            # exhaustive questions over a whole file every chunk has to be
+            # seen by the chain, therefore the documents are passed
+            # directly to the question-answering chain (this also removes
+            # the cost of embedding every single row).
+            qa_chain = load_qa_chain(
+                llm=OpenAI(temperature=0, batch_size=20, max_tokens=1024),
+                chain_type="map_reduce",
+                question_prompt=QUESTION_PROMPT,
+                combine_prompt=COMBINE_PROMPT,
+                collapse_prompt=COLLAPSE_PROMPT,
+                token_max=2000,
+                verbose=True,
+            )
+
+            for query in queries:
+                print(query)
+                result = qa_chain(
+                    {"input_documents": docs, "question": query},
+                    return_only_outputs=True,
+                )["output_text"]
+                results.append(result)
+
+                print(result)
+
+            print(cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------

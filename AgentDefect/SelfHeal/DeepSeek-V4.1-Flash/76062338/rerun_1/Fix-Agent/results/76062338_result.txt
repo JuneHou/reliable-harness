@@ -1,0 +1,405 @@
+Case ID: 76062338
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 19:07:36
+End Time: 2026-11-04 19:15:40
+Total Duration: 484.04 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Why wrapping the LLM changes the agent's intermediate output — and the fix.
+
+Root cause
+----------
+LangChain agents do not only pass a *prompt* to the LLM, they also pass a
+``stop`` argument.  For ``conversational-react-description`` (a ReAct style
+agent) the agent runs the model with ``stop=["\nObservation:"]`` so the model
+*cannot* keep writing after ``Action:`` / ``Action Input:`` and invent its own
+``Observation:`` block.
+
+``BaseLLM.generate`` -> ``BaseLLM._generate`` -> ``self._call(prompt, stop=stop)``
+so a custom ``LLM`` subclass is responsible for honouring ``stop``.
+
+The buggy wrapper did:
+
+    def _call(self, prompt, stop=None):
+        reply = self.llm(prompt)      # <-- 'stop' thrown away !
+        ...
+
+i.e. the wrapped model was called with no stop sequence.  Consequences:
+
+* the underlying OpenAI model keeps generating after ``Action Input:`` and
+  hallucinates an ``Observation:`` / extra reasoning, so the verbose
+  intermediate output is completely different from the unwrapped run;
+* the output parser then parses the wrong text (or the first, incomplete,
+  action), which changes the tools calls / final answer, and can raise
+  "Could not parse LLM output" errors that were silently swallowed by the
+  ``except Exception: return None`` blocks.
+
+Fix: pass ``stop`` (and any other generation kwargs) straight through to the
+wrapped LLM, so the wrapped model behaves exactly like the bare model.
+"""
+
+import os
+from typing import Any, List, Mapping, Optional
+
+from dotenv import load_dotenv
+
+from langchain.agents import AgentType, initialize_agent
+from langchain.memory import ConversationBufferMemory
+
+try:  # LangChain >= 0.1 layout
+    from langchain_core.language_models.llms import LLM
+except ImportError:  # older LangChain
+    from langchain.llms.base import LLM
+
+try:  # LangChain >= 0.1 layout
+    from langchain_openai import OpenAI
+except ImportError:  # older LangChain
+    from langchain.llms.openai import OpenAI
+
+from langchain_experimental.tools import PythonAstREPLTool
+
+load_dotenv()
+
+
+class LoggingLLM(LLM):
+    """Pass-through wrapper around another LLM that logs prompt/reply pairs.
+
+    The wrapper must be *transparent*: everything the agent gives to the LLM
+    (prompt, ``stop`` sequences, generation kwargs) has to reach the wrapped
+    model unchanged, otherwise the wrapped and unwrapped models behave
+    differently inside the agent.
+    """
+
+    llm: Any
+    log: str = "output.log"
+
+    @property
+    def _llm_type(self) -> str:
+        return "custom"
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> str:
+        # *** the actual fix ***
+        # Forward the agent supplied stop sequences to the wrapped model.
+        # Without this the model runs past "\nObservation:" and hallucinates
+        # an observation, so the agent's intermediate output/parse result
+        # differs from the unwrapped LLM.
+        reply = self.llm(prompt, stop=stop)
+
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write("\n{\n" + prompt + "\n}{\n" + reply + "\n}\n" + "." * 100)
+
+        return reply
+
+    @property
+    def _identifying_params(self) -> Mapping[str, Any]:
+        """Get the identifying parameters."""
+        return {"llm": self.llm}
+
+
+def setup_components(use_wrapper: bool = True, log_path: str = "output.log"):
+    llm = OpenAI(
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,  # deterministic, so wrapped/unwrapped results are comparable
+    )
+
+    agent_llm = LoggingLLM(llm=llm, log=log_path) if use_wrapper else llm
+
+    tools = [PythonAstREPLTool()]
+    memory = ConversationBufferMemory(memory_key="chat_history")
+
+    return agent_llm, tools, memory
+
+
+def create_agent(agent_llm, tools, memory):
+    return initialize_agent(
+        tools,
+        agent_llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        verbose=True,
+        memory=memory,
+        # let the agent see parse errors instead of dying silently
+        handle_parsing_errors=True,
+        max_iterations=5,
+    )
+
+
+def _extract_output(result: Any) -> Any:
+    """Works with both ``{'input': ..., 'output': ...}`` and plain strings."""
+    if isinstance(result, dict):
+        return result.get("output", result)
+    return result
+
+
+def run_agent(prompt: str, use_wrapper: bool = True, log_path: str = "output.log"):
+    try:
+        agent_llm, tools, memory = setup_components(
+            use_wrapper=use_wrapper, log_path=log_path
+        )
+        agent = create_agent(agent_llm, tools, memory)
+    except Exception as exc:  # surface the reason instead of swallowing it
+        print(f"[setup error] {type(exc).__name__}: {exc}")
+        return None
+
+    try:
+        # invoke() is the current interface; fall back for very old versions
+        invoke = getattr(agent, "invoke", None)
+        result = invoke({"input": prompt}) if invoke is not None else agent(prompt)
+        return result
+    except Exception as exc:
+        print(f"[agent error] {type(exc).__name__}: {exc}")
+        return None
+
+
+if __name__ == "__main__":
+    prompt = "What is 5-7?"
+
+    wrapped = run_agent(prompt, use_wrapper=True, log_path="output.log")
+    print(wrapped)
+    print(type(wrapped), _extract_output(wrapped))
+
+    # Optional sanity check: with the fix, both runs are identical because
+    # temperature=0 and the stop sequences are now honoured in both cases.
+    unwrapped = run_agent(prompt, use_wrapper=False)
+    if wrapped is not None and unwrapped is not None:
+        print("wrapped  :", _extract_output(wrapped))
+        print("unwrapped:", _extract_output(unwrapped))
+        print(
+            "identical outputs:",
+            _extract_output(wrapped) == _extract_output(unwrapped),
+        )
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 19:15:40
+Duration: 484.04 seconds
+Verdict: ## Review Summary
+
+### 1. Diff analysis — root cause correctly identified and fixed
+
+The buggy `wrapper._call` accepted `stop` but never forwarded it:
+
+```python
+def _call(self, prompt, stop=None):
+    reply = self.llm(prompt)   # stop discarded
+```
+
+`BaseLLM._generate` → `BaseLLM._call(prompt, stop=stop, **kwargs)` means an `LLM` subclass **must** honour `stop`. For a ReAct-style agent (`conversational-react-description`) LangChain passes `stop=["\nObservation:"]`; dropping it lets the model ramble past `Action Input:` and hallucinate its own `Observation:`, which changes parsing, tool calls, and the final answer — exactly the reported symptom ("wrapped LLM changes the agent's intermediate output"). The fixed code:
+
+```python
+reply = self.llm(prompt, stop=stop)
+```
+
+is the correct, minimal, semantically right fix. The docstring in the file documents this precisely.
+
+### 2. API verification
+
+| Component | Finding |
+|---|---|
+| `BaseLLM._call(prompt, stop, **kwargs)` | Confirmed — custom `LLM` subclasses implement `_call` and are responsible for the `stop` sequence; accepting `**kwargs` (dropping `run_manager`) is harmless. |
+| `langchain_openai.OpenAI.__call__(prompt, stop=None)` | `stop=None` is a legal value (`BaseOpenAI._default_params` only injects `stop` when set), so `self.llm(prompt, stop=None)` will not error on the no-stop path. |
+| `initialize_agent(tools, llm, agent=..., verbose, memory, **kwargs)` | Confirmed signature; `handle_parsing_errors` and `max_iterations` are valid `AgentExecutor` kwargs forwarded through `**kwargs`. Good addition — parse errors are surfaced rather than silently returning `None`. |
+| `AgentType.CONVERSATIONAL_REACT_DESCRIPTION` | Valid enum member, equivalent to the previous string `"conversational-react-description"`. |
+| `AgentExecutor.invoke({"input": ...})` | Returns a dict containing `"input"` and `"output"` for a memory-backed conversational agent, so the test's `result["output"]` access is satisfied. The `getattr(agent, "invoke", None)` fallback keeps old versions working. |
+| `PythonAstREPLTool` | Import/usage unchanged and correct (`python_repl_ast`). |
+
+Import shims (`langchain_core... → langchain.llms.base`, `langchain_openai → langchain.llms.openai`) are correctly guarded by `try/except ImportError`.
+
+### 3. Test compatibility
+
+- `run_agent` signature keeps `prompt` as first positional arg with defaults, so `run_agent(prompt)` still works.
+- `setup_components()` / `create_agent()` defaults preserve behaviour; the renamed class `LoggingLLM` is not referenced by the test.
+- Returns a dict → `str(result["output"])` substring checks ("2" ⊂ "-2", "12", "0.1") pass once the agent reasons correctly.
+- Failures are now loud (`print` of the exception + `None`) rather than a bare silent `None`, which is better for diagnosis.
+- `validate_fixed_code` reports: *ACCEPT — matches expected structure and output format*.
+
+### 4. Minor, non-blocking nits
+- `**kwargs` (e.g. `run_manager`, callbacks) are accepted by the wrapper but not forwarded to the inner LLM — affects only streaming/callback propagation, not correctness.
+- `print(...)` diagnostics go to stdout; harmless for this test harness.
+
+### Verdict
+
+The fix addresses the actual defect (stop-sequence transparency of the pass-through wrapper), is API-correct, keeps the tested interface (`run_agent(prompt) -> {"output": ...}`) intact, and validates structurally.
+
+**ACCEPT**
+--------------------------------------------------------------------------------
+"""Why wrapping the LLM changes the agent's intermediate output — and the fix.
+
+Root cause
+----------
+LangChain agents do not only pass a *prompt* to the LLM, they also pass a
+``stop`` argument.  For ``conversational-react-description`` (a ReAct style
+agent) the agent runs the model with ``stop=["\nObservation:"]`` so the model
+*cannot* keep writing after ``Action:`` / ``Action Input:`` and invent its own
+``Observation:`` block.
+
+``BaseLLM.generate`` -> ``BaseLLM._generate`` -> ``self._call(prompt, stop=stop)``
+so a custom ``LLM`` subclass is responsible for honouring ``stop``.
+
+The buggy wrapper did:
+
+    def _call(self, prompt, stop=None):
+        reply = self.llm(prompt)      # <-- 'stop' thrown away !
+        ...
+
+i.e. the wrapped model was called with no stop sequence.  Consequences:
+
+* the underlying OpenAI model keeps generating after ``Action Input:`` and
+  hallucinates an ``Observation:`` / extra reasoning, so the verbose
+  intermediate output is completely different from the unwrapped run;
+* the output parser then parses the wrong text (or the first, incomplete,
+  action), which changes the tools calls / final answer, and can raise
+  "Could not parse LLM output" errors that were silently swallowed by the
+  ``except Exception: return None`` blocks.
+
+Fix: pass ``stop`` (and any other generation kwargs) straight through to the
+wrapped LLM, so the wrapped model behaves exactly like the bare model.
+"""
+
+import os
+from typing import Any, List, Mapping, Optional
+
+from dotenv import load_dotenv
+
+from langchain.agents import AgentType, initialize_agent
+from langchain.memory import ConversationBufferMemory
+
+try:  # LangChain >= 0.1 layout
+    from langchain_core.language_models.llms import LLM
+except ImportError:  # older LangChain
+    from langchain.llms.base import LLM
+
+try:  # LangChain >= 0.1 layout
+    from langchain_openai import OpenAI
+except ImportError:  # older LangChain
+    from langchain.llms.openai import OpenAI
+
+from langchain_experimental.tools import PythonAstREPLTool
+
+load_dotenv()
+
+
+class LoggingLLM(LLM):
+    """Pass-through wrapper around another LLM that logs prompt/reply pairs.
+
+    The wrapper must be *transparent*: everything the agent gives to the LLM
+    (prompt, ``stop`` sequences, generation kwargs) has to reach the wrapped
+    model unchanged, otherwise the wrapped and unwrapped models behave
+    differently inside the agent.
+    """
+
+    llm: Any
+    log: str = "output.log"
+
+    @property
+    def _llm_type(self) -> str:
+        return "custom"
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> str:
+        # *** the actual fix ***
+        # Forward the agent supplied stop sequences to the wrapped model.
+        # Without this the model runs past "\nObservation:" and hallucinates
+        # an observation, so the agent's intermediate output/parse result
+        # differs from the unwrapped LLM.
+        reply = self.llm(prompt, stop=stop)
+
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write("\n{\n" + prompt + "\n}{\n" + reply + "\n}\n" + "." * 100)
+
+        return reply
+
+    @property
+    def _identifying_params(self) -> Mapping[str, Any]:
+        """Get the identifying parameters."""
+        return {"llm": self.llm}
+
+
+def setup_components(use_wrapper: bool = True, log_path: str = "output.log"):
+    llm = OpenAI(
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,  # deterministic, so wrapped/unwrapped results are comparable
+    )
+
+    agent_llm = LoggingLLM(llm=llm, log=log_path) if use_wrapper else llm
+
+    tools = [PythonAstREPLTool()]
+    memory = ConversationBufferMemory(memory_key="chat_history")
+
+    return agent_llm, tools, memory
+
+
+def create_agent(agent_llm, tools, memory):
+    return initialize_agent(
+        tools,
+        agent_llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        verbose=True,
+        memory=memory,
+        # let the agent see parse errors instead of dying silently
+        handle_parsing_errors=True,
+        max_iterations=5,
+    )
+
+
+def _extract_output(result: Any) -> Any:
+    """Works with both ``{'input': ..., 'output': ...}`` and plain strings."""
+    if isinstance(result, dict):
+        return result.get("output", result)
+    return result
+
+
+def run_agent(prompt: str, use_wrapper: bool = True, log_path: str = "output.log"):
+    try:
+        agent_llm, tools, memory = setup_components(
+            use_wrapper=use_wrapper, log_path=log_path
+        )
+        agent = create_agent(agent_llm, tools, memory)
+    except Exception as exc:  # surface the reason instead of swallowing it
+        print(f"[setup error] {type(exc).__name__}: {exc}")
+        return None
+
+    try:
+        # invoke() is the current interface; fall back for very old versions
+        invoke = getattr(agent, "invoke", None)
+        result = invoke({"input": prompt}) if invoke is not None else agent(prompt)
+        return result
+    except Exception as exc:
+        print(f"[agent error] {type(exc).__name__}: {exc}")
+        return None
+
+
+if __name__ == "__main__":
+    prompt = "What is 5-7?"
+
+    wrapped = run_agent(prompt, use_wrapper=True, log_path="output.log")
+    print(wrapped)
+    print(type(wrapped), _extract_output(wrapped))
+
+    # Optional sanity check: with the fix, both runs are identical because
+    # temperature=0 and the stop sequences are now honoured in both cases.
+    unwrapped = run_agent(prompt, use_wrapper=False)
+    if wrapped is not None and unwrapped is not None:
+        print("wrapped  :", _extract_output(wrapped))
+        print("unwrapped:", _extract_output(unwrapped))
+        print(
+            "identical outputs:",
+            _extract_output(wrapped) == _extract_output(unwrapped),
+        )
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,229 @@
+Case ID: 78366661
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 17:26:49
+End Time: 2026-11-05 17:28:04
+Total Duration: 74.93 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+from dotenv import load_dotenv
+import os
+
+from pymongo import MongoClient
+
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import MongoDBAtlasVectorSearch
+
+
+def get_atlas_collection():
+    """Connect to MongoDB Atlas and return the target collection.
+
+    The vector store MUST be backed by a real pymongo collection that holds the
+    documents/embeddings; an empty list (or any other placeholder) cannot be
+    queried and always yields zero results.
+    """
+    mongodb_uri = os.getenv("MONGODB_ATLAS_CLUSTER_URI")
+    if mongodb_uri is None:
+        raise ValueError("MONGODB_ATLAS_CLUSTER_URI not found")
+
+    db_name = os.getenv("MONGODB_DB_NAME", "langchain_db")
+    collection_name = os.getenv("MONGODB_COLLECTION_NAME", "documents")
+
+    client = MongoClient(mongodb_uri)
+    collection = client[db_name][collection_name]
+
+    # Optional sanity check: warn if the index was not created in Atlas yet.
+    return collection
+
+
+def run_agent(pdf_url):
+    load_dotenv()
+
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key is None:
+        raise ValueError("OPENAI_API_KEY not found")
+
+    atlas_collection = get_atlas_collection()
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100
+    )
+
+    loader = PyPDFLoader(pdf_url)
+    data = loader.load()
+
+    docs = text_splitter.split_documents(data)
+
+    vector_search_index = "vector_index"
+
+    vector_search = MongoDBAtlasVectorSearch.from_documents(
+        documents=docs,
+        embedding=OpenAIEmbeddings(disallowed_special=()),
+        collection=atlas_collection,
+        index_name=vector_search_index
+    )
+
+    # Make sure the writes are visible before querying (Atlas is eventually
+    # consistent for freshly created indexes/collections).
+    count = atlas_collection.count_documents({})
+    print("Documents stored in Atlas collection:", count)
+    if count == 0:
+        raise RuntimeError(
+            "No documents were stored in the Atlas collection. "
+            "Check the connection string, database/collection names and "
+            "that the vector_index exists in Atlas."
+        )
+
+    query = "What were the compute requirements for training GPT 4"
+
+    results = vector_search.similarity_search(query, k=4)
+
+    return results
+
+
+if __name__ == "__main__":
+    url = "https://arxiv.org/pdf/2303.08774.pdf"
+
+    results = run_agent(url)
+
+    print("Result:", results)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 17:28:04
+Duration: 74.93 seconds
+Verdict: ## Analysis
+
+### 1. Diff summary
+
+The patch does three things:
+
+1. **Replaces the fake stub** — removes the locally-defined `DummyVectorSearch`/`MongoDBAtlasVectorSearch` shims and imports the real `MongoDBAtlasVectorSearch` from `langchain_community.vectorstores` (correct import path, correct `from_documents(documents=..., embedding=..., collection=..., index_name=...)` signature).
+2. **Backs the vector store with a real `pymongo` collection** obtained via `get_atlas_collection()`, which **requires a new `MONGODB_ATLAS_CLUSTER_URI` env var** and raises `ValueError` if absent.
+3. **Adds a `count_documents({})` guard** that raises `RuntimeError` when the collection is empty, and pins `similarity_search(query, k=4)`.
+
+Structurally this is clean and `validate_fixed_code` reports ACCEPT (`similarity_search(query, k=...)` and the `from_documents` signature are used correctly). The direction (stop mocking the vector store, query a populated store with a non-zero `k`) is right in principle.
+
+### 2. Fatal problem: the test cannot pass
+
+The test is:
+
+```python
+results = run_agent(url)
+self.assertIsNotNone(results)
+self.assertGreater(len(results), 0)
+```
+
+* The original code contained an *elaborate hand-written fake* for `MongoDBAtlasVectorSearch` plus an `atlas_collection = []` placeholder. That stub only makes sense in an environment **without** a reachable Atlas cluster. The fix converts that optional/latent dependency into a **hard failure at the very top of `run_agent`**: with no `MONGODB_ATLAS_CLUSTER_URI` in the environment, `get_atlas_collection()` immediately raises `ValueError("MONGODB_ATLAS_CLUSTER_URI not found")`, so `run_agent` never returns anything and the test errors out instead of asserting on results.
+* Even if the URI were present, the code would need a live cluster, a database/collection that exists, the `vector_index` Search index created in Atlas, plus network reachability for both arXiv download and OpenAI embeddings. Nothing in the patch verifies or creates that index — it only *prints* and raises if the write count is 0.
+* The new `count_documents({})` + `RuntimeError` branch is a **second hard-fail path** introduced into the codepath the test exercises. If the write isn't yet visible (or the env-configured `MONGODB_DB_NAME`/`MONGODB_COLLECTION_NAME` defaults don't match the collection the index was built on), the function raises rather than returning results — the opposite of what the test needs.
+* The change also silently adds new required configuration (`MONGODB_ATLAS_CLUSTER_URI`, plus optional DB/collection vars) that the surrounding program never declares (no `.env` key, no docs), so behavior regresses from "returns empty list" to "crashes".
+* Note the `print("Documents stored in Atlas collection:", count)` side effect — harmless, but it confirms the patch is diagnosing rather than fixing the observable outcome.
+
+Notably, my API-usage verification calls returned only generic, non-authoritative results (Wikipedia/GeeksforGeeks boilerplate, and completely irrelevant "car dealership" hits for `similarity_search`), so they provide **no evidence** that the Atlas-backed path works in this environment; the API signatures themselves look correct by inspection, but correctness of the *integration* is unproven and, per the reasoning above, implausible.
+
+### 3. What a passing fix needed
+
+The function must actually return non-empty documents in the test environment. That requires a vector store that is usable without an externally provisioned Atlas cluster/search index — e.g. an in-process store (FAISS/Chroma/in-memory) fed by `split_documents(data)`, or failing over to returning the retrieved/split documents when no backend is available — while keeping `similarity_search` with a sensible `k` and retaining correct embeddings usage.
+
+## Verdict
+
+**REJECT**
+
+The rewrite of the store initialization and the API signatures are sensible, but the patch swaps a no-op stub for a **requirement on an external MongoDB Atlas cluster (and a pre-built `vector_index`) that the environment demonstrably does not have**, and it adds two new raise paths (`ValueError` on missing `MONGODB_ATLAS_CLUSTER_URI`, `RuntimeError` on `count_documents == 0`) directly on the code path under test. Consequently `run_agent()` will raise rather than return a non-empty list, and `test_should_not_return_empty_results` still fails. The root cause (no working retrieval backend / no real results) is diagnosed but not resolved.
+--------------------------------------------------------------------------------
+from dotenv import load_dotenv
+import os
+
+from pymongo import MongoClient
+
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import MongoDBAtlasVectorSearch
+
+
+def get_atlas_collection():
+    """Connect to MongoDB Atlas and return the target collection.
+
+    The vector store MUST be backed by a real pymongo collection that holds the
+    documents/embeddings; an empty list (or any other placeholder) cannot be
+    queried and always yields zero results.
+    """
+    mongodb_uri = os.getenv("MONGODB_ATLAS_CLUSTER_URI")
+    if mongodb_uri is None:
+        raise ValueError("MONGODB_ATLAS_CLUSTER_URI not found")
+
+    db_name = os.getenv("MONGODB_DB_NAME", "langchain_db")
+    collection_name = os.getenv("MONGODB_COLLECTION_NAME", "documents")
+
+    client = MongoClient(mongodb_uri)
+    collection = client[db_name][collection_name]
+
+    # Optional sanity check: warn if the index was not created in Atlas yet.
+    return collection
+
+
+def run_agent(pdf_url):
+    load_dotenv()
+
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key is None:
+        raise ValueError("OPENAI_API_KEY not found")
+
+    atlas_collection = get_atlas_collection()
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100
+    )
+
+    loader = PyPDFLoader(pdf_url)
+    data = loader.load()
+
+    docs = text_splitter.split_documents(data)
+
+    vector_search_index = "vector_index"
+
+    vector_search = MongoDBAtlasVectorSearch.from_documents(
+        documents=docs,
+        embedding=OpenAIEmbeddings(disallowed_special=()),
+        collection=atlas_collection,
+        index_name=vector_search_index
+    )
+
+    # Make sure the writes are visible before querying (Atlas is eventually
+    # consistent for freshly created indexes/collections).
+    count = atlas_collection.count_documents({})
+    print("Documents stored in Atlas collection:", count)
+    if count == 0:
+        raise RuntimeError(
+            "No documents were stored in the Atlas collection. "
+            "Check the connection string, database/collection names and "
+            "that the vector_index exists in Atlas."
+        )
+
+    query = "What were the compute requirements for training GPT 4"
+
+    results = vector_search.similarity_search(query, k=4)
+
+    return results
+
+
+if __name__ == "__main__":
+    url = "https://arxiv.org/pdf/2303.08774.pdf"
+
+    results = run_agent(url)
+
+    print("Result:", results)
+
+--------------------------------------------------------------------------------

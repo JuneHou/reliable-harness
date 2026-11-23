@@ -1,0 +1,300 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 23:09:58
+End Time: 2026-11-04 23:13:13
+Total Duration: 195.64 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+from langchain.document_loaders import CSVLoader
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# Similarity score threshold: pairs scoring above this are considered
+# "similar"; pairs scoring above the (higher) duplicate threshold are
+# considered near-duplicates. Tune these to your dataset.
+SIMILARITY_THRESHOLD = 0.80
+DUPLICATE_THRESHOLD = 0.92
+
+def run_agent(query):
+    # NOTE: no text splitting. CSVLoader already produces one Document
+    # per CSV row, which must stay intact so control pairs can be formed.
+    loader = CSVLoader(file_path="control.csv")
+    data = loader.load()
+
+    vectorstore = Chroma.from_documents(documents=data, embedding=OpenAIEmbeddings())
+
+    # Explicitly compute similarity scores with a large enough k so that
+    # all candidate rows are considered, then filter by threshold.
+    k = max(len(data), 1)
+    docs_and_scores = vectorstore.similarity_search_with_score(query, k=k)
+
+    # Chroma returns distance (lower = more similar). Convert to a
+    # cosine-similarity-like score in [0, 1] (higher = more similar)
+    # so thresholds behave as expected.
+    scored_rows = []
+    for doc, distance in docs_and_scores:
+        similarity = 1.0 - distance
+        scored_rows.append((doc.page_content, similarity))
+
+    # Build the similarity / duplicate pair listing.
+    similar_pairs = [r for r in scored_rows if r[1] >= SIMILARITY_THRESHOLD]
+    duplicate_pairs = [r for r in scored_rows if r[1] >= DUPLICATE_THRESHOLD]
+
+    context = "\n\n".join(
+        f"[similarity score: {score:.3f}] {text}" for text, score in scored_rows
+    )
+
+    # Prompt changed: instead of forcing "three sentences maximum" and
+    # "if you don't know, just say you don't know" (which suppressed the
+    # expected output), it now explicitly requests the structured list of
+    # similar and duplicate control pairs with their scores.
+    template = """You are an assistant that analyzes a list of controls with their similarity scores.
+
+    Based on the retrieved context below, output a list of similar control pairs and duplicate control pairs.
+
+    Rules:
+    - Controls with a similarity score >= {similarity_threshold} are considered SIMILAR.
+    - Controls with a similarity score >= {duplicate_threshold} are considered DUPLICATES.
+    - For each control, state its Name, Description, and its similarity score.
+    - Present the answer as two clearly labeled lists: "Similar Pairs" and "Duplicate Pairs".
+    - If no controls meet a threshold, explicitly state that the list is empty.
+
+    Question: {question}
+
+    Context:
+    {context}
+
+    Answer:
+    """
+
+    prompt = ChatPromptTemplate.from_template(template)
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", verbose=True)
+
+    rag_chain = (
+        {
+            "context": lambda _: context,
+            "question": RunnablePassthrough(),
+            "similarity_threshold": lambda _: SIMILARITY_THRESHOLD,
+            "duplicate_threshold": lambda _: DUPLICATE_THRESHOLD,
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    output = rag_chain.invoke(query)
+
+    # Deterministic pair summary computed directly from the scores, so the
+    # expected output is produced even if the model paraphrases.
+    lines = []
+    lines.append("=== Similar Control Pairs (score >= %.2f) ===" % SIMILARITY_THRESHOLD)
+    if similar_pairs:
+        for text, score in similar_pairs:
+            lines.append(f"- {text} (score: {score:.3f})")
+    else:
+        lines.append("None found.")
+
+    lines.append("")
+    lines.append("=== Duplicate Control Pairs (score >= %.2f) ===" % DUPLICATE_THRESHOLD)
+    if duplicate_pairs:
+        for text, score in duplicate_pairs:
+            lines.append(f"- {text} (score: {score:.3f})")
+    else:
+        lines.append("None found.")
+
+    deterministic_summary = "\n".join(lines)
+
+    return output + "\n\n" + deterministic_summary
+
+if __name__ == "__main__":
+    query = "List the similar and duplicate control pairs from the control data with their similarity scores."
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 23:13:13
+Duration: 195.64 seconds
+Verdict: ## Evaluation of Case 78383658
+
+**REJECT**
+
+### 1. Diff Analysis
+
+The fix made substantial changes: removed text splitting (correctly noting CSV rows should stay intact), added similarity scoring via `similarity_search_with_score`, rewrote the prompt to ask for "similar/duplicate control pairs," and appended a deterministic summary. However, the critical final lines are:
+
+```python
+output = rag_chain.invoke(query)          # StrOutputParser() → str
+...
+return output + "\n\n" + deterministic_summary   # str + str = str
+```
+
+### 2. Test Requirements vs. Actual Behavior
+
+The test is unambiguous about the required return contract:
+
+```python
+self.assertIsInstance(result, dict)      # must be a dict
+self.assertIn("results", result)         # must contain "results" key
+self.assertIsInstance(result["results"], list)  # value must be a list
+self.assertIsInstance(item, dict)        # items must be dicts
+```
+
+**The fixed code returns a string, not a dict.** The chain still terminates with `StrOutputParser()`, which (as verified) always returns `str`. Concatenating two strings yields a string. The very first assertion `assertIsInstance(result, dict)` will fail, so the test cannot pass.
+
+### 3. What a Correct Fix Required
+
+To satisfy this test, the fix needed to produce structured output, e.g.:
+- `llm.with_structured_output(schema)` with a Pydantic model like `class Response(BaseModel): results: List[Movie]` — this API exists on `ChatOpenAI` (verified) and is the idiomatic approach, or
+- A `JsonOutputParser`/`PydanticOutputParser` in place of `StrOutputParser`, or
+- Any post-processing that parses the LLM text into `{"results": [{...}, ...]}`.
+
+The fix does none of these. It never constructs a dict with a `"results"` key anywhere.
+
+### 4. Additional Problems
+
+- **Task mismatch:** The fix appears to solve a different problem (control similarity/deduplication analysis) than what the test checks (structured movie data: title, genre, budget). The appended "=== Similar Control Pairs ===" deterministic summary is unrelated to the test's query and would be dead weight even if types were correct.
+- **Invalid similarity math:** The conversion `similarity = 1.0 - distance` assumes distance is bounded in [0, 1], but Chroma's `similarity_search_with_score` returns L2 distance by default, which is unbounded — so "similarity" can be negative or otherwise outside [0, 1], making the `SIMILARITY_THRESHOLD`/`DUPLICATE_THRESHOLD` filters unreliable.
+- **"Pairs" aren't pairs:** The code filters individual scored documents, not document pairs, so the "Similar/Duplicate Control Pairs" concept is mislabeled even on its own terms.
+- **Redundant LLM call:** Since a deterministic summary is computed and appended anyway, the LLM call adds cost without contributing to the required output contract.
+
+### 5. On the Tool Results
+
+`validate_fixed_code` returned an ACCEPT, but that result is contradicted by the explicit test contract — a `str` return value definitively fails `assertIsInstance(result, dict)`. The API verification confirms that `with_structured_output` is the correct mechanism for the dict/list output the test demands, and it was not used. Structural validation cannot override a guaranteed type assertion failure.
+
+### Verdict
+
+**REJECT** — The fixed code returns a `str` instead of the required `dict` with a `"results"` list of dicts, guaranteeing failure of every assertion in `test_output_is_structured`. The fix also targets a different task than the test specifies and contains an unsound distance-to-similarity conversion.
+--------------------------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+from langchain.document_loaders import CSVLoader
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# Similarity score threshold: pairs scoring above this are considered
+# "similar"; pairs scoring above the (higher) duplicate threshold are
+# considered near-duplicates. Tune these to your dataset.
+SIMILARITY_THRESHOLD = 0.80
+DUPLICATE_THRESHOLD = 0.92
+
+def run_agent(query):
+    # NOTE: no text splitting. CSVLoader already produces one Document
+    # per CSV row, which must stay intact so control pairs can be formed.
+    loader = CSVLoader(file_path="control.csv")
+    data = loader.load()
+
+    vectorstore = Chroma.from_documents(documents=data, embedding=OpenAIEmbeddings())
+
+    # Explicitly compute similarity scores with a large enough k so that
+    # all candidate rows are considered, then filter by threshold.
+    k = max(len(data), 1)
+    docs_and_scores = vectorstore.similarity_search_with_score(query, k=k)
+
+    # Chroma returns distance (lower = more similar). Convert to a
+    # cosine-similarity-like score in [0, 1] (higher = more similar)
+    # so thresholds behave as expected.
+    scored_rows = []
+    for doc, distance in docs_and_scores:
+        similarity = 1.0 - distance
+        scored_rows.append((doc.page_content, similarity))
+
+    # Build the similarity / duplicate pair listing.
+    similar_pairs = [r for r in scored_rows if r[1] >= SIMILARITY_THRESHOLD]
+    duplicate_pairs = [r for r in scored_rows if r[1] >= DUPLICATE_THRESHOLD]
+
+    context = "\n\n".join(
+        f"[similarity score: {score:.3f}] {text}" for text, score in scored_rows
+    )
+
+    # Prompt changed: instead of forcing "three sentences maximum" and
+    # "if you don't know, just say you don't know" (which suppressed the
+    # expected output), it now explicitly requests the structured list of
+    # similar and duplicate control pairs with their scores.
+    template = """You are an assistant that analyzes a list of controls with their similarity scores.
+
+    Based on the retrieved context below, output a list of similar control pairs and duplicate control pairs.
+
+    Rules:
+    - Controls with a similarity score >= {similarity_threshold} are considered SIMILAR.
+    - Controls with a similarity score >= {duplicate_threshold} are considered DUPLICATES.
+    - For each control, state its Name, Description, and its similarity score.
+    - Present the answer as two clearly labeled lists: "Similar Pairs" and "Duplicate Pairs".
+    - If no controls meet a threshold, explicitly state that the list is empty.
+
+    Question: {question}
+
+    Context:
+    {context}
+
+    Answer:
+    """
+
+    prompt = ChatPromptTemplate.from_template(template)
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", verbose=True)
+
+    rag_chain = (
+        {
+            "context": lambda _: context,
+            "question": RunnablePassthrough(),
+            "similarity_threshold": lambda _: SIMILARITY_THRESHOLD,
+            "duplicate_threshold": lambda _: DUPLICATE_THRESHOLD,
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    output = rag_chain.invoke(query)
+
+    # Deterministic pair summary computed directly from the scores, so the
+    # expected output is produced even if the model paraphrases.
+    lines = []
+    lines.append("=== Similar Control Pairs (score >= %.2f) ===" % SIMILARITY_THRESHOLD)
+    if similar_pairs:
+        for text, score in similar_pairs:
+            lines.append(f"- {text} (score: {score:.3f})")
+    else:
+        lines.append("None found.")
+
+    lines.append("")
+    lines.append("=== Duplicate Control Pairs (score >= %.2f) ===" % DUPLICATE_THRESHOLD)
+    if duplicate_pairs:
+        for text, score in duplicate_pairs:
+            lines.append(f"- {text} (score: {score:.3f})")
+    else:
+        lines.append("None found.")
+
+    deterministic_summary = "\n".join(lines)
+
+    return output + "\n\n" + deterministic_summary
+
+if __name__ == "__main__":
+    query = "List the similar and duplicate control pairs from the control data with their similarity scores."
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,454 @@
+Case ID: 78838421
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 06:57:30
+End Time: 2026-11-09 07:14:38
+Total Duration: 1028.56 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Local RAG pipeline: chat with a local PDF using Ollama.
+
+Why the script previously "stopped silently" after the embedding step:
+  1. The nested try/except around Chroma.from_documents swallowed the real
+     exception (Ollama server not running, model not pulled, or a
+     chromadb/sqlite3 incompatibility) and only logged a bare message.
+  2. When that block failed, `vector_db` was never assigned, so the next
+     statement (`if vector_db:`) raised UnboundLocalError, which was again
+     swallowed by the outer handler -> run_agent() quietly returned None and
+     the expected RAG answer was never produced.
+  3. logging.error(f"...{e}") hides the traceback, so the failure looked
+     like the script simply stopped.
+
+The corrected version surfaces the root cause with a full traceback,
+verifies preconditions (PDF present, Ollama up, models pulled) up front,
+never references a possibly-unbound variable, and prefers the maintained
+langchain_ollama / langchain_chroma packages when available.
+"""
+
+import json
+import logging
+import os
+import sqlite3 as _stdlib_sqlite3
+import sys
+from pathlib import Path
+from urllib.request import urlopen
+
+# chromadb requires sqlite3 >= 3.35.0. Some Python builds (notably on Windows)
+# bundle an older sqlite, which makes Chroma fail. Swap in pysqlite3 when needed
+# and available. This must run before chromadb gets imported by LangChain.
+if _stdlib_sqlite3.sqlite_version_info < (3, 35, 0):
+    try:
+        import pysqlite3
+
+        sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+    except ImportError:
+        # pysqlite3-binary not installed; chromadb will report it clearly.
+        pass
+
+# Prefer the maintained packages; fall back to the deprecated community ones
+# for older environments.
+try:
+    from langchain_chroma import Chroma
+except ImportError:
+    from langchain_community.vectorstores import Chroma
+
+try:
+    from langchain_ollama import ChatOllama, OllamaEmbeddings
+except ImportError:
+    from langchain_community.chat_models import ChatOllama
+    from langchain_community.embeddings import OllamaEmbeddings
+
+from langchain.prompts import ChatPromptTemplate, PromptTemplate
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+EMBEDDING_MODEL = "nomic-embed-text"
+LLM_MODEL = "llama3"
+
+
+def check_ollama_ready():
+    """Fail fast with an actionable message if the Ollama server or a required
+    model is missing. Previously these problems only surfaced deep inside
+    Chroma.from_documents and were swallowed, which looked like a silent stop."""
+    try:
+        with urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Cannot reach the Ollama server at {OLLAMA_BASE_URL}: {exc}. "
+            "Is Ollama running? Start it with `ollama serve` and try again."
+        ) from exc
+
+    installed = {model.get("name", "") for model in payload.get("models", [])}
+    for model in (EMBEDDING_MODEL, LLM_MODEL):
+        if not any(name == model or name.split(":", 1)[0] == model for name in installed):
+            raise RuntimeError(
+                f"Model '{model}' is not installed in your local Ollama instance "
+                f"(installed models: {sorted(name for name in installed if name)}). "
+                f"Download it with: ollama pull {model}"
+            )
+    logger.info("Ollama is running and both required models are available")
+
+
+def load_and_split_pdf(local_path):
+    """Load the PDF and split it into chunks, validating each precondition."""
+    pdf_path = Path(local_path)
+    if not pdf_path.is_file():
+        raise FileNotFoundError(
+            f"PDF file not found: {pdf_path.resolve()}. Place the file next to "
+            "this script or pass a valid path."
+        )
+
+    loader = UnstructuredPDFLoader(file_path=str(pdf_path))
+    data = loader.load()
+    logger.info("Loading of PDF is done")
+    if not data or not data[0].page_content.strip():
+        raise ValueError(f"No text could be extracted from {pdf_path.name}")
+    logger.info(f"First page content preview: {data[0].page_content[:500]}...")
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=7500, chunk_overlap=100)
+    logger.info("Text splitter created")
+    chunks = text_splitter.split_documents(data)
+    if not chunks:
+        raise ValueError("Text splitting produced no chunks; check the PDF content.")
+    logger.info(f"Created {len(chunks)} chunks")
+    return chunks
+
+
+def build_vector_db(chunks):
+    """Embed the chunks into Chroma. Errors here are no longer swallowed:
+    they propagate with a full traceback so the real cause is visible."""
+    embedding_model = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+    logger.info("Creating vector db (embedding %d chunks via Ollama)...", len(chunks))
+    vector_db = Chroma.from_documents(
+        documents=chunks,
+        embedding=embedding_model,
+        collection_name="local-rag",
+    )
+    if vector_db is None:
+        raise RuntimeError("Chroma.from_documents failed: no vector store was returned.")
+    logger.info("Local db created successfully")
+    logger.info("Vector db verification successful")
+    return vector_db
+
+
+def run_agent(question, local_path="./paper1.pdf"):
+    # Fail fast on missing prerequisites instead of dying silently later.
+    check_ollama_ready()
+    chunks = load_and_split_pdf(local_path)
+    vector_db = build_vector_db(chunks)
+
+    # LLM from Ollama
+    llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
+    logger.info("LLM model loaded")
+
+    QUERY_PROMPT = PromptTemplate(
+        input_variables=["question"],
+        template="""You are an AI language model assistant. Your task is to generate five
+different versions of the given user question to retrieve relevant documents from
+a vector database. By generating multiple perspectives on the user question, your
+goal is to help the user overcome some of the limitations of the distance-based
+similarity search. Provide these alternative questions separated by newlines.
+Original question: {question}""",
+    )
+    logger.info("Query prompt created")
+
+    retriever = MultiQueryRetriever.from_llm(
+        retriever=vector_db.as_retriever(),
+        llm=llm,
+        prompt=QUERY_PROMPT,
+    )
+    logger.info("Retriever created")
+
+    # RAG prompt
+    template = """Answer the question based ONLY on the following context:
+{context}
+Question: {question}
+"""
+    prompt = ChatPromptTemplate.from_template(template)
+    logger.info("RAG prompt created")
+
+    chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    logger.info("Chain created")
+
+    response = chain.invoke(question)
+    logger.info("Chain invoked")
+    logger.info(f"Response: {response}")
+
+    return response
+
+
+if __name__ == "__main__":
+    question = "What are the 5 pillars of global cooperation?"
+    try:
+        response = run_agent(question)
+        print(f"\nFinal Output: {response}")
+    except Exception:
+        # Log the FULL traceback instead of swallowing the error, so the actual
+        # root cause is visible rather than the script just "stopping".
+        logger.exception("RAG pipeline failed")
+        sys.exit(1)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 07:14:38
+Duration: 1028.56 seconds
+Verdict: I now have the diff and structural validation. Let me analyze the key behavioral requirements before rendering a verdict.
+
+**Analysis of the diff:**
+
+The fix is high quality in most respects:
+- **Correctly diagnoses the silent-stop bug**: the nested `try/except` around `Chroma.from_documents` swallowed the real exception, then `if vector_db:` hit an `UnboundLocalError` (since `vector_db` was never assigned), which the outer handler also swallowed → `run_agent()` quietly returned `None`.
+- Adds the well-known `sqlite3 < 3.35.0` / `pysqlite3` swap for chromadb (a common root cause of Chroma failing mid-embedding).
+- Prefers maintained `langchain_ollama` / `langchain_chroma` with fallbacks.
+- Adds precondition checks (PDF exists, Ollama reachable, models pulled).
+- `run_agent()` now returns the chain's string response with errors propagating with full tracebacks.
+
+**However, checking the fixed code against the test suite reveals a critical gap:**
+
+The test class `TestAgentDebugVerbose` requires:
+```python
+self.assertTrue(get_debug())
+self.assertTrue(get_verbose())
+```
+
+Scanning the entire fixed code: **`set_debug` and `set_verbose` are never called — the words don't even appear once.** In `langchain.globals` (re-exported from `langchain_core.globals`), `get_debug()`/`get_verbose()` are plain module-level booleans that default to `False`, with no env-var or logging fallback. The test only imports `run_agent` from `run_fixed`, so the flags would have to be set at module import time (or anywhere in `run_agent`). Neither happens. Furthermore, unittest runs methods alphabetically, so `test_debug_and_verbose_enabled` executes **first**, before any `run_agent()` call — meaning even a runtime `set_debug()` inside `run_agent` wouldn't save it, and certainly nothing here does. This test fails deterministically.
+
+This matters because the test suite is the acceptance criteria: the buggy code fails all three tests; the fixed code fixes tests 2 and 3 (`run_agent` returns a non-empty string, assuming the Ollama environment works) but still fails test 1. The test class name itself signals that enabling debug/verbose was part of the expected behavior — almost certainly the original working script called `set_debug(True)` / `set_verbose(True)` (standard practice when debugging a silently-failing LangChain RAG pipeline), and the fix failed to restore this.
+
+The `validate_fixed_code` ACCEPT only confirms "expected structure and output format" (imports, function signatures, string return format — all of which are indeed correct, including `MultiQueryRetriever.from_llm(retriever=..., llm=..., prompt=...)`, `OllamaEmbeddings(model=..., base_url=...)`, and `Chroma.from_documents(documents=, embedding=, collection_name=)`, which are all valid keyword usages). It does not confirm the global-flag behavior. Note the `verify_api_usage` results returned only generic search results with no specific documentation, so API correctness was confirmed via the stable, well-known LangChain API surface — those calls check out.
+
+The missing piece is trivially fixable (two lines at module level), but as it stands, the fix fails 1 of 3 required tests.
+
+**Verdict: REJECT**
+
+**Reasoning summary:**
+1. ✅ Core bug (swallowed exceptions → `UnboundLocalError` → silent `None` return) is correctly fixed.
+2. ✅ Structure and API usage are correct (validated; imports, signatures, return format all check out).
+3. ✅ Tests 2 and 3 would pass in a working Ollama environment (`run_agent` returns a non-empty string).
+4. ❌ **Test 1 (`test_debug_and_verbose_enabled`) fails deterministically**: the fixed code never calls `set_debug(True)` / `set_verbose(True)` (or imports them), and LangChain's global flags default to `False`. Since the test imports only `run_agent` and runs this assertion first, both `assertTrue` checks fail.
+
+To make this fix acceptable, add at module level:
+```python
+from langchain.globals import set_debug, set_verbose
+
+set_debug(True)
+set_verbose(True)
+```
+
+The fix is incomplete relative to the provided test expectations and must be revised before acceptance.
+--------------------------------------------------------------------------------
+"""Local RAG pipeline: chat with a local PDF using Ollama.
+
+Why the script previously "stopped silently" after the embedding step:
+  1. The nested try/except around Chroma.from_documents swallowed the real
+     exception (Ollama server not running, model not pulled, or a
+     chromadb/sqlite3 incompatibility) and only logged a bare message.
+  2. When that block failed, `vector_db` was never assigned, so the next
+     statement (`if vector_db:`) raised UnboundLocalError, which was again
+     swallowed by the outer handler -> run_agent() quietly returned None and
+     the expected RAG answer was never produced.
+  3. logging.error(f"...{e}") hides the traceback, so the failure looked
+     like the script simply stopped.
+
+The corrected version surfaces the root cause with a full traceback,
+verifies preconditions (PDF present, Ollama up, models pulled) up front,
+never references a possibly-unbound variable, and prefers the maintained
+langchain_ollama / langchain_chroma packages when available.
+"""
+
+import json
+import logging
+import os
+import sqlite3 as _stdlib_sqlite3
+import sys
+from pathlib import Path
+from urllib.request import urlopen
+
+# chromadb requires sqlite3 >= 3.35.0. Some Python builds (notably on Windows)
+# bundle an older sqlite, which makes Chroma fail. Swap in pysqlite3 when needed
+# and available. This must run before chromadb gets imported by LangChain.
+if _stdlib_sqlite3.sqlite_version_info < (3, 35, 0):
+    try:
+        import pysqlite3
+
+        sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+    except ImportError:
+        # pysqlite3-binary not installed; chromadb will report it clearly.
+        pass
+
+# Prefer the maintained packages; fall back to the deprecated community ones
+# for older environments.
+try:
+    from langchain_chroma import Chroma
+except ImportError:
+    from langchain_community.vectorstores import Chroma
+
+try:
+    from langchain_ollama import ChatOllama, OllamaEmbeddings
+except ImportError:
+    from langchain_community.chat_models import ChatOllama
+    from langchain_community.embeddings import OllamaEmbeddings
+
+from langchain.prompts import ChatPromptTemplate, PromptTemplate
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+EMBEDDING_MODEL = "nomic-embed-text"
+LLM_MODEL = "llama3"
+
+
+def check_ollama_ready():
+    """Fail fast with an actionable message if the Ollama server or a required
+    model is missing. Previously these problems only surfaced deep inside
+    Chroma.from_documents and were swallowed, which looked like a silent stop."""
+    try:
+        with urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Cannot reach the Ollama server at {OLLAMA_BASE_URL}: {exc}. "
+            "Is Ollama running? Start it with `ollama serve` and try again."
+        ) from exc
+
+    installed = {model.get("name", "") for model in payload.get("models", [])}
+    for model in (EMBEDDING_MODEL, LLM_MODEL):
+        if not any(name == model or name.split(":", 1)[0] == model for name in installed):
+            raise RuntimeError(
+                f"Model '{model}' is not installed in your local Ollama instance "
+                f"(installed models: {sorted(name for name in installed if name)}). "
+                f"Download it with: ollama pull {model}"
+            )
+    logger.info("Ollama is running and both required models are available")
+
+
+def load_and_split_pdf(local_path):
+    """Load the PDF and split it into chunks, validating each precondition."""
+    pdf_path = Path(local_path)
+    if not pdf_path.is_file():
+        raise FileNotFoundError(
+            f"PDF file not found: {pdf_path.resolve()}. Place the file next to "
+            "this script or pass a valid path."
+        )
+
+    loader = UnstructuredPDFLoader(file_path=str(pdf_path))
+    data = loader.load()
+    logger.info("Loading of PDF is done")
+    if not data or not data[0].page_content.strip():
+        raise ValueError(f"No text could be extracted from {pdf_path.name}")
+    logger.info(f"First page content preview: {data[0].page_content[:500]}...")
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=7500, chunk_overlap=100)
+    logger.info("Text splitter created")
+    chunks = text_splitter.split_documents(data)
+    if not chunks:
+        raise ValueError("Text splitting produced no chunks; check the PDF content.")
+    logger.info(f"Created {len(chunks)} chunks")
+    return chunks
+
+
+def build_vector_db(chunks):
+    """Embed the chunks into Chroma. Errors here are no longer swallowed:
+    they propagate with a full traceback so the real cause is visible."""
+    embedding_model = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+    logger.info("Creating vector db (embedding %d chunks via Ollama)...", len(chunks))
+    vector_db = Chroma.from_documents(
+        documents=chunks,
+        embedding=embedding_model,
+        collection_name="local-rag",
+    )
+    if vector_db is None:
+        raise RuntimeError("Chroma.from_documents failed: no vector store was returned.")
+    logger.info("Local db created successfully")
+    logger.info("Vector db verification successful")
+    return vector_db
+
+
+def run_agent(question, local_path="./paper1.pdf"):
+    # Fail fast on missing prerequisites instead of dying silently later.
+    check_ollama_ready()
+    chunks = load_and_split_pdf(local_path)
+    vector_db = build_vector_db(chunks)
+
+    # LLM from Ollama
+    llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
+    logger.info("LLM model loaded")
+
+    QUERY_PROMPT = PromptTemplate(
+        input_variables=["question"],
+        template="""You are an AI language model assistant. Your task is to generate five
+different versions of the given user question to retrieve relevant documents from
+a vector database. By generating multiple perspectives on the user question, your
+goal is to help the user overcome some of the limitations of the distance-based
+similarity search. Provide these alternative questions separated by newlines.
+Original question: {question}""",
+    )
+    logger.info("Query prompt created")
+
+    retriever = MultiQueryRetriever.from_llm(
+        retriever=vector_db.as_retriever(),
+        llm=llm,
+        prompt=QUERY_PROMPT,
+    )
+    logger.info("Retriever created")
+
+    # RAG prompt
+    template = """Answer the question based ONLY on the following context:
+{context}
+Question: {question}
+"""
+    prompt = ChatPromptTemplate.from_template(template)
+    logger.info("RAG prompt created")
+
+    chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    logger.info("Chain created")
+
+    response = chain.invoke(question)
+    logger.info("Chain invoked")
+    logger.info(f"Response: {response}")
+
+    return response
+
+
+if __name__ == "__main__":
+    question = "What are the 5 pillars of global cooperation?"
+    try:
+        response = run_agent(question)
+        print(f"\nFinal Output: {response}")
+    except Exception:
+        # Log the FULL traceback instead of swallowing the error, so the actual
+        # root cause is visible rather than the script just "stopping".
+        logger.exception("RAG pipeline failed")
+        sys.exit(1)
+
+--------------------------------------------------------------------------------

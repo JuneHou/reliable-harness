@@ -1,0 +1,938 @@
+Case ID: 79497660
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 18:48:55
+End Time: 2026-11-05 18:56:19
+Total Duration: 443.82 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Fix for: "How do I add custom columns to the pgvector table LlamaIndex creates?"
+
+Why the original output was wrong
+---------------------------------
+``PGVectorStore`` builds its table from a *fixed* SQLAlchemy model. The only
+columns that exist are:
+
+    id | text | metadata_ (JSON) | node_id | embedding  (+ embedding_cache with hybrid search)
+
+Every key you put in ``Document.metadata`` (e.g. ``external_id``) is serialized
+into the single ``metadata_`` JSON column. That means you cannot index, join,
+constrain or aggregate on it with plain SQL - exactly the mismatch the user hit.
+
+The fix
+-------
+Keep using ``PGVectorStore``, but make the fields you care about *first class
+columns*:
+
+1. ``CustomColumnPGVectorStore`` declares the extra columns
+   (``custom_columns = {"external_id": "VARCHAR(255)", ...}``).
+2. After LlamaIndex has created/loaded its table, the columns are added with an
+   idempotent ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` (a supporting index is
+   created too).
+3. ``add()``/``async_add()`` still delegate to LlamaIndex (so the ``metadata_``
+   blob keeps working, and metadata filters keep working), then copy the chosen
+   metadata values into the real columns keyed by ``node_id``.
+4. ``backfill_custom_columns()`` promotes values for rows that were written
+   before the columns existed.
+
+Notes / alternatives
+--------------------
+* Subclassing ``_get_data_model`` works too, but its signature changes between
+  llama-index-vector-stores-postgres releases; the ALTER-based approach below is
+  version independent and also upgrades already-existing tables.
+* The ``llama-index-pg-custom-schema`` package wraps this same idea with typed
+  columns, defaults, uniqueness and foreign keys if you prefer a library.
+* Custom columns must be populated by the application: LlamaIndex will never
+  infer them from ``metadata`` on its own.
+"""
+
+from __future__ import annotations
+
+import os
+from contextlib import closing
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote_plus
+
+import psycopg2
+from dotenv import load_dotenv
+from llama_index.core import Document, Settings, VectorStoreIndex
+from llama_index.core.schema import BaseNode
+from llama_index.vector_stores.postgres import PGVectorStore
+from pydantic import Field, PrivateAttr
+
+load_dotenv()
+
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_USER = "postgres"
+DB_PASSWORD = "password"
+TABLE_NAME = "vectorstore"
+SCHEMA_NAME = "public"
+EMBED_DIM = 1536
+
+#: column name -> PostgreSQL type. These become REAL columns on the vector table
+#: instead of only living inside the ``metadata_`` JSON blob.
+CUSTOM_COLUMNS: Dict[str, str] = {
+    "external_id": "VARCHAR(255)",
+    "source_system": "VARCHAR(64)",
+}
+
+
+def _quote_ident(identifier: str) -> str:
+    """Safely quote a SQL identifier."""
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+
+def ensure_database_exists(database: str) -> None:
+    """Make the per-tenant database exist so the demo is runnable end to end."""
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            dbname="postgres",
+        )
+    except psycopg2.OperationalError:
+        # Postgres not reachable (e.g. offline docs run) - let the store surface it.
+        return
+
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
+            if cur.fetchone() is None:
+                cur.execute(f"CREATE DATABASE {_quote_ident(database)}")
+    finally:
+        conn.close()
+
+
+class CustomColumnPGVectorStore(PGVectorStore):
+    """``PGVectorStore`` that also writes selected metadata keys into real columns."""
+
+    # NOTE: these are ordinary pydantic fields so they can be passed by callers.
+    custom_columns: Dict[str, str] = Field(default_factory=dict)
+    conn_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    _custom_columns_ready: bool = PrivateAttr(default=False)
+
+    # ------------------------------------------------------------------ setup
+    @classmethod
+    def from_connection_params(
+        cls,
+        *,
+        database: str,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        table_name: str,
+        embed_dim: int,
+        custom_columns: Optional[Dict[str, str]] = None,
+        schema_name: str = "public",
+        hnsw_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> "CustomColumnPGVectorStore":
+        """Explicit factory (mirrors ``PGVectorStore.from_params`` + custom fields)."""
+        quoted_user = quote_plus(user)
+        quoted_password = quote_plus(password)
+        return cls(
+            connection_string=(
+                f"postgresql+psycopg2://{quoted_user}:{quoted_password}"
+                f"@{host}:{port}/{database}"
+            ),
+            async_connection_string=(
+                f"postgresql+asyncpg://{quoted_user}:{quoted_password}"
+                f"@{host}:{port}/{database}"
+            ),
+            table_name=table_name,
+            embed_dim=embed_dim,
+            schema_name=schema_name or "public",
+            hnsw_kwargs=hnsw_kwargs or {},
+            custom_columns=dict(custom_columns or {}),
+            conn_kwargs={
+                "host": host,
+                "port": port,
+                "user": user,
+                "password": password,
+                "dbname": database,
+            },
+            **kwargs,
+        )
+
+    @property
+    def table_ref(self) -> str:
+        """Fully qualified, quoted table name."""
+        return f"{_quote_ident(self.schema_name or 'public')}.{_quote_ident(self.table_name)}"
+
+    def _connect(self):
+        return psycopg2.connect(**self.conn_kwargs)
+
+    def _table_exists(self, cur) -> bool:
+        cur.execute(
+            """
+            SELECT 1
+              FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s
+            """,
+            (self.schema_name or "public", self.table_name),
+        )
+        return cur.fetchone() is not None
+
+    def ensure_custom_columns(self) -> None:
+        """Add the custom columns (idempotent) once LlamaIndex' table exists."""
+        if self._custom_columns_ready or not self.custom_columns:
+            return
+        if not self.conn_kwargs:
+            return
+
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                if not self._table_exists(cur):
+                    # LlamaIndex has not created the table yet; retry on next call.
+                    return
+
+                statements: List[str] = []
+                if self.schema_name:
+                    statements.append(
+                        f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(self.schema_name)}"
+                    )
+                for column, sql_type in self.custom_columns.items():
+                    col = _quote_ident(column)
+                    statements.append(
+                        f"ALTER TABLE {self.table_ref} ADD COLUMN IF NOT EXISTS {col} {sql_type}"
+                    )
+                    index_name = _quote_ident(
+                        f"{self.table_name}_{column}_idx"[:63]
+                    )
+                    statements.append(
+                        f"CREATE INDEX IF NOT EXISTS {index_name} "
+                        f"ON {self.table_ref} ({col})"
+                    )
+
+                for statement in statements:
+                    cur.execute(statement)
+            conn.commit()
+
+        self._custom_columns_ready = True
+
+    def _initialize(self) -> None:
+        """Run LlamaIndex' normal init (creates table/model), then add our columns."""
+        super()._initialize()
+        self.ensure_custom_columns()
+
+    # ------------------------------------------------------------------ writes
+    @staticmethod
+    def _coerce(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    def _sync_custom_columns(self, nodes: Sequence[BaseNode]) -> None:
+        """Copy ``node.metadata[column]`` into the real column for each node."""
+        if not self.custom_columns or not nodes or not self.conn_kwargs:
+            return
+
+        self.ensure_custom_columns()
+
+        columns = list(self.custom_columns)
+        set_clause = ", ".join(f"{_quote_ident(c)} = %s" for c in columns)
+        statement = (
+            f"UPDATE {self.table_ref} SET {set_clause} WHERE node_id = %s"
+        )
+
+        rows: List[Tuple[Any, ...]] = []
+        for node in nodes:
+            metadata = node.metadata or {}
+            values = [self._coerce(metadata.get(column)) for column in columns]
+            if all(value is None for value in values):
+                continue
+            rows.append((*values, node.node_id))
+
+        if not rows:
+            return
+
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(statement, rows)
+            conn.commit()
+
+    def add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+        ids = super().add(nodes, **add_kwargs)
+        self._sync_custom_columns(nodes)
+        return ids
+
+    async def async_add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+        ids = await super().async_add(nodes, **add_kwargs)
+        self._sync_custom_columns(nodes)
+        return ids
+
+    # ------------------------------------------------------------------ reads
+    def backfill_custom_columns(self) -> int:
+        """Promote values for rows written before the columns existed."""
+        if not self.custom_columns or not self.conn_kwargs:
+            return 0
+        self.ensure_custom_columns()
+
+        updated = 0
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                for column in self.custom_columns:
+                    col = _quote_ident(column)
+                    cur.execute(
+                        f"""
+                        UPDATE {self.table_ref}
+                           SET {col} = metadata_ ->> %s
+                         WHERE {col} IS NULL
+                           AND metadata_ IS NOT NULL
+                           AND metadata_ ? %s
+                        """,
+                        (column, column),
+                    )
+                    updated += cur.rowcount
+            conn.commit()
+        return updated
+
+    def get_node_ids_by_column(self, column: str, value: Any) -> List[str]:
+        """Plain SQL lookup on a first-class column (impossible via metadata JSON)."""
+        if column not in self.custom_columns:
+            raise ValueError(
+                f"{column!r} is not a custom column. Known: {list(self.custom_columns)}"
+            )
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT node_id FROM {self.table_ref} "
+                    f"WHERE {_quote_ident(column)} = %s",
+                    (value,),
+                )
+                return [row[0] for row in cur.fetchall()]
+
+    def delete_by_column(self, column: str, value: Any) -> None:
+        if column not in self.custom_columns:
+            raise ValueError(
+                f"{column!r} is not a custom column. Known: {list(self.custom_columns)}"
+            )
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self.table_ref} WHERE {_quote_ident(column)} = %s",
+                    (value,),
+                )
+            conn.commit()
+
+    def describe_columns(self) -> List[Tuple[str, str]]:
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name, data_type
+                      FROM information_schema.columns
+                     WHERE table_schema = %s AND table_name = %s
+                     ORDER BY ordinal_position
+                    """,
+                    (self.schema_name or "public", self.table_name),
+                )
+                return cur.fetchall()
+
+    def fetch_rows(self, columns: Sequence[str]) -> List[Tuple[Any, ...]]:
+        projection = ", ".join(_quote_ident(c) for c in columns)
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {projection} FROM {self.table_ref} ORDER BY id")
+                return cur.fetchall()
+
+
+def create_vector_store(request) -> CustomColumnPGVectorStore:
+    """Vector store whose table has dedicated columns for our metadata fields."""
+    ensure_database_exists(request.tenant)
+
+    vector_store = CustomColumnPGVectorStore.from_connection_params(
+        database=request.tenant,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        table_name=TABLE_NAME,
+        schema_name=SCHEMA_NAME,
+        embed_dim=EMBED_DIM,
+        custom_columns=CUSTOM_COLUMNS,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+
+    # Create the table + custom columns up front so they exist before any insert.
+    vector_store._initialize()
+
+    return vector_store
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(
+            text="Sample document 1",
+            metadata={"external_id": "ext_001", "source_system": "crm"},
+        ),
+        Document(
+            text="Sample document 2",
+            metadata={"external_id": "ext_002", "source_system": "crm"},
+        ),
+    ]
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store,
+    )
+
+    return index, vector_store
+
+
+if __name__ == "__main__":
+    # Keep the demo runnable without an API key (embeddings are only needed to
+    # populate the ``embedding`` column, the custom columns are independent).
+    if not os.getenv("OPENAI_API_KEY"):
+        from llama_index.core.embeddings import MockEmbedding
+
+        Settings.embed_model = MockEmbedding(embed_dim=EMBED_DIM)
+
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index, vector_store = run_agent(request)
+
+    migrated = vector_store.backfill_custom_columns()
+
+    print("Table columns (external_id is now a real column, not only metadata JSON):")
+    for column_name, data_type in vector_store.describe_columns():
+        print(f"  - {column_name}: {data_type}")
+
+    print("\nRows:")
+    for row in vector_store.fetch_rows(
+        ["node_id", "external_id", "source_system", "metadata_"]
+    ):
+        node_id, external_id, source_system, metadata = row
+        print(
+            f"  node_id={node_id} external_id={external_id} "
+            f"source_system={source_system} metadata_={metadata}"
+        )
+
+    print("\nSQL lookup by the custom column:")
+    print("  external_id='ext_002' ->", vector_store.get_node_ids_by_column("external_id", "ext_002"))
+
+    if migrated:
+        print(f"\nBackfilled {migrated} pre-existing row(s) from metadata_.")
+
+    print("\nExpected: external_id/source_system returned by a plain SELECT on the table.")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 18:56:19
+Duration: 443.82 seconds
+Verdict: The web verification tool returned irrelevant results (it clearly failed to resolve these llama-index internals), so I'll rely on the test contract and known implementation details of `llama-index-vector-stores-postgres`, cross-checked against the test code itself — which is authoritative here.
+
+## Analysis
+
+### Structural validation
+`validate_fixed_code` returned **ACCEPT** for structure/output format. That only confirms it parses and matches the expected shape — it says nothing about runtime behavior against the test.
+
+### Critical defect #1: wrong table name — the fix targets a table that doesn't exist
+The fix builds all its SQL against `self.table_ref`:
+
+```python
+SCHEMA_NAME = "public"; TABLE_NAME = "vectorstore"
+@property
+def table_ref(self): return f'"{schema}"."{self.table_name}"'   # -> "public"."vectorstore"
+```
+
+But `PGVectorStore` never creates a table with that name. Its SQLAlchemy model is generated by `get_data_model(...)` with `__tablename__ = f"data_{base}"` — i.e. the `table_name` param gets a `data_` prefix. The test confirms this exactly:
+
+```sql
+SELECT external_id, metadata_ FROM data_vectorstore ...
+```
+with `table_name="vectorstore"`. So the real table is `data_vectorstore`.
+
+Consequences at runtime:
+1. `ensure_custom_columns()` → `_table_exists(cur)` queries `information_schema` for `table_name = 'vectorstore'` → `False` → **silently returns without creating anything** (`_custom_columns_ready` stays `False`).
+2. `_sync_custom_columns()` then calls `ensure_custom_columns()` (no-op) and executes
+   `UPDATE "public"."vectorstore" SET "external_id" = %s, ... WHERE node_id = %s`
+   → `psycopg2.errors.UndefinedTable: relation "public"."vectorstore" does not exist`.
+3. This is raised from inside `add()` (and `async_add()`), i.e. from `VectorStoreIndex.from_documents(...)`, so `run_agent()` itself raises. Both tests fail in `setUp`/call phase before any assertion.
+4. Even ignoring the crash, the `external_id` column would never exist on `data_vectorstore` → `UndefinedColumn: column "external_id" does not exist` in both tests.
+
+Note the docstring even lists the correct LlamaIndex columns (`id | text | metadata_ | node_id | embedding`) — the author knew the model but forgot the `data_` tablename prefix. Ironic, since the fix's own preamble criticizes that `_get_data_model` is version-dependent, then hardcodes a name that's wrong for the current one.
+
+### Critical defect #2: metadata is never cleaned, so `assertNotIn("external_id", metadata)` must fail
+Even if the table name were fixed, `_sync_custom_columns` only *copies* values out of `node.metadata`:
+
+```python
+values = [self._coerce(metadata.get(column)) for column in columns]
+```
+
+It never removes the key, and the docstring explicitly states it intends to keep `metadata_` intact ("the `metadata_` blob keeps working"). The test requires:
+
+```python
+for external_id, metadata in rows:
+    self.assertIsNotNone(external_id)
+    self.assertNotIn("external_id", metadata)   # metadata_ must NOT contain it
+```
+
+Nothing in the fix strips `external_id`/`source_system` from metadata before `super().add(nodes)`, so `metadata_` still holds `{"external_id": "ext_001", ...}` → failure regardless of table naming.
+
+### Additional problems
+- **`_initialize` lifecycle is shaky.** `from_connection_params` → `cls(...)` invokes `PGVectorStore.__init__`, which already initializes; `create_vector_store` then calls `vector_store._initialize()` a second time. Additionally, `_initialize` is a private, version-sensitive name (in several releases table/schema creation happens directly in `__init__` / `_create_tables_if_not_exists`), so `super()._initialize()` can raise `AttributeError` on some releases — the exact fragility the fix claims to avoid.
+- **Test path may lack an embedding model.** `Settings.embed_model = MockEmbedding(...)` is set only under `if __name__ == "__main__"`. The test imports `run_agent` and calls it directly, so `VectorStoreIndex.from_documents` uses the default OpenAI embedding and needs `OPENAI_API_KEY` — an avoidable failure mode.
+- **Different writing/reading layers.** Rows are inserted through LlamaIndex's async SQLAlchemy session but patched with a *separate* psycopg2 connection in a second transaction; if the first transaction isn't yet visible/committed, the `UPDATE ... WHERE node_id = ...` can match zero rows silently — a fragile design vs. extending the data model's columns directly.
+- **API contract change.** `run_agent` now returns `(index, vector_store)` instead of `index`; harmless for this test but a divergence from the original signature.
+- `delete_by_column`/`get_node_ids_by_column` are unreachable-useful because `custom_columns` never gets set up (blocked by defect #1).
+
+### Why not acceptable as "partial credit"
+The fix's *approach* (dedicated columns for `external_id`) is directionally right, but it does not actually produce the behavior the tests assert: no `external_id` column is created on `data_vectorstore`, and metadata still contains `external_id`. Both tests fail deterministically.
+
+## Verdict
+
+**REJECT**
+
+Reasoning summary:
+1. The custom-column DDL/DML is wired to `"public"."vectorstore"`, while `PGVectorStore` actually creates `data_vectorstore`; `ensure_custom_columns()` therefore silently skips, and `_sync_custom_columns()` then throws `UndefinedTable` out of `run_agent`.
+2. `external_id` metadata key is never removed, so `assertNotIn("external_id", metadata)` fails even in the hypothetical corrected-table case.
+3. Secondary risks: double/`@private` `_initialize()` call (version-fragile), embedding model only mocked in `__main__` (test path needs `OPENAI_API_KEY`), and cross-connection copy logic that can silently update zero rows.
+
+A correct fix would extend the table's data model (or use `table_name=f"data_{...}"` / derive it from the store's actual table) **and** pop the promoted keys from `node.metadata` before delegating to `add()`, so the rows land in `data_vectorstore.external_id` with clean `metadata_`.
+--------------------------------------------------------------------------------
+"""Fix for: "How do I add custom columns to the pgvector table LlamaIndex creates?"
+
+Why the original output was wrong
+---------------------------------
+``PGVectorStore`` builds its table from a *fixed* SQLAlchemy model. The only
+columns that exist are:
+
+    id | text | metadata_ (JSON) | node_id | embedding  (+ embedding_cache with hybrid search)
+
+Every key you put in ``Document.metadata`` (e.g. ``external_id``) is serialized
+into the single ``metadata_`` JSON column. That means you cannot index, join,
+constrain or aggregate on it with plain SQL - exactly the mismatch the user hit.
+
+The fix
+-------
+Keep using ``PGVectorStore``, but make the fields you care about *first class
+columns*:
+
+1. ``CustomColumnPGVectorStore`` declares the extra columns
+   (``custom_columns = {"external_id": "VARCHAR(255)", ...}``).
+2. After LlamaIndex has created/loaded its table, the columns are added with an
+   idempotent ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` (a supporting index is
+   created too).
+3. ``add()``/``async_add()`` still delegate to LlamaIndex (so the ``metadata_``
+   blob keeps working, and metadata filters keep working), then copy the chosen
+   metadata values into the real columns keyed by ``node_id``.
+4. ``backfill_custom_columns()`` promotes values for rows that were written
+   before the columns existed.
+
+Notes / alternatives
+--------------------
+* Subclassing ``_get_data_model`` works too, but its signature changes between
+  llama-index-vector-stores-postgres releases; the ALTER-based approach below is
+  version independent and also upgrades already-existing tables.
+* The ``llama-index-pg-custom-schema`` package wraps this same idea with typed
+  columns, defaults, uniqueness and foreign keys if you prefer a library.
+* Custom columns must be populated by the application: LlamaIndex will never
+  infer them from ``metadata`` on its own.
+"""
+
+from __future__ import annotations
+
+import os
+from contextlib import closing
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote_plus
+
+import psycopg2
+from dotenv import load_dotenv
+from llama_index.core import Document, Settings, VectorStoreIndex
+from llama_index.core.schema import BaseNode
+from llama_index.vector_stores.postgres import PGVectorStore
+from pydantic import Field, PrivateAttr
+
+load_dotenv()
+
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_USER = "postgres"
+DB_PASSWORD = "password"
+TABLE_NAME = "vectorstore"
+SCHEMA_NAME = "public"
+EMBED_DIM = 1536
+
+#: column name -> PostgreSQL type. These become REAL columns on the vector table
+#: instead of only living inside the ``metadata_`` JSON blob.
+CUSTOM_COLUMNS: Dict[str, str] = {
+    "external_id": "VARCHAR(255)",
+    "source_system": "VARCHAR(64)",
+}
+
+
+def _quote_ident(identifier: str) -> str:
+    """Safely quote a SQL identifier."""
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+
+def ensure_database_exists(database: str) -> None:
+    """Make the per-tenant database exist so the demo is runnable end to end."""
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            dbname="postgres",
+        )
+    except psycopg2.OperationalError:
+        # Postgres not reachable (e.g. offline docs run) - let the store surface it.
+        return
+
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
+            if cur.fetchone() is None:
+                cur.execute(f"CREATE DATABASE {_quote_ident(database)}")
+    finally:
+        conn.close()
+
+
+class CustomColumnPGVectorStore(PGVectorStore):
+    """``PGVectorStore`` that also writes selected metadata keys into real columns."""
+
+    # NOTE: these are ordinary pydantic fields so they can be passed by callers.
+    custom_columns: Dict[str, str] = Field(default_factory=dict)
+    conn_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    _custom_columns_ready: bool = PrivateAttr(default=False)
+
+    # ------------------------------------------------------------------ setup
+    @classmethod
+    def from_connection_params(
+        cls,
+        *,
+        database: str,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        table_name: str,
+        embed_dim: int,
+        custom_columns: Optional[Dict[str, str]] = None,
+        schema_name: str = "public",
+        hnsw_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> "CustomColumnPGVectorStore":
+        """Explicit factory (mirrors ``PGVectorStore.from_params`` + custom fields)."""
+        quoted_user = quote_plus(user)
+        quoted_password = quote_plus(password)
+        return cls(
+            connection_string=(
+                f"postgresql+psycopg2://{quoted_user}:{quoted_password}"
+                f"@{host}:{port}/{database}"
+            ),
+            async_connection_string=(
+                f"postgresql+asyncpg://{quoted_user}:{quoted_password}"
+                f"@{host}:{port}/{database}"
+            ),
+            table_name=table_name,
+            embed_dim=embed_dim,
+            schema_name=schema_name or "public",
+            hnsw_kwargs=hnsw_kwargs or {},
+            custom_columns=dict(custom_columns or {}),
+            conn_kwargs={
+                "host": host,
+                "port": port,
+                "user": user,
+                "password": password,
+                "dbname": database,
+            },
+            **kwargs,
+        )
+
+    @property
+    def table_ref(self) -> str:
+        """Fully qualified, quoted table name."""
+        return f"{_quote_ident(self.schema_name or 'public')}.{_quote_ident(self.table_name)}"
+
+    def _connect(self):
+        return psycopg2.connect(**self.conn_kwargs)
+
+    def _table_exists(self, cur) -> bool:
+        cur.execute(
+            """
+            SELECT 1
+              FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s
+            """,
+            (self.schema_name or "public", self.table_name),
+        )
+        return cur.fetchone() is not None
+
+    def ensure_custom_columns(self) -> None:
+        """Add the custom columns (idempotent) once LlamaIndex' table exists."""
+        if self._custom_columns_ready or not self.custom_columns:
+            return
+        if not self.conn_kwargs:
+            return
+
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                if not self._table_exists(cur):
+                    # LlamaIndex has not created the table yet; retry on next call.
+                    return
+
+                statements: List[str] = []
+                if self.schema_name:
+                    statements.append(
+                        f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(self.schema_name)}"
+                    )
+                for column, sql_type in self.custom_columns.items():
+                    col = _quote_ident(column)
+                    statements.append(
+                        f"ALTER TABLE {self.table_ref} ADD COLUMN IF NOT EXISTS {col} {sql_type}"
+                    )
+                    index_name = _quote_ident(
+                        f"{self.table_name}_{column}_idx"[:63]
+                    )
+                    statements.append(
+                        f"CREATE INDEX IF NOT EXISTS {index_name} "
+                        f"ON {self.table_ref} ({col})"
+                    )
+
+                for statement in statements:
+                    cur.execute(statement)
+            conn.commit()
+
+        self._custom_columns_ready = True
+
+    def _initialize(self) -> None:
+        """Run LlamaIndex' normal init (creates table/model), then add our columns."""
+        super()._initialize()
+        self.ensure_custom_columns()
+
+    # ------------------------------------------------------------------ writes
+    @staticmethod
+    def _coerce(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    def _sync_custom_columns(self, nodes: Sequence[BaseNode]) -> None:
+        """Copy ``node.metadata[column]`` into the real column for each node."""
+        if not self.custom_columns or not nodes or not self.conn_kwargs:
+            return
+
+        self.ensure_custom_columns()
+
+        columns = list(self.custom_columns)
+        set_clause = ", ".join(f"{_quote_ident(c)} = %s" for c in columns)
+        statement = (
+            f"UPDATE {self.table_ref} SET {set_clause} WHERE node_id = %s"
+        )
+
+        rows: List[Tuple[Any, ...]] = []
+        for node in nodes:
+            metadata = node.metadata or {}
+            values = [self._coerce(metadata.get(column)) for column in columns]
+            if all(value is None for value in values):
+                continue
+            rows.append((*values, node.node_id))
+
+        if not rows:
+            return
+
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(statement, rows)
+            conn.commit()
+
+    def add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+        ids = super().add(nodes, **add_kwargs)
+        self._sync_custom_columns(nodes)
+        return ids
+
+    async def async_add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+        ids = await super().async_add(nodes, **add_kwargs)
+        self._sync_custom_columns(nodes)
+        return ids
+
+    # ------------------------------------------------------------------ reads
+    def backfill_custom_columns(self) -> int:
+        """Promote values for rows written before the columns existed."""
+        if not self.custom_columns or not self.conn_kwargs:
+            return 0
+        self.ensure_custom_columns()
+
+        updated = 0
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                for column in self.custom_columns:
+                    col = _quote_ident(column)
+                    cur.execute(
+                        f"""
+                        UPDATE {self.table_ref}
+                           SET {col} = metadata_ ->> %s
+                         WHERE {col} IS NULL
+                           AND metadata_ IS NOT NULL
+                           AND metadata_ ? %s
+                        """,
+                        (column, column),
+                    )
+                    updated += cur.rowcount
+            conn.commit()
+        return updated
+
+    def get_node_ids_by_column(self, column: str, value: Any) -> List[str]:
+        """Plain SQL lookup on a first-class column (impossible via metadata JSON)."""
+        if column not in self.custom_columns:
+            raise ValueError(
+                f"{column!r} is not a custom column. Known: {list(self.custom_columns)}"
+            )
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT node_id FROM {self.table_ref} "
+                    f"WHERE {_quote_ident(column)} = %s",
+                    (value,),
+                )
+                return [row[0] for row in cur.fetchall()]
+
+    def delete_by_column(self, column: str, value: Any) -> None:
+        if column not in self.custom_columns:
+            raise ValueError(
+                f"{column!r} is not a custom column. Known: {list(self.custom_columns)}"
+            )
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self.table_ref} WHERE {_quote_ident(column)} = %s",
+                    (value,),
+                )
+            conn.commit()
+
+    def describe_columns(self) -> List[Tuple[str, str]]:
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name, data_type
+                      FROM information_schema.columns
+                     WHERE table_schema = %s AND table_name = %s
+                     ORDER BY ordinal_position
+                    """,
+                    (self.schema_name or "public", self.table_name),
+                )
+                return cur.fetchall()
+
+    def fetch_rows(self, columns: Sequence[str]) -> List[Tuple[Any, ...]]:
+        projection = ", ".join(_quote_ident(c) for c in columns)
+        with closing(self._connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {projection} FROM {self.table_ref} ORDER BY id")
+                return cur.fetchall()
+
+
+def create_vector_store(request) -> CustomColumnPGVectorStore:
+    """Vector store whose table has dedicated columns for our metadata fields."""
+    ensure_database_exists(request.tenant)
+
+    vector_store = CustomColumnPGVectorStore.from_connection_params(
+        database=request.tenant,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        table_name=TABLE_NAME,
+        schema_name=SCHEMA_NAME,
+        embed_dim=EMBED_DIM,
+        custom_columns=CUSTOM_COLUMNS,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+
+    # Create the table + custom columns up front so they exist before any insert.
+    vector_store._initialize()
+
+    return vector_store
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(
+            text="Sample document 1",
+            metadata={"external_id": "ext_001", "source_system": "crm"},
+        ),
+        Document(
+            text="Sample document 2",
+            metadata={"external_id": "ext_002", "source_system": "crm"},
+        ),
+    ]
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store,
+    )
+
+    return index, vector_store
+
+
+if __name__ == "__main__":
+    # Keep the demo runnable without an API key (embeddings are only needed to
+    # populate the ``embedding`` column, the custom columns are independent).
+    if not os.getenv("OPENAI_API_KEY"):
+        from llama_index.core.embeddings import MockEmbedding
+
+        Settings.embed_model = MockEmbedding(embed_dim=EMBED_DIM)
+
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index, vector_store = run_agent(request)
+
+    migrated = vector_store.backfill_custom_columns()
+
+    print("Table columns (external_id is now a real column, not only metadata JSON):")
+    for column_name, data_type in vector_store.describe_columns():
+        print(f"  - {column_name}: {data_type}")
+
+    print("\nRows:")
+    for row in vector_store.fetch_rows(
+        ["node_id", "external_id", "source_system", "metadata_"]
+    ):
+        node_id, external_id, source_system, metadata = row
+        print(
+            f"  node_id={node_id} external_id={external_id} "
+            f"source_system={source_system} metadata_={metadata}"
+        )
+
+    print("\nSQL lookup by the custom column:")
+    print("  external_id='ext_002' ->", vector_store.get_node_ids_by_column("external_id", "ext_002"))
+
+    if migrated:
+        print(f"\nBackfilled {migrated} pre-existing row(s) from metadata_.")
+
+    print("\nExpected: external_id/source_system returned by a plain SELECT on the table.")
+
+--------------------------------------------------------------------------------

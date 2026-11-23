@@ -1,0 +1,409 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 06:25:27
+End Time: 2026-11-05 06:34:44
+Total Duration: 557.61 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import numpy as np
+from dotenv import load_dotenv
+
+try:
+    from langchain_community.document_loaders import CSVLoader
+except ImportError:
+    from langchain.document_loaders import CSVLoader
+
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# Similarity score thresholds (cosine similarity in [0, 1]).
+# A pair is "similar" if its score is >= SIMILARITY_THRESHOLD and
+# a "duplicate" if its score is >= DUPLICATE_THRESHOLD.
+SIMILARITY_THRESHOLD = 0.80
+DUPLICATE_THRESHOLD = 0.95
+
+CSV_PATH = "control.csv"
+
+
+def get_field(document, field, default=""):
+    """Extract a single column value from a CSVLoader document.
+
+    CSVLoader renders each CSV row as 'Column: value' lines in page_content.
+    """
+    for line in document.page_content.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            if field.lower() in key.strip().lower():
+                return value.strip()
+    return default
+
+
+def find_similar_and_duplicate_pairs(
+    documents,
+    embeddings,
+    similarity_threshold=SIMILARITY_THRESHOLD,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+):
+    """Compare every control with every other control using whole-record
+    embeddings and bucket the pairs by similarity score thresholds.
+
+    Unlike a k-limited retriever (which only returns a few fragments and
+    applies no score threshold), this guarantees that every pair whose
+    similarity clears the configured thresholds is found.
+    """
+    texts = [doc.page_content for doc in documents]
+    vectors = np.array(embeddings.embed_documents(texts), dtype=float)
+
+    # Normalize the embedding vectors so the dot product is cosine similarity.
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    vectors = vectors / norms
+    similarity_matrix = vectors @ vectors.T
+
+    similar_pairs = []
+    duplicate_pairs = []
+    for i in range(len(documents)):
+        for j in range(i + 1, len(documents)):
+            score = float(similarity_matrix[i, j])
+            if score >= duplicate_threshold:
+                duplicate_pairs.append((i, j, score))
+            elif score >= similarity_threshold:
+                similar_pairs.append((i, j, score))
+
+    # Most similar first.
+    similar_pairs.sort(key=lambda pair: pair[2], reverse=True)
+    duplicate_pairs.sort(key=lambda pair: pair[2], reverse=True)
+    return similar_pairs, duplicate_pairs
+
+
+def format_pairs(documents, pairs):
+    """Render the detected pairs (Name + Description + score) as context text."""
+    if not pairs:
+        return "None found."
+    lines = []
+    for i, j, score in pairs:
+        name_a = get_field(documents[i], "Name", default=f"Row {i}")
+        name_b = get_field(documents[j], "Name", default=f"Row {j}")
+        desc_a = get_field(documents[i], "Description", default=documents[i].page_content)
+        desc_b = get_field(documents[j], "Description", default=documents[j].page_content)
+        lines.append(
+            f"- '{name_a}' <-> '{name_b}' (similarity score: {score:.3f})\n"
+            f"    '{name_a}': {desc_a}\n"
+            f"    '{name_b}': {desc_b}"
+        )
+    return "\n".join(lines)
+
+
+def run_agent(
+    query,
+    similarity_threshold=SIMILARITY_THRESHOLD,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+):
+    # Keep ONE document per CSV row. Do NOT split the rows: chunking would
+    # fragment individual control records and make per-control comparison
+    # (which is what this task needs) impossible.
+    loader = CSVLoader(file_path=CSV_PATH)
+    documents = loader.load()
+
+    if len(documents) < 2:
+        return "Not enough rows in the CSV file to compare controls."
+
+    # Deterministically compute all similar/duplicate pairs with scores.
+    embeddings = OpenAIEmbeddings()
+    similar_pairs, duplicate_pairs = find_similar_and_duplicate_pairs(
+        documents,
+        embeddings,
+        similarity_threshold=similarity_threshold,
+        duplicate_threshold=duplicate_threshold,
+    )
+
+    context = (
+        f"SIMILAR CONTROL PAIRS (similarity score >= {similarity_threshold:.2f} "
+        f"and < {duplicate_threshold:.2f}):\n"
+        f"{format_pairs(documents, similar_pairs)}\n\n"
+        f"DUPLICATE CONTROL PAIRS (similarity score >= {duplicate_threshold:.2f}):\n"
+        f"{format_pairs(documents, duplicate_pairs)}"
+    )
+
+    # Explicit prompt that demands the exact output format the user expects:
+    # a list of similar and duplicate control pairs with similarity scores.
+    template = """You are an assistant that analyzes control records stored in a CSV file.
+
+    Your task is to report the similar and duplicate controls.
+
+    You are given control pairs that were detected with semantic similarity
+    scores (cosine similarity between 0 and 1, where 1 means identical).
+
+    Answer the question using ONLY the pairs listed in the context below.
+    Do not invent controls or pairs that are not present in the context.
+
+    Return your answer in EXACTLY this format:
+
+    Similar Control Pairs:
+    1. Control "<Name A>" - Control "<Name B>" (similarity score: <score>)
+    2. Control "<Name A>" - Control "<Name B>" (similarity score: <score>)
+
+    Duplicate Control Pairs:
+    1. Control "<Name A>" - Control "<Name B>" (similarity score: <score>)
+    2. Control "<Name A>" - Control "<Name B>" (similarity score: <score>)
+
+    If a category contains no pairs, write "None found." for that category.
+
+    Question: {question}
+
+    Context:
+    {context}
+
+    Answer:
+    """
+
+    prompt = ChatPromptTemplate.from_template(template)
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+
+    # The context is precomputed and threshold-filtered (not pulled from a
+    # k-limited retriever), so the model receives every pair that clears the
+    # similarity thresholds and can format them into the expected list.
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"question": query, "context": context})
+
+
+if __name__ == "__main__":
+    query = "List the similar and duplicate controls, combining their Name and Description."
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 06:34:44
+Duration: 557.61 seconds
+Verdict: **Analysis complete.** Now let me cross-check the critical issue: the test's expectations vs. what the fixed code actually returns.
+
+**Test expectations (case 78383658):**
+```python
+self.assertIsInstance(result, dict)        # run_agent must return a dict
+self.assertIn("results", result)           # with a "results" key
+self.assertIsInstance(result["results"], list)  # that's a list
+self.assertIsInstance(item, dict)          # of dicts
+```
+
+**What the fixed code returns:**
+```python
+chain = prompt | llm | StrOutputParser()
+return chain.invoke({"question": query, "context": context})
+```
+
+Per the verified LangChain documentation, `StrOutputParser.parse()` "expects a string as input and then returns this string unchanged." So `run_agent` returns a **plain string** — the exact same return type as the buggy code.
+
+---
+
+## Decision: REJECT
+
+**Detailed reasoning:**
+
+1. **Return type mismatch (fatal).** The test's very first assertion is `self.assertIsInstance(result, dict)`. The fixed code terminates its chain with `StrOutputParser()`, which passes the LLM's string output through unchanged. `result` will be a `str`, so `assertIsInstance(result, dict)` raises `AssertionError` immediately. Nothing in the fixed code produces structured output — there is no `with_structured_output()`, no Pydantic schema, no `JsonOutputParser`, and no manual `json.loads(...)` conversion anywhere. Even if the LLM happened to emit a JSON string, `StrOutputParser` would still return it as a `str`, not a parsed `dict`.
+
+2. **Missing `"results"` structure.** Even setting aside the type, the required shape — a top-level `"results"` key containing a list of per-item dicts (e.g., title/genre/budget fields for the movie query) — is never constructed or requested. The prompt instead demands a free-text, line-numbered report format ("Similar Control Pairs: 1. Control ... (similarity score: ...)"), which is the opposite of the structured dict-of-list-of-dicts contract the test enforces.
+
+3. **Semantic/task mismatch.** The test queries `"Find movies for family. Return only the title, genre and budget."`, but the rewritten code is entirely oriented around detecting similar/duplicate *control* pairs: it precomputes a cosine-similarity matrix with numpy, formats pair listings, and instructs the model to answer "using ONLY the pairs listed in the context." Given that query, the model would receive control-pair context and a control-pair answer template — it cannot produce movie title/genre/budget results. This is a rewrite that solves a different problem than the one the test exercises.
+
+4. **What a correct fix would look like.** To satisfy this test, the chain should use a structured-output mechanism, e.g.:
+   ```python
+   from pydantic import BaseModel
+   class MovieItem(BaseModel):
+       title: str
+       genre: str
+       budget: str
+   class MovieResults(BaseModel):
+       results: list[MovieItem]
+
+   chain = prompt | llm.with_structured_output(MovieResults)
+   ```
+   The fixed code contains nothing of this nature.
+
+5. **What the fix did get right (but insufficient).** The import hygiene (`langchain_community` fallback for `CSVLoader`, `OpenAIEmbeddings` from `langchain_openai`) and `embed_documents()` usage are API-correct — the numpy pairwise-cosine code is technically sound. And removing the row-splitting `CharacterTextSplitter` is a defensible design choice. But none of that addresses the contract the test checks.
+
+6. **Note on tooling.** `validate_fixed_code` returned "ACCEPT," but this conflicts with both the verified `StrOutputParser` semantics (returns string unchanged) and a direct read of the test. The first assertion in the test cannot pass with this implementation, so the validation result appears to be a superficial check rather than a behavioral one. API verification and the test code itself are the more reliable evidence here.
+
+**Verdict: REJECT** — the fixed code still returns an unstructured string from `StrOutputParser`, failing `assertIsInstance(result, dict)` on the first line of the test, and its rewritten control-pair-analysis pipeline does not address the movie-query task the test exercises.
+--------------------------------------------------------------------------------
+import numpy as np
+from dotenv import load_dotenv
+
+try:
+    from langchain_community.document_loaders import CSVLoader
+except ImportError:
+    from langchain.document_loaders import CSVLoader
+
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# Similarity score thresholds (cosine similarity in [0, 1]).
+# A pair is "similar" if its score is >= SIMILARITY_THRESHOLD and
+# a "duplicate" if its score is >= DUPLICATE_THRESHOLD.
+SIMILARITY_THRESHOLD = 0.80
+DUPLICATE_THRESHOLD = 0.95
+
+CSV_PATH = "control.csv"
+
+
+def get_field(document, field, default=""):
+    """Extract a single column value from a CSVLoader document.
+
+    CSVLoader renders each CSV row as 'Column: value' lines in page_content.
+    """
+    for line in document.page_content.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            if field.lower() in key.strip().lower():
+                return value.strip()
+    return default
+
+
+def find_similar_and_duplicate_pairs(
+    documents,
+    embeddings,
+    similarity_threshold=SIMILARITY_THRESHOLD,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+):
+    """Compare every control with every other control using whole-record
+    embeddings and bucket the pairs by similarity score thresholds.
+
+    Unlike a k-limited retriever (which only returns a few fragments and
+    applies no score threshold), this guarantees that every pair whose
+    similarity clears the configured thresholds is found.
+    """
+    texts = [doc.page_content for doc in documents]
+    vectors = np.array(embeddings.embed_documents(texts), dtype=float)
+
+    # Normalize the embedding vectors so the dot product is cosine similarity.
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    vectors = vectors / norms
+    similarity_matrix = vectors @ vectors.T
+
+    similar_pairs = []
+    duplicate_pairs = []
+    for i in range(len(documents)):
+        for j in range(i + 1, len(documents)):
+            score = float(similarity_matrix[i, j])
+            if score >= duplicate_threshold:
+                duplicate_pairs.append((i, j, score))
+            elif score >= similarity_threshold:
+                similar_pairs.append((i, j, score))
+
+    # Most similar first.
+    similar_pairs.sort(key=lambda pair: pair[2], reverse=True)
+    duplicate_pairs.sort(key=lambda pair: pair[2], reverse=True)
+    return similar_pairs, duplicate_pairs
+
+
+def format_pairs(documents, pairs):
+    """Render the detected pairs (Name + Description + score) as context text."""
+    if not pairs:
+        return "None found."
+    lines = []
+    for i, j, score in pairs:
+        name_a = get_field(documents[i], "Name", default=f"Row {i}")
+        name_b = get_field(documents[j], "Name", default=f"Row {j}")
+        desc_a = get_field(documents[i], "Description", default=documents[i].page_content)
+        desc_b = get_field(documents[j], "Description", default=documents[j].page_content)
+        lines.append(
+            f"- '{name_a}' <-> '{name_b}' (similarity score: {score:.3f})\n"
+            f"    '{name_a}': {desc_a}\n"
+            f"    '{name_b}': {desc_b}"
+        )
+    return "\n".join(lines)
+
+
+def run_agent(
+    query,
+    similarity_threshold=SIMILARITY_THRESHOLD,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+):
+    # Keep ONE document per CSV row. Do NOT split the rows: chunking would
+    # fragment individual control records and make per-control comparison
+    # (which is what this task needs) impossible.
+    loader = CSVLoader(file_path=CSV_PATH)
+    documents = loader.load()
+
+    if len(documents) < 2:
+        return "Not enough rows in the CSV file to compare controls."
+
+    # Deterministically compute all similar/duplicate pairs with scores.
+    embeddings = OpenAIEmbeddings()
+    similar_pairs, duplicate_pairs = find_similar_and_duplicate_pairs(
+        documents,
+        embeddings,
+        similarity_threshold=similarity_threshold,
+        duplicate_threshold=duplicate_threshold,
+    )
+
+    context = (
+        f"SIMILAR CONTROL PAIRS (similarity score >= {similarity_threshold:.2f} "
+        f"and < {duplicate_threshold:.2f}):\n"
+        f"{format_pairs(documents, similar_pairs)}\n\n"
+        f"DUPLICATE CONTROL PAIRS (similarity score >= {duplicate_threshold:.2f}):\n"
+        f"{format_pairs(documents, duplicate_pairs)}"
+    )
+
+    # Explicit prompt that demands the exact output format the user expects:
+    # a list of similar and duplicate control pairs with similarity scores.
+    template = """You are an assistant that analyzes control records stored in a CSV file.
+
+    Your task is to report the similar and duplicate controls.
+
+    You are given control pairs that were detected with semantic similarity
+    scores (cosine similarity between 0 and 1, where 1 means identical).
+
+    Answer the question using ONLY the pairs listed in the context below.
+    Do not invent controls or pairs that are not present in the context.
+
+    Return your answer in EXACTLY this format:
+
+    Similar Control Pairs:
+    1. Control "<Name A>" - Control "<Name B>" (similarity score: <score>)
+    2. Control "<Name A>" - Control "<Name B>" (similarity score: <score>)
+
+    Duplicate Control Pairs:
+    1. Control "<Name A>" - Control "<Name B>" (similarity score: <score>)
+    2. Control "<Name A>" - Control "<Name B>" (similarity score: <score>)
+
+    If a category contains no pairs, write "None found." for that category.
+
+    Question: {question}
+
+    Context:
+    {context}
+
+    Answer:
+    """
+
+    prompt = ChatPromptTemplate.from_template(template)
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+
+    # The context is precomputed and threshold-filtered (not pulled from a
+    # k-limited retriever), so the model receives every pair that clears the
+    # similarity thresholds and can format them into the expected list.
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"question": query, "context": context})
+
+
+if __name__ == "__main__":
+    query = "List the similar and duplicate controls, combining their Name and Description."
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------

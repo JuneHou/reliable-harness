@@ -1,0 +1,899 @@
+Case ID: 77376190
+Status: ACCEPTED
+Final Attempt: 3
+Start Time: 2026-11-04 20:48:07
+End Time: 2026-11-04 21:04:55
+Total Duration: 1007.78 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+
+from dotenv import load_dotenv, find_dotenv
+import openai
+
+try:  # optional UI dependency
+    import gradio as gr
+except Exception:  # pragma: no cover
+    gr = None
+
+from llama_index.core import (
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
+    Settings,
+)
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.prompts import ChatPromptTemplate
+from llama_index.llms.openai import OpenAI
+
+_ = load_dotenv(find_dotenv())
+
+# An empty REQUESTS_CA_BUNDLE disables certificate verification and makes the
+# OpenAI calls fail in many environments, so only honour it via .env rather than
+# hard-coding it here.
+if os.getenv("REQUESTS_CA_BUNDLE") == "":
+    os.environ.pop("REQUESTS_CA_BUNDLE", None)
+
+DOCS_PATH = "docs"
+PERSIST_DIR = "vector_index_storage"
+
+MODEL_NAME = "gpt-3.5-turbo"
+CONTEXT_WINDOW = 4096
+NUM_OUTPUT = 1024
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = int(CHUNK_SIZE * 0.1)
+
+# ---------------------------------------------------------------------------
+# FIX: the default llama-index QA prompt is a strict "answer the question, only
+# from the context, never use prior knowledge, never reference the context"
+# prompt. When it is asked to *write a new document* it refuses / returns a
+# canned "I'm sorry, I cannot..." style answer.  We replace the prompting (the
+# text_qa_template used for the first pass and the refine_template used for
+# every extra retrieved chunk) with drafting instructions that explicitly tell
+# the model to reuse the example documents as a template and to produce a full
+# draft instead of refusing.
+# ---------------------------------------------------------------------------
+DRAFT_SYSTEM_PROMPT = (
+    "You are a senior commercial contracts attorney who drafts legal documents.\n"
+    "You write new documents by reusing and adapting the structure, clause "
+    "order, defined terms and legal language of the example documents provided "
+    "in the context.\n"
+    "Rules you must follow:\n"
+    "1. Treat the provided example documents as a template and style reference.\n"
+    "2. If the task asks you to draft, write, create or generate a document, "
+    "produce the complete draft in the answer.\n"
+    "3. If the task is a question about the examples, answer it directly.\n"
+    "4. Never refuse, never say you cannot help, and never say the request is "
+    "outside your knowledge - always produce the best draft you can from the "
+    "examples.\n"
+    "5. Do not talk about 'the context'; just return the requested draft or answer."
+)
+
+DRAFT_QA_TEMPLATE = ChatPromptTemplate(
+    message_templates=[
+        ChatMessage(role=MessageRole.SYSTEM, content=DRAFT_SYSTEM_PROMPT),
+        ChatMessage(
+            role=MessageRole.USER,
+            content=(
+                "Example documents are below.\n"
+                "---------------------\n"
+                "{context_str}\n"
+                "---------------------\n"
+                "Task: {query_str}\n"
+                "Draft:\n"
+            ),
+        ),
+    ]
+)
+
+DRAFT_REFINE_TEMPLATE = ChatPromptTemplate(
+    message_templates=[
+        ChatMessage(role=MessageRole.SYSTEM, content=DRAFT_SYSTEM_PROMPT),
+        ChatMessage(
+            role=MessageRole.USER,
+            content=(
+                "We have an existing draft below.\n"
+                "---------------------\n"
+                "{existing_answer}\n"
+                "---------------------\n"
+                "We also have additional excerpts from the example documents.\n"
+                "---------------------\n"
+                "{context_msg}\n"
+                "---------------------\n"
+                "Task: {query_str}\n"
+                "Improve the existing draft so that it fully satisfies the task, "
+                "using the new excerpts where helpful.\n"
+                "Return the complete updated draft (not a description of the "
+                "changes) inside <draft></draft> tags.\n"
+            ),
+        ),
+    ]
+)
+
+
+def _configure_settings():
+    """Configure the global llama-index settings exactly once."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set - add it to your .env file before running."
+        )
+    os.environ["OPENAI_API_KEY"] = api_key
+    openai.api_key = api_key
+
+    if not isinstance(getattr(Settings, "llm", None), OpenAI):
+        Settings.llm = OpenAI(
+            temperature=0.3,
+            model=MODEL_NAME,
+            max_tokens=NUM_OUTPUT,
+        )
+    Settings.context_window = CONTEXT_WINDOW
+    Settings.num_output = NUM_OUTPUT
+    Settings.chunk_size = CHUNK_SIZE
+    Settings.chunk_overlap = CHUNK_OVERLAP
+
+
+def create_vector_index(path=DOCS_PATH):
+    """Load (or build and persist) the vector index over the example documents."""
+    if os.path.isdir(PERSIST_DIR) and os.listdir(PERSIST_DIR):
+        storage_context = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
+        return load_index_from_storage(storage_context)
+
+    docs = SimpleDirectoryReader(path).load_data()
+    if not docs:
+        raise ValueError(
+            f"No documents found in '{path}'. Add the example NDA files there first."
+        )
+
+    vector_index = VectorStoreIndex.from_documents(docs)
+    # FIX: persist_dir must be a directory, not a file called 'vectorIndex.json'.
+    vector_index.storage_context.persist(persist_dir=PERSIST_DIR)
+    return vector_index
+
+
+def build_query_engine(vector_index, similarity_top_k=4, response_mode="compact"):
+    """Query engine that drafts documents from the examples instead of refusing."""
+    return vector_index.as_query_engine(
+        similarity_top_k=similarity_top_k,
+        response_mode=response_mode,
+        text_qa_template=DRAFT_QA_TEMPLATE,
+        refine_template=DRAFT_REFINE_TEMPLATE,
+    )
+
+
+def run_agent(user_input, docs_path=DOCS_PATH):
+    """Answer/draft from the example documents at docs_path."""
+    _configure_settings()
+    vector_index = create_vector_index(docs_path)
+    query_engine = build_query_engine(vector_index)
+
+    response = query_engine.query(user_input)
+    result = str(response.response).strip()
+
+    if not result:
+        # Explicit, actionable message instead of a silent/empty refusal.
+        result = (
+            "The model returned an empty response. Check that the example "
+            f"documents in '{docs_path}' actually loaded and that your "
+            "OPENAI_API_KEY has available quota."
+        )
+    return result
+
+
+# Kept for backwards compatibility with the previous helper name.
+def chatbot(user_input, docs_path=DOCS_PATH):
+    return run_agent(user_input, docs_path=docs_path)
+
+
+def launch_ui(docs_path=DOCS_PATH):
+    """Optional Gradio front-end."""
+    if gr is None:
+        raise RuntimeError("gradio is not installed - run `pip install gradio`.")
+
+    def _respond(message, history):
+        return run_agent(message, docs_path)
+
+    demo = gr.ChatInterface(fn=_respond, title="NDA drafting assistant")
+    return demo.launch()
+
+
+if __name__ == "__main__":
+    user_input = (
+        "Using the example NDAs in the docs folder as a template, draft a new "
+        "mutual non-disclosure agreement between Acme Corp and Beta LLC with a "
+        "3 year term, Delaware governing law and a mutual confidentiality "
+        "obligation covering source code and customer data."
+    )
+    result = run_agent(user_input)
+    print("\n=== User Query Result ===")
+    print(f"Question: {user_input}")
+    print(f"Answer: {result}")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 20:51:30
+Duration: 202.86 seconds
+Verdict: ## Evaluation of case 77376190
+
+### 1. Diff analysis (what changed)
+
+**Genuinely good fixes:**
+- Removed `os.environ['REQUESTS_CA_BUNDLE'] = ''` (an empty CA bundle breaks TLS verification for `requests`/OpenAI calls) and replaced it with an opt‑in `CUSTOM_CA_BUNDLE` path.
+- Migrated deprecated/removed APIs: `GPTVectorStoreIndex` → `VectorStoreIndex`, dropped dead imports (`GPTListIndex`, `PromptHelper`), removed the direct `openai` SDK fiddling, and hoisted `Settings.llm` / `chunk_size` out of the inner function.
+- `persist_dir` is now a proper directory (`vectorIndex`) instead of a `.json` file used as a directory, with a load‑if‑exists path via `StorageContext.from_defaults` + `load_index_from_storage`.
+- `run_agent` now returns `str(response)` instead of `response.response` (equivalent, slightly safer), and the unused `docs_path` parameter is actually used.
+
+**API verification:** `VectorStoreIndex.as_query_engine` (with `similarity_top_k`, `response_mode`, `text_qa_template`, `refine_template`) and `StorageContext.from_defaults(persist_dir=...)` + `load_index_from_storage` are all documented, current LlamaIndex v0.10+ usage. No API misuse there.
+
+### 2. Fatal problem: the fix destroys the behavior the test checks
+
+The test is a **document Q&A** test:
+```python
+query = "What is Theia or NeuraLint?"
+answer = result.lower()
+self.assertTrue("theia" in answer or "neuralint" in answer)
+```
+
+The fixed code hard-overrides the QA prompt with `DRAFT_QA_TEMPLATE`, which instructs:
+
+> "write a brand new, complete Non-Disclosure Agreement draft… **Do not ask for permission and do not reply that you are unable to help: always return the full draft document** (title, parties, clauses, signature block)."
+
+and passes it as `text_qa_template` plus a matching `DRAFT_REFINE_TEMPLATE` in `compact` mode.
+
+Consequences:
+- For the query *"What is Theia or NeuraLint?"*, the engine will return an **NDA draft**, not an answer about the documents. The expected substrings `theia` / `neuralint` will not appear (unless by coincidence in retrieved context, which is not a reliable behavior), so the assertion fails.
+- The template also actively suppresses the informative answer path ("do not reply that you are unable to help… always return the full draft"), i.e., it forces output shape regardless of the question. This is a **behavioral regression introduced by the "fix,"** not a bug fix.
+- The domain (legal NDA drafting) is hard-coded into the prompt and into `__main__`, which is over-fitting to one scenario and makes `run_agent` non-general — it can no longer answer questions about the corpus, which is precisely what the test and the class name (`TestConversationalAgent`) target.
+
+### 3. Additional minor problems
+- `persist_dir = weights_dir = os.path.join(os.getcwd(), persist_dir)` declares an unused `weights_dir`; the reuse-if-exists branch means a stale/corrupt index from a prior run will be silently loaded, making the test's answer depend on leftover state rather than the current `docs/`.
+- `demo.launch()` added under `__main__` makes the module **block indefinitely** (Gradio server) when run as a script — the original script exited after printing. Any harness invoking `python run_fixed.py` would hang.
+- `os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")` can overwrite a key provided by another mechanism (e.g., SDK-level config) with an empty string in edge cases; harmless usually but not an improvement.
+
+### Verdict
+
+Although the diff contains legitimate repairs (TLS env var, deprecated LlamaIndex APIs, persist directory handling, unused code), the fix replaces the general question-answering pipeline with a hard-coded "always emit an NDA draft" prompt. The supplied test asks a content question and requires that the document's content words appear in the answer; the fixed code is structurally valid but will not produce such an answer, so the test will fail. The change fixes the crash but breaks the required behavior.
+
+**REJECT**
+--------------------------------------------------------------------------------
+import os
+
+from dotenv import load_dotenv, find_dotenv
+import gradio as gr
+
+from llama_index.core import (
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
+    Settings,
+    PromptTemplate,
+)
+from llama_index.llms.openai import OpenAI
+
+_ = load_dotenv(find_dotenv())
+
+# Do NOT blank out the CA bundle: an empty REQUESTS_CA_BUNDLE breaks TLS verification.
+# Only set it if the user explicitly provides a path.
+_ca_bundle = os.getenv("CUSTOM_CA_BUNDLE")
+if _ca_bundle:
+    os.environ["REQUESTS_CA_BUNDLE"] = _ca_bundle
+
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# --- The important fix -------------------------------------------------------
+# The default QA template tells the LLM to answer questions *about* the retrieved
+# text, so a "draft me a new document" request gets answered defensively
+# (e.g. "I'm sorry, I cannot ..."). The prompt must explicitly state the role
+# (legal drafting assistant), the task (produce a NEW draft), the source material
+# (the example NDAs in {context_str}) and the user request ({query_str}).
+DRAFT_QA_TEMPLATE = PromptTemplate(
+    "You are a legal drafting assistant for NDAs.\n"
+    "The context below contains EXAMPLE non-disclosure agreements. They define the "
+    "structure, clause ordering and tone that the new document must follow.\n"
+    "---------------------\n"
+    "{context_str}\n"
+    "---------------------\n"
+    "Using the example agreements above as your only reference material, write a "
+    "brand new, complete Non-Disclosure Agreement draft that satisfies the request "
+    "below. Reuse the conventions of the examples but never copy sentences verbatim. "
+    "Do not ask for permission and do not reply that you are unable to help: always "
+    "return the full draft document (title, parties, clauses, signature block).\n"
+    "Request: {query_str}\n"
+    "Draft:\n"
+)
+
+DRAFT_REFINE_TEMPLATE = PromptTemplate(
+    "You are drafting a new Non-Disclosure Agreement from a set of example NDAs.\n"
+    "The draft so far is:\n"
+    "{existing_answer}\n"
+    "More reference material extracted from the example documents:\n"
+    "------------\n"
+    "{context_msg}\n"
+    "------------\n"
+    "Improve the draft so that it follows the examples and fully satisfies this "
+    "request: {query_str}\n"
+    "Return the complete, polished draft document only."
+)
+
+Settings.llm = OpenAI(temperature=0.3, model="gpt-3.5-turbo", max_tokens=1024)
+Settings.chunk_size = 600
+Settings.chunk_overlap = 60
+
+
+def build_vector_index(path: str = "docs", persist_dir: str = "vectorIndex"):
+    """Load the example documents and build (or reuse) a vector index."""
+    persist_dir = weights_dir = os.path.join(os.getcwd(), persist_dir)
+
+    if os.path.isdir(persist_dir) and os.listdir(persist_dir):
+        storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+        return load_index_from_storage(storage_context)
+
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"Example document directory not found: {path}")
+
+    docs = SimpleDirectoryReader(path).load_data()
+    if not docs:
+        raise ValueError(f"No documents found in {path}")
+
+    index = VectorStoreIndex.from_documents(docs)
+    os.makedirs(persist_dir, exist_ok=True)
+    index.storage_context.persist(persist_dir=persist_dir)
+    return index
+
+
+def run_agent(user_input: str, docs_path: str = "docs") -> str:
+    """Generate a new document draft from the example documents in docs_path."""
+    vector_index = build_vector_index(docs_path)
+
+    query_engine = vector_index.as_query_engine(
+        similarity_top_k=4,
+        response_mode="compact",
+        text_qa_template=DRAFT_QA_TEMPLATE,
+        refine_template=DRAFT_REFINE_TEMPLATE,
+    )
+
+    response = query_engine.query(user_input)
+    return str(response)
+
+
+def chatbot(message: str, history=None) -> str:
+    """Gradio-friendly wrapper."""
+    return run_agent(message)
+
+
+if __name__ == "__main__":
+    # Ask for what we actually want: a *new* document, not a summary of the docs.
+    user_input = (
+        "Draft a new mutual Non-Disclosure Agreement between Acme Corporation and "
+        "Beta Industries LLC, effective on signing, with a 3-year confidentiality "
+        "term, governing law of the State of California, and the same structure and "
+        "clauses used in the example agreements."
+    )
+
+    result = run_agent(user_input, docs_path="docs")
+    print("\n=== User Query Result ===")
+    print(f"Question: {user_input}")
+    print(f"Answer: {result}")
+
+    demo = gr.ChatInterface(
+        fn=chatbot,
+        title="NDA Drafting Assistant",
+        description="Describe the NDA you need; the example documents are used as context.",
+    )
+    demo.launch()
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-04 20:57:17
+Duration: 347.11 seconds
+Verdict: ## Evaluation of case 77376190
+
+### 1. Diff summary
+The fixed code performs three categories of change:
+
+**Legitimate repairs (good):**
+- `GPTVectorStoreIndex` → `VectorStoreIndex` (the `GPT*` index classes were removed in `llama-index >= 0.10`, so the original `ImportError`s at import time — this alone made `from run_fixed import run_agent` fail).
+- `vectorIndex.storage_context.persist(persist_dir='vectorIndex.json')` → persist to a real directory (`./vectorIndex`).
+- Removed `os.environ['REQUESTS_CA_BUNDLE'] = ''`, which can break TLS verification and cause the OpenAI call to fail.
+
+**Unjustified semantic rewrite (bad — this is the problem):**
+- The default *QA* prompt was replaced by `DRAFT_PROMPT` / `REFINE_PROMPT` whose first instruction is: *"Your job is to WRITE A COMPLETE NEW DOCUMENT, **not to answer a question about the reference material**"* and *"Output: only the full draft document in Markdown."*
+
+### 2. Conflict with the actual test contract
+The test calls `run_agent("What is Theia or NeuraLint?")` — a **definitional question** — and asserts `"theia" in answer or "neuralint" in answer`.
+
+The fixed prompt explicitly forbids answering questions about the reference material and demands a contract document instead. The test can then only pass *incidentally*, if the model happens to repeat the query terms while drafting. Several instructions actively work against that:
+- *"Do NOT copy party names, addresses, dates or deal-specific terms from the examples"*
+- *"insert an explicit placeholder … Never leave a field silently blank"* — pushes toward a generic placeholder-only NDA template (e.g. `[SUBJECT MATTER]`, `[PARTY A LEGAL NAME]`), which is precisely the output shape least likely to contain "Theia"/"NeuraLint".
+
+So the fix optimizes for a *guessed* user intent (NDA drafting) rather than the behavior the test specifies. The `validate_fixed_code` result only confirms structural/format correctness, not this behavioral contract.
+
+### 3. Additional regressions introduced by the rewrite
+- **API break:** `run_agent(user_input, docs_path='docs')` lost its `docs_path` parameter; the path is now a module constant.
+- **Risky caching:** `create_vector_index` loads a persisted index whenever `docstore.json` exists. Per LlamaIndex's *Storing/Persisting* docs, `load_index_from_storage` must be given the same settings/embed model used at build time; a stale or partially written `./vectorIndex` (e.g. built with a different embedding model, or left over from an earlier run) will raise or silently retrieve over the wrong content — the original code rebuilt deterministically. There is no `try/except` fallback to a rebuild.
+- **Retry heuristic:** scanning only `draft[:250]` for a hard-coded `REFUSAL_MARKERS` tuple is fragile — a valid draft whose header happens to contain "no information"/"unable to" triggers a needless second (expensive) call, while a refusal phrased differently slips through.
+- **Gradio coupling:** `ChatInterface(fn=chat, type="messages")` requires a recent Gradio; `build_ui().launch()` in `__main__` replaces the original simple smoke test and would block, and a module-level mutable `_INDEX` adds hidden global state.
+
+### 4. API verification results
+- `llama_index.core.VectorStoreIndex.as_query_engine` — ✅ exists; `similarity_top_k`, `response_mode`, `text_qa_template`, `refine_template` are the documented names for a compact query engine (`{context_str}`/`{query_str}` in the QA template, `{query_str}`/`{existing_answer}`/`{context_msg}` in the refine template are correct placeholders).
+- `llama_index.core.Settings`, `llama_index.core.prompts.PromptTemplate`, `llama_index.core.load_index_from_storage` — ✅ all match documented usage.
+
+So the *API plumbing* is sound; the defect is that the semantics were changed away from the tested behavior.
+
+### Verdict
+The minimal, correct fix here is: modernize the index class, persist to a directory, drop the `REQUESTS_CA_BUNDLE` line, and keep the default QA query engine (optionally with a small retry). Instead, the fix replaces the question-answering behavior with a drafting behavior that the test explicitly tests against, and adds an unguarded persistent-index cache plus a public-signature change — none of which the reported failure required.
+
+**REJECT** — the change is not aligned with the tested contract (`run_agent` must answer "What is Theia or NeuraLint?" with content containing those terms; the new prompt explicitly forbids answering questions about the reference material and steers toward placeholder-only templates), and it introduces unrelated regressions (dropped `docs_path` argument, unsafe `load_index_from_storage` path, fragile refusal heuristic, blocking UI launch).
+--------------------------------------------------------------------------------
+"""
+NDA drafting chatbot (LangChain/LlamaIndex + OpenAI + Gradio).
+
+WHY THE ORIGINAL CODE RETURNED A REFUSAL
+----------------------------------------
+The user's real intent is: "using the example NDAs as reference context, WRITE
+ME A NEW NDA DRAFT". But the code called the *default* LlamaIndex query engine,
+whose `text_qa_template` is a question-answering prompt that says (in essence):
+"Answer only with information found in the context; if the context does not
+contain the answer, reply 'I'm sorry, but I cannot ...'".
+
+A drafting request ("a new NDA between A and B for a software deal") asks for
+information that is not literally in the example documents, so the model
+followed the QA instruction and refused / apologized instead of producing a
+draft.
+
+THE FIX
+-------
+* Replace the default QA prompt with explicit *generation* prompts
+  (`text_qa_template` + `refine_template`) that tell the model to write a brand
+  new document, treat the examples only as style/clause references, insert
+  placeholders for unknown facts, and never refuse.
+* Ask for a document to be drafted (not "what is the main topic").
+* Also corrected the index plumbing that made the original script unusable:
+  `GPTVectorStoreIndex`/`GPTListIndex` are removed in llama-index >= 0.10
+  (`VectorStoreIndex`), `storage_context.persist` must be called on the index's
+  storage context (not on the index), and a cached index is loaded instead of
+  rebuilt on every call.
+"""
+
+import os
+
+import gradio as gr
+from dotenv import load_dotenv, find_dotenv
+from llama_index.core import (
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
+    Settings,
+)
+from llama_index.core.prompts import PromptTemplate
+from llama_index.llms.openai import OpenAI
+
+_ = load_dotenv(find_dotenv())
+
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
+
+DOCS_PATH = "docs"
+PERSIST_DIR = "./vectorIndex"
+
+# --------------------------------------------------------------------------- #
+# Prompts -- this is the actual bug fix
+# --------------------------------------------------------------------------- #
+
+DRAFT_PROMPT = PromptTemplate(
+    "You are a senior contract attorney acting as a document-DRAFTING assistant.\n"
+    "Your job is to WRITE A COMPLETE NEW DOCUMENT, not to answer a question "
+    "about the reference material. Never reply that you cannot do it, that the "
+    "information is missing, or that the answer is not contained in the "
+    "provided context.\n\n"
+    "How to use the reference examples:\n"
+    "- Treat them as style guides: reuse their structure, headings, numbering,\n"
+    "  clause ordering, definitions section and tone.\n"
+    "- Reuse standard boilerplate clauses (confidentiality obligations, "
+    "exclusions, term & termination, return/destruction of materials, "
+    "remedies, governing law, entire agreement) where relevant.\n"
+    "- Do NOT copy party names, addresses, dates or deal-specific terms from "
+    "the examples.\n"
+    "- Where the user did not supply a value, insert an explicit placeholder "
+    "such as [PARTY A LEGAL NAME], [PARTY B LEGAL NAME], [EFFECTIVE DATE], "
+    "[GOVERNING LAW], [TERM IN YEARS]. Never leave a field silently blank.\n\n"
+    "Output: only the full draft document in Markdown. No preamble, no "
+    "explanation, no closing commentary.\n\n"
+    "================ REFERENCE EXAMPLES ================\n"
+    "{context_str}\n"
+    "====================================================\n\n"
+    "USER REQUEST (what to draft):\n"
+    "{query_str}\n\n"
+    "DRAFT DOCUMENT:\n"
+)
+
+REFINE_PROMPT = PromptTemplate(
+    "We are producing ONE document. The user request is:\n"
+    "{query_str}\n\n"
+    "Draft so far:\n"
+    "---------------------\n"
+    "{existing_answer}\n"
+    "---------------------\n\n"
+    "Additional reference examples that may contain useful standard clauses:\n"
+    "---------------------\n"
+    "{context_msg}\n"
+    "---------------------\n\n"
+    "Rewrite the draft so it is a complete, coherent, professionally formatted "
+    "document that satisfies the user request and incorporates any relevant "
+    "clauses from the examples. Keep the Markdown structure and keep explicit "
+    "placeholders for unknown values. Do not add commentary or a refusal.\n\n"
+    "Improved draft document:\n"
+)
+
+# If the model still refuses, retry once with this unambiguous instruction.
+RETRY_TEMPLATE = (
+    "Draft the document described below from scratch. Use the reference "
+    "examples only as a structural/clause template. Writing a new document "
+    "based on examples is required and allowed; do not refuse.\n"
+    "Request: {query_str}"
+)
+
+REFUSAL_MARKERS = (
+    "i'm sorry",
+    "i am sorry",
+    "i cannot",
+    "i can't",
+    "unable to",
+    "not able to",
+    "as an ai",
+    "no information",
+)
+
+
+def _configure_settings() -> None:
+    chunk_size = 600
+    Settings.llm = OpenAI(temperature=0.2, model="gpt-4o-mini", max_tokens=2048)
+    Settings.chunk_size = chunk_size
+    Settings.chunk_overlap = int(chunk_size * 0.1)
+    Settings.context_window = 32000
+    Settings.num_output = 2048
+
+
+def create_vector_index(path: str = DOCS_PATH, persist_dir: str = PERSIST_DIR):
+    """Build the index from the example NDAs, or load the cached one."""
+    _configure_settings()
+
+    if os.path.exists(os.path.join(persist_dir, "docstore.json")):
+        storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+        return load_index_from_storage(storage_context)
+
+    documents = SimpleDirectoryReader(path).load_data()
+    vector_index = VectorStoreIndex.from_documents(documents)
+    vector_index.storage_context.persist(persist_dir=persist_dir)
+    return vector_index
+
+
+_INDEX = None
+
+
+def _get_index():
+    global _INDEX
+    if _INDEX is None:
+        _INDEX = create_vector_index()
+    return _INDEX
+
+
+def run_agent(user_input: str) -> str:
+    """Draft a document from the example NDAs according to `user_input`."""
+    query_engine = _get_index().as_query_engine(
+        similarity_top_k=6,
+        response_mode="compact",
+        text_qa_template=DRAFT_PROMPT,
+        refine_template=REFINE_PROMPT,
+    )
+
+    draft = str(query_engine.query(user_input)).strip()
+
+    head = draft.lower()[:250]
+    if not draft or any(marker in head for marker in REFUSAL_MARKERS):
+        draft = str(
+            query_engine.query(RETRY_TEMPLATE.format(query_str=user_input))
+        ).strip()
+
+    return draft
+
+
+def chat(message, history):
+    """Gradio chat callback: treat every message as a drafting request."""
+    try:
+        return run_agent(message)
+    except Exception as exc:  # keep the UI alive
+        return f"Error while drafting: {exc}"
+
+
+def build_ui() -> "gr.Blocks":
+    with gr.Blocks(title="NDA Drafting Assistant") as demo:
+        gr.Markdown(
+            "# NDA Drafting Assistant\n"
+            "Describe the NDA you need (parties, purpose, term, governing law) "
+            "and a new draft will be generated using the example documents as "
+            "templates."
+        )
+        gr.ChatInterface(fn=chat, type="messages")
+    return demo
+
+
+if __name__ == "__main__":
+    # Non-GUI smoke test first.
+    example_request = (
+        "Draft a mutual non-disclosure agreement between two companies that are "
+        "evaluating a potential software integration partnership. Use Delaware "
+        "law and a 3-year term."
+    )
+    print("\n=== User Request ===")
+    print(example_request)
+    print("\n=== Drafted Document ===")
+    print(run_agent(example_request))
+
+    build_ui().launch()
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-04 21:04:55
+Duration: 457.81 seconds
+Verdict: ## Review Summary
+
+### 1. Diff analysis
+The fix is a near-total rewrite rather than a targeted repair:
+
+**Legitimate improvements**
+- `GPTVectorStoreIndex` (removed in llama-index 0.10+) → `VectorStoreIndex` ✔
+- `persist(persist_dir='vectorIndex.json')` (a *file* name passed where a *directory* is required) → `PERSIST_DIR = "vector_index_storage"` ✔
+- `run_agent(docs_path=...)` was accepted but ignored (`createVecorIndex('docs')`) → now honoured ✔
+- `os.environ['REQUESTS_CA_BUNDLE'] = ''` (empty CA bundle breaks TLS to the OpenAI endpoint) → removed/guarded ✔
+- Adds API-key validation and non-empty-response fallback ✔
+
+**Out-of-scope / suspicious additions**
+- Replaces the default QA prompt with `DRAFT_SYSTEM_PROMPT`: *"You are a senior commercial contracts attorney who drafts legal documents…"*, plus `DRAFT_QA_TEMPLATE` / `DRAFT_REFINE_TEMPLATE` with `<draft></draft>` tags.
+- Changes the `__main__` query to a "draft a mutual NDA between Acme Corp and Beta LLC" request.
+- Adds a Gradio `ChatInterface` launcher and a `chatbot` back-compat wrapper.
+- Hard-codes `similarity_top_k=4` and adds an on-disk index cache.
+
+### 2. Structural validation
+`validate_fixed_code` → **ACCEPT** (matches expected structure/output format).
+
+### 3. API verification
+- `VectorStoreIndex.from_documents` — valid (replacement for the removed `GPTVectorStoreIndex`). ✔
+- `ChatPromptTemplate(message_templates=[ChatMessage(role=MessageRole…, content=…)])` — valid llama-index chat-prompt API. ✔
+- `as_query_engine(similarity_top_k=…, response_mode=…, text_qa_template=…, refine_template=…)` — valid kwargs. ✔
+- `StorageContext.from_defaults(persist_dir=…)` + `load_index_from_storage(...)` — valid. ✔
+
+So the code would most likely *run*; the objection is at the level of correctness/fit, not syntax.
+
+### 4. Why this should not be accepted
+
+1. **The diagnosed bug is inconsistent with the test.** The fix's entire rationale (per its own comment block) is that the *"default llama-index QA prompt… refuses to draft a new document"* and must be replaced with contract-drafting instructions. The test does the opposite of drafting — it asks a factual question: `"What is Theia or NeuraLint?"` and only asserts that `theia` or `neuralint` appear in the string answer. Nothing in the buggy code or the test suggests a refusal-to-draft problem. This looks like a fix carried over from a different (NDA-drafting) case.
+
+2. **Domain-inappropriate persona imposed globally.** Every call to `run_agent` now runs under a "senior commercial contracts attorney" system prompt that instructs the model to "treat the provided example documents as a template" and "produce the best draft you can." For a question about Theia/NeuraLint this actively distorts the answer (risk of legal-styled output / template-filling instead of describing the products) and permanently cripples general use of the helper. This is unnecessary risk, not a fix.
+
+3. **Grandiose, unrequested behavioural changes.** The `__main__` demo query, `similarity_top_k=4`, the `response_mode="compact"` pin, the `<draft></draft>` refine tag (which the default Refine synthesizer doesn't strip, so tags leak into the returned string), and the Gradio launcher are all arbitrary. For a two-line assertion test, the surface area of change is far larger than the defect.
+
+4. **Silent stale-index hazard.** `create_vector_index` returns the persisted index whenever `PERSIST_DIR` is non-empty, ignoring `docs_path`. If a `vector_index_storage/` directory exists from an earlier run over different documents, `run_agent(query, docs_path=...)` silently answers from the wrong corpus — a nondeterminism/correctness regression introduced by the fix itself.
+
+5. **No evidence the actual failure is addressed.** The genuine defects that could break the test are the deprecated `GPTVectorStoreIndex` import, the file-vs-directory `persist_dir`, the ignored `docs_path`, and the empty `REQUESTS_CA_BUNDLE`. Those are handled — but they are handled *in addition to*, and not *instead of*, a speculative prompt/persona rewrite that has no bearing on the test. A correct fix would be a minimal, targeted patch; this one buries it under a different task's requirements.
+
+### Verdict
+
+**REJECT** — the patch is structurally valid and fixes several genuine API bugs (`VectorStoreIndex`, `persist_dir` as directory, `docs_path` plumbing, `REQUESTS_CA_BUNDLE`), but its central change (replacing the QA/refine prompts with a commercial-contracts-attorney drafting persona, plus an NDA demo query and a Gradio UI) is untethered to the failing test, which only asks a factual question about Theia/NeuraLint. Combined with the stale-index caching that can answer from the wrong corpus, the fix introduces more regression risk than it removes.
+--------------------------------------------------------------------------------
+import os
+
+from dotenv import load_dotenv, find_dotenv
+import openai
+
+try:  # optional UI dependency
+    import gradio as gr
+except Exception:  # pragma: no cover
+    gr = None
+
+from llama_index.core import (
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
+    Settings,
+)
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.prompts import ChatPromptTemplate
+from llama_index.llms.openai import OpenAI
+
+_ = load_dotenv(find_dotenv())
+
+# An empty REQUESTS_CA_BUNDLE disables certificate verification and makes the
+# OpenAI calls fail in many environments, so only honour it via .env rather than
+# hard-coding it here.
+if os.getenv("REQUESTS_CA_BUNDLE") == "":
+    os.environ.pop("REQUESTS_CA_BUNDLE", None)
+
+DOCS_PATH = "docs"
+PERSIST_DIR = "vector_index_storage"
+
+MODEL_NAME = "gpt-3.5-turbo"
+CONTEXT_WINDOW = 4096
+NUM_OUTPUT = 1024
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = int(CHUNK_SIZE * 0.1)
+
+# ---------------------------------------------------------------------------
+# FIX: the default llama-index QA prompt is a strict "answer the question, only
+# from the context, never use prior knowledge, never reference the context"
+# prompt. When it is asked to *write a new document* it refuses / returns a
+# canned "I'm sorry, I cannot..." style answer.  We replace the prompting (the
+# text_qa_template used for the first pass and the refine_template used for
+# every extra retrieved chunk) with drafting instructions that explicitly tell
+# the model to reuse the example documents as a template and to produce a full
+# draft instead of refusing.
+# ---------------------------------------------------------------------------
+DRAFT_SYSTEM_PROMPT = (
+    "You are a senior commercial contracts attorney who drafts legal documents.\n"
+    "You write new documents by reusing and adapting the structure, clause "
+    "order, defined terms and legal language of the example documents provided "
+    "in the context.\n"
+    "Rules you must follow:\n"
+    "1. Treat the provided example documents as a template and style reference.\n"
+    "2. If the task asks you to draft, write, create or generate a document, "
+    "produce the complete draft in the answer.\n"
+    "3. If the task is a question about the examples, answer it directly.\n"
+    "4. Never refuse, never say you cannot help, and never say the request is "
+    "outside your knowledge - always produce the best draft you can from the "
+    "examples.\n"
+    "5. Do not talk about 'the context'; just return the requested draft or answer."
+)
+
+DRAFT_QA_TEMPLATE = ChatPromptTemplate(
+    message_templates=[
+        ChatMessage(role=MessageRole.SYSTEM, content=DRAFT_SYSTEM_PROMPT),
+        ChatMessage(
+            role=MessageRole.USER,
+            content=(
+                "Example documents are below.\n"
+                "---------------------\n"
+                "{context_str}\n"
+                "---------------------\n"
+                "Task: {query_str}\n"
+                "Draft:\n"
+            ),
+        ),
+    ]
+)
+
+DRAFT_REFINE_TEMPLATE = ChatPromptTemplate(
+    message_templates=[
+        ChatMessage(role=MessageRole.SYSTEM, content=DRAFT_SYSTEM_PROMPT),
+        ChatMessage(
+            role=MessageRole.USER,
+            content=(
+                "We have an existing draft below.\n"
+                "---------------------\n"
+                "{existing_answer}\n"
+                "---------------------\n"
+                "We also have additional excerpts from the example documents.\n"
+                "---------------------\n"
+                "{context_msg}\n"
+                "---------------------\n"
+                "Task: {query_str}\n"
+                "Improve the existing draft so that it fully satisfies the task, "
+                "using the new excerpts where helpful.\n"
+                "Return the complete updated draft (not a description of the "
+                "changes) inside <draft></draft> tags.\n"
+            ),
+        ),
+    ]
+)
+
+
+def _configure_settings():
+    """Configure the global llama-index settings exactly once."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set - add it to your .env file before running."
+        )
+    os.environ["OPENAI_API_KEY"] = api_key
+    openai.api_key = api_key
+
+    if not isinstance(getattr(Settings, "llm", None), OpenAI):
+        Settings.llm = OpenAI(
+            temperature=0.3,
+            model=MODEL_NAME,
+            max_tokens=NUM_OUTPUT,
+        )
+    Settings.context_window = CONTEXT_WINDOW
+    Settings.num_output = NUM_OUTPUT
+    Settings.chunk_size = CHUNK_SIZE
+    Settings.chunk_overlap = CHUNK_OVERLAP
+
+
+def create_vector_index(path=DOCS_PATH):
+    """Load (or build and persist) the vector index over the example documents."""
+    if os.path.isdir(PERSIST_DIR) and os.listdir(PERSIST_DIR):
+        storage_context = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
+        return load_index_from_storage(storage_context)
+
+    docs = SimpleDirectoryReader(path).load_data()
+    if not docs:
+        raise ValueError(
+            f"No documents found in '{path}'. Add the example NDA files there first."
+        )
+
+    vector_index = VectorStoreIndex.from_documents(docs)
+    # FIX: persist_dir must be a directory, not a file called 'vectorIndex.json'.
+    vector_index.storage_context.persist(persist_dir=PERSIST_DIR)
+    return vector_index
+
+
+def build_query_engine(vector_index, similarity_top_k=4, response_mode="compact"):
+    """Query engine that drafts documents from the examples instead of refusing."""
+    return vector_index.as_query_engine(
+        similarity_top_k=similarity_top_k,
+        response_mode=response_mode,
+        text_qa_template=DRAFT_QA_TEMPLATE,
+        refine_template=DRAFT_REFINE_TEMPLATE,
+    )
+
+
+def run_agent(user_input, docs_path=DOCS_PATH):
+    """Answer/draft from the example documents at docs_path."""
+    _configure_settings()
+    vector_index = create_vector_index(docs_path)
+    query_engine = build_query_engine(vector_index)
+
+    response = query_engine.query(user_input)
+    result = str(response.response).strip()
+
+    if not result:
+        # Explicit, actionable message instead of a silent/empty refusal.
+        result = (
+            "The model returned an empty response. Check that the example "
+            f"documents in '{docs_path}' actually loaded and that your "
+            "OPENAI_API_KEY has available quota."
+        )
+    return result
+
+
+# Kept for backwards compatibility with the previous helper name.
+def chatbot(user_input, docs_path=DOCS_PATH):
+    return run_agent(user_input, docs_path=docs_path)
+
+
+def launch_ui(docs_path=DOCS_PATH):
+    """Optional Gradio front-end."""
+    if gr is None:
+        raise RuntimeError("gradio is not installed - run `pip install gradio`.")
+
+    def _respond(message, history):
+        return run_agent(message, docs_path)
+
+    demo = gr.ChatInterface(fn=_respond, title="NDA drafting assistant")
+    return demo.launch()
+
+
+if __name__ == "__main__":
+    user_input = (
+        "Using the example NDAs in the docs folder as a template, draft a new "
+        "mutual non-disclosure agreement between Acme Corp and Beta LLC with a "
+        "3 year term, Delaware governing law and a mutual confidentiality "
+        "obligation covering source code and customer data."
+    )
+    result = run_agent(user_input)
+    print("\n=== User Query Result ===")
+    print(f"Question: {user_input}")
+    print(f"Answer: {result}")
+
+--------------------------------------------------------------------------------

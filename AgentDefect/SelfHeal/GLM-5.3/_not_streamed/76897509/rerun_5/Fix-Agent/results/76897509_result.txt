@@ -1,0 +1,278 @@
+Case ID: 76897509
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 08:19:17
+End Time: 2026-11-05 08:24:45
+Total Duration: 327.35 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import random
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain.llms import OpenAI
+from langchain.schema import Document
+from langchain.vectorstores.base import VectorStoreRetriever
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.cache import InMemoryCache
+from langchain.globals import set_llm_cache
+
+_ = load_dotenv(find_dotenv())
+set_llm_cache(InMemoryCache())
+
+OPENAI_API_KEY_POOL = [
+    os.getenv('OPENAI_API_KEY'),
+]
+
+def get_random_key(key_pool):
+    return random.choice([k for k in key_pool if k is not None])
+
+
+class FilteredRetriever(VectorStoreRetriever):
+    """A VectorStoreRetriever that applies a metadata filter at query time.
+
+    ConversationalRetrievalChain only accepts "question" and "chat_history" as
+    input keys, so any "filter" key passed in the chain input dict is silently
+    ignored. Instead, the filter must be applied by the retriever itself.
+    The `filter` attribute is mutable, so the SAME chain instance can be
+    reused with a different document filter for every query.
+    """
+
+    filter: Optional[Dict[str, Any]] = None
+
+    def _get_relevant_documents(self, query: str, run_manager=None) -> List[Document]:
+        # Push the filter down to the vector store so only matching documents
+        # are retrieved (e.g. only chunks whose metadata source == "paper2.pdf").
+        search_kwargs = dict(self.search_kwargs or {})
+        k = search_kwargs.pop("k", 4)
+        if self.filter:
+            search_kwargs["filter"] = self.filter
+
+        docs = self.vectorstore.similarity_search(query, k=k, **search_kwargs)
+
+        # Safety net: drop any document that does not satisfy the filter.
+        if self.filter:
+            docs = [
+                doc
+                for doc in docs
+                if all(
+                    doc.metadata.get(key) == value
+                    for key, value in self.filter.items()
+                )
+            ]
+        return docs
+
+
+def run_agent(query, pdf_paths):
+    all_texts = []
+    embeddings = OpenAIEmbeddings(openai_api_key=get_random_key(OPENAI_API_KEY_POOL))
+
+    for pdf_path in pdf_paths:
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        texts = text_splitter.split_documents(documents)
+
+        for text in texts:
+            text.metadata["source"] = pdf_path
+
+        all_texts.extend(texts)
+
+    db = Chroma.from_documents(all_texts, embeddings)
+
+    # Use the custom retriever so the filter can be changed per query
+    # without rebuilding the chain or the vector store.
+    retriever = FilteredRetriever(vectorstore=db, search_kwargs={"k": 4})
+
+    qa = ConversationalRetrievalChain.from_llm(
+        OpenAI(openai_api_key=get_random_key(OPENAI_API_KEY_POOL), cache=True, temperature=0),
+        retriever,
+        verbose=True,
+        return_source_documents=True)
+
+    # The filter is applied at query time. Setting this attribute before each
+    # call lets the same chain be reused for different documents.
+    # It means the information from paper2.pdf should be used to answer the query.
+    retriever.filter = {'source': 'paper2.pdf'}
+
+    # NOTE: "filter" is NOT passed inside the chain input dict anymore;
+    # ConversationalRetrievalChain would simply ignore it.
+    result = qa({"question": query, "chat_history": []})
+
+    return result
+
+
+if __name__ == "__main__":
+    query = "What is Theia"
+    pdf_paths = ["paper1.pdf", "paper2.pdf"]
+    result = run_agent(query, pdf_paths)
+
+    print(result['answer'])
+
+    # Verify the filtering is working correctly: if the answer is drawn from
+    # paper2.pdf, every source document below must be "paper2.pdf".
+    sources = {doc.metadata.get('source') for doc in result.get('source_documents', [])}
+    print("Sources used:", sources)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 08:24:45
+Duration: 327.35 seconds
+Verdict: All checks are complete. Here is my evaluation:
+
+## Analysis
+
+### The Bug (Original Code)
+The original code passed `filter` inside the chain's input dict:
+```python
+result = qa({"question": query, "chat_history": [], "filter": filter})
+```
+`ConversationalRetrievalChain`'s input schema only contains `question` and `chat_history` (confirmed via the API verification: it's a chain wrapping a `retriever: BaseRetriever` field). A `filter` key in the input dict is **silently ignored** — it is never forwarded to the retriever's `_get_relevant_documents` call. So no filtering ever happened, and retrieval pulled from *both* PDFs, which is exactly what the test detects: the test expects an "I don't know / not sure / cannot find" style answer, meaning the answer for "What is Theia" must come *only* from `paper2.pdf` (where the information evidently isn't present). An unfiltered retrieval would produce a substantive answer from `paper1.pdf` and fail the test.
+
+### The Fix
+1. **`FilteredRetriever(VectorStoreRetriever)` subclass** — This is the correct LangChain pattern. `VectorStoreRetriever` is a Pydantic model with fields `vectorstore`, `search_type`, `search_kwargs`, and subclassing it with an additional declared field (`filter: Optional[Dict[str, Any]]`) is standard practice (same pattern as `MultiQueryRetriever` etc.). The overridden `_get_relevant_documents(self, query, run_manager=None)` signature is compatible with the base class contract (the base calls it with `run_manager` as a keyword argument).
+2. **Filter pushed down to the vector store** — `Chroma.similarity_search` was verified to accept a `filter` kwarg (it delegates to `similarity_search_with_score(query, k, filter=filter)`), and `{"source": "paper2.pdf"}` is valid Chroma `where` syntax. The metadata `source` is set to the exact `pdf_path` string, so the match is correct.
+3. **Safety-net post-filter** — Even if the backend ignored the filter, the list comprehension drops non-matching docs, guaranteeing behavioral correctness of the filtering.
+4. **Chain input cleaned up** — `qa({"question": query, "chat_history": []})` now passes only valid input keys, and the mutable `retriever.filter` attribute allows per-query filtering without rebuilding the chain (Pydantic field assignment works for declared fields).
+5. **Test compatibility** — `return_source_documents=True` guarantees both `'answer'` and `'source_documents'` keys exist in the result dict (satisfying the `assertIsInstance`/`assertIn` checks), even if the filtered retrieval returns zero documents. With filtering now actually enforced, the LLM receives only `paper2.pdf` context and will answer "I don't know", satisfying the final assertion.
+
+### Validation Results
+- `validate_fixed_code`: **ACCEPT** — structure and output format match expectations.
+- `generate_diff`: Change is minimal and surgical — only the retrieval/filtering mechanism was fixed; PDF loading, splitting, metadata tagging, embeddings, and chain construction are preserved.
+- `verify_api_usage`: All three verified components (`ConversationalRetrievalChain`, `VectorStoreRetriever`, `Chroma.similarity_search`) confirm the fix's assumptions are correct.
+
+No suspicious or unverifiable API usage remains: the `Document` and typing imports are standard, `from_llm` accepts a retriever as the second positional argument (unchanged from the original working pattern), and Pydantic attribute mutation on a declared field is valid.
+
+## Verdict
+
+**ACCEPT**
+
+The fix correctly identifies that `ConversationalRetrievalChain` ignores an extraneous `filter` key in its input dict, and resolves it the idiomatic way — by applying the metadata filter inside a custom retriever and pushing it down to `Chroma.similarity_search`, with a redundant post-filter safety net. All API usage is verified as valid, structural validation passed, and the behavior now matches the test's expectations (filtered retrieval from `paper2.pdf` only, resulting in an "I don't know" answer with `source_documents` present in the result).
+--------------------------------------------------------------------------------
+import os
+import random
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain.llms import OpenAI
+from langchain.schema import Document
+from langchain.vectorstores.base import VectorStoreRetriever
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.cache import InMemoryCache
+from langchain.globals import set_llm_cache
+
+_ = load_dotenv(find_dotenv())
+set_llm_cache(InMemoryCache())
+
+OPENAI_API_KEY_POOL = [
+    os.getenv('OPENAI_API_KEY'),
+]
+
+def get_random_key(key_pool):
+    return random.choice([k for k in key_pool if k is not None])
+
+
+class FilteredRetriever(VectorStoreRetriever):
+    """A VectorStoreRetriever that applies a metadata filter at query time.
+
+    ConversationalRetrievalChain only accepts "question" and "chat_history" as
+    input keys, so any "filter" key passed in the chain input dict is silently
+    ignored. Instead, the filter must be applied by the retriever itself.
+    The `filter` attribute is mutable, so the SAME chain instance can be
+    reused with a different document filter for every query.
+    """
+
+    filter: Optional[Dict[str, Any]] = None
+
+    def _get_relevant_documents(self, query: str, run_manager=None) -> List[Document]:
+        # Push the filter down to the vector store so only matching documents
+        # are retrieved (e.g. only chunks whose metadata source == "paper2.pdf").
+        search_kwargs = dict(self.search_kwargs or {})
+        k = search_kwargs.pop("k", 4)
+        if self.filter:
+            search_kwargs["filter"] = self.filter
+
+        docs = self.vectorstore.similarity_search(query, k=k, **search_kwargs)
+
+        # Safety net: drop any document that does not satisfy the filter.
+        if self.filter:
+            docs = [
+                doc
+                for doc in docs
+                if all(
+                    doc.metadata.get(key) == value
+                    for key, value in self.filter.items()
+                )
+            ]
+        return docs
+
+
+def run_agent(query, pdf_paths):
+    all_texts = []
+    embeddings = OpenAIEmbeddings(openai_api_key=get_random_key(OPENAI_API_KEY_POOL))
+
+    for pdf_path in pdf_paths:
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        texts = text_splitter.split_documents(documents)
+
+        for text in texts:
+            text.metadata["source"] = pdf_path
+
+        all_texts.extend(texts)
+
+    db = Chroma.from_documents(all_texts, embeddings)
+
+    # Use the custom retriever so the filter can be changed per query
+    # without rebuilding the chain or the vector store.
+    retriever = FilteredRetriever(vectorstore=db, search_kwargs={"k": 4})
+
+    qa = ConversationalRetrievalChain.from_llm(
+        OpenAI(openai_api_key=get_random_key(OPENAI_API_KEY_POOL), cache=True, temperature=0),
+        retriever,
+        verbose=True,
+        return_source_documents=True)
+
+    # The filter is applied at query time. Setting this attribute before each
+    # call lets the same chain be reused for different documents.
+    # It means the information from paper2.pdf should be used to answer the query.
+    retriever.filter = {'source': 'paper2.pdf'}
+
+    # NOTE: "filter" is NOT passed inside the chain input dict anymore;
+    # ConversationalRetrievalChain would simply ignore it.
+    result = qa({"question": query, "chat_history": []})
+
+    return result
+
+
+if __name__ == "__main__":
+    query = "What is Theia"
+    pdf_paths = ["paper1.pdf", "paper2.pdf"]
+    result = run_agent(query, pdf_paths)
+
+    print(result['answer'])
+
+    # Verify the filtering is working correctly: if the answer is drawn from
+    # paper2.pdf, every source document below must be "paper2.pdf".
+    sources = {doc.metadata.get('source') for doc in result.get('source_documents', [])}
+    print("Sources used:", sources)
+
+--------------------------------------------------------------------------------

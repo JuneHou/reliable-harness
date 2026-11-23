@@ -1,0 +1,493 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 21:02:07
+End Time: 2026-11-04 21:04:43
+Total Duration: 156.07 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Fixed LangChain RAG pipeline for finding *similar* and *duplicate* controls.
+
+Why the original output was wrong
+---------------------------------
+1. WRONG PROMPT.  The template was a generic "question-answering / answer in three sentences"
+   prompt.  The real task is a *pairwise comparison* task: enumerate every pair of controls,
+   give a similarity score, and classify it with thresholds (80-87 -> similar, >95 -> duplicate).
+   A QA prompt never asks for pairs, scores or thresholds, so the model answered with a short
+   paragraph and no list.
+2. ROW DESTRUCTION.  CharacterTextSplitter(chunk_size=500, chunk_overlap=50) chopped the CSV
+   documents, so one control could be split across two chunks (or glued to the next row).
+   A control must stay a single, complete document to be comparable.
+3. TRUNCATED CONTEXT.  vectorstore.as_retriever() returns only the top-k chunks (default k=4),
+   so most controls were never in the prompt.  Duplicate detection needs the *whole* corpus
+   compared pairwise - not a semantic top-k retrieval of one query.
+4. NO SCORES AT ALL.  The similarity score/threshold logic lived nowhere: a chat model cannot
+   reliably compute cosine similarity, so scores have to be computed in Python (embeddings +
+   cosine similarity) and handed to the model, which then only formats/explains them.
+
+Run:  python rag_chain.py
+"""
+
+import os
+from itertools import combinations
+
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import CSVLoader
+from langchain_community.vectorstores import Chroma
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+
+load_dotenv()
+
+CSV_PATH = os.getenv("CONTROL_CSV", "control.csv")
+EMBED_MODEL = "text-embedding-3-small"
+LLM_MODEL = "gpt-4o-mini"
+
+# Similarity thresholds (cosine similarity rescaled to 0-100)
+SIMILAR_LOW = 80.0
+SIMILAR_HIGH = 87.0
+DUPLICATE_MIN = 95.0
+MAX_PAIRS_IN_CONTEXT = 200  # keep the prompt bounded for large CSVs
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def cosine_score(vec_a, vec_b):
+    """Cosine similarity of two embedding vectors, rescaled to 0-100."""
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = sum(a * a for a in vec_a) ** 0.5
+    norm_b = sum(b * b for b in vec_b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return round(max(-1.0, min(1.0, dot / (norm_a * norm_b))) * 100.0, 2)
+
+
+def classify(score):
+    if score > DUPLICATE_MIN:
+        return "duplicate"
+    if SIMILAR_LOW <= score <= SIMILAR_HIGH:
+        return "similar"
+    if score >= SIMILAR_LOW:  # 87 < score <= 95
+        return "borderline"
+    return "not-a-match"
+
+
+def control_id(doc, index):
+    """Human readable control identifier (CSVLoader stores the line index in metadata['row'])."""
+    row = doc.metadata.get("row")
+    return f"row {row}" if row is not None else f"control {index + 1}"
+
+
+def format_corpus(docs):
+    return "\n".join(
+        f"- {control_id(doc, i)}: {doc.page_content.strip()}" for i, doc in enumerate(docs)
+    )
+
+
+def build_candidate_table(docs, embeddings):
+    """Compute EVERY pairwise similarity in Python and keep pairs above the threshold."""
+    vectors = embeddings.embed_documents([doc.page_content for doc in docs])
+
+    scored = []
+    for i, j in combinations(range(len(docs)), 2):
+        score = cosine_score(vectors[i], vectors[j])
+        if score >= SIMILAR_LOW:
+            scored.append((score, i, j))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    if not scored:
+        return (
+            "NO PAIR OF CONTROLS REACHES THE 80.0 SIMILARITY THRESHOLD.",
+            [],
+        )
+
+    lines = []
+    for rank, (score, i, j) in enumerate(scored[:MAX_PAIRS_IN_CONTEXT], start=1):
+        lines.append(
+            f"{rank}. Control A: {control_id(docs[i], i)} | "
+            f"Control B: {control_id(docs[j], j)} | "
+            f"Similarity: {score:.2f} | Expected classification: {classify(score)}"
+        )
+    if len(scored) > MAX_PAIRS_IN_CONTEXT:
+        lines.append(
+            f"... {len(scored) - MAX_PAIRS_IN_CONTEXT} further pairs above the threshold were omitted."
+        )
+    return "\n".join(lines), scored
+
+
+def format_retrieved(docs):
+    return "\n".join(
+        f"- {control_id(doc, i)}: {doc.page_content.strip()}" for i, doc in enumerate(docs)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# chain
+# --------------------------------------------------------------------------- #
+def build_rag_chain(csv_path=CSV_PATH):
+    # 1) One CSV row == one control -> no text splitting, otherwise controls get mangled.
+    loader = CSVLoader(file_path=csv_path, encoding="utf-8")
+    docs = loader.load()
+    if not docs:
+        raise ValueError(f"No controls were loaded from {csv_path!r}; check the file path/format.")
+
+    embeddings = OpenAIEmbeddings(model=EMBED_MODEL, encode_kwargs={"normalize_embeddings": True})
+    vectorstore = Chroma.from_documents(documents=docs, embedding=embeddings)
+
+    # 2) Pairwise comparison needs the whole corpus, not the top-k of a single query.
+    retriever = vectorstore.as_retriever(
+        search_type="similarity", search_kwargs={"k": len(docs)}
+    )
+
+    # 3) Precompute the pair candidates (an LLM cannot compute trustworthy numeric similarity).
+    candidates_block, _ = build_candidate_table(docs, embeddings)
+    corpus_block = format_corpus(docs)
+
+    # 4) Task-specific prompt: explicit role, explicit thresholds, explicit output format.
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a data-quality analyst who finds similar and duplicate controls in a CSV.\n\n"
+                "You do NOT estimate similarity yourself. Every similarity score has already been "
+                "computed with cosine similarity over text embeddings and is listed in the "
+                "PRECOMPUTED PAIR CANDIDATES section (scale 0-100).\n\n"
+                "Classification rules:\n"
+                f"- {SIMILAR_LOW:.0f} <= score <= {SIMILAR_HIGH:.0f}  -> \"similar\"\n"
+                f"- score > {DUPLICATE_MIN:.0f}                 -> \"duplicate\"\n"
+                "- scores strictly between 87 and 95        -> \"borderline\" (report, do not call "
+                "it similar or duplicate)\n"
+                f"- score < {SIMILAR_LOW:.0f}                     -> ignore, never report\n\n"
+                "Hard rules:\n"
+                "1. Compare each control with every OTHER control; never pair a control with itself.\n"
+                "2. Use ONLY the exact scores from PRECOMPUTED PAIR CANDIDATES - never invent, "
+                "guess or re-round a score.\n"
+                "3. Output one line per qualifying pair, sorted by descending similarity.\n"
+                "4. Keep each line in exactly this format:\n"
+                "   n. Control A: <id> | Control B: <id> | Similarity: <score> | "
+                "Classification: <similar|duplicate|borderline> | Reason: <one short sentence>\n"
+                "5. If the candidates section says no pair reaches the threshold, answer exactly: "
+                "\"No similar or duplicate control pairs were found above the 80 threshold.\"\n"
+                "6. Do not write an introduction, a summary or a three-sentence answer - only the list.",
+            ),
+            (
+                "human",
+                "Task: {question}\n\n"
+                "PRECOMPUTED PAIR CANDIDATES (cosine similarity 0-100, threshold >= {similar_low}):\n"
+                "{candidates}\n\n"
+                "CONTROLS IN THE DATASET (all rows, for reference only):\n"
+                "{corpus}\n\n"
+                "TOP RETRIEVED CONTROLS FOR THIS TASK:\n"
+                "{context}",
+            ),
+        ]
+    )
+
+    llm = ChatOpenAI(temperature=0, model=LLM_MODEL)
+
+    rag_chain = (
+        {
+            "context": RunnableLambda(lambda q: format_retrieved(retriever.invoke(q))),
+            "candidates": RunnableLambda(lambda _q: candidates_block),
+            "corpus": RunnableLambda(lambda _q: corpus_block),
+            "similar_low": RunnableLambda(lambda _q: f"{SIMILAR_LOW:.0f}"),
+            "question": RunnablePassthrough(),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return rag_chain, candidates_block
+
+
+def run_agent(query):
+    rag_chain, candidates_block = build_rag_chain()
+    # Deterministic short-circuit: never let the model hallucinate pairs when none qualify.
+    if candidates_block.startswith("NO PAIR OF CONTROLS"):
+        return f"No similar or duplicate control pairs were found above the {SIMILAR_LOW:.0f} threshold."
+    return rag_chain.invoke(query)
+
+
+if __name__ == "__main__":
+    query = (
+        "Compare every control in the dataset with every other control and list all pairs of "
+        "similar and duplicate controls together with their similarity score and the threshold "
+        "that applies to each pair."
+    )
+    print(run_agent(query))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 21:04:43
+Duration: 156.07 seconds
+Verdict: ## Verdict: **REJECT**
+
+### 1. What the diff actually does
+The fix is a **prompt-engineering / domain rewrite**, not a fix of the failing contract:
+
+- Replaces the QA template with a highly prescriptive "similarity / duplicate control" analyst prompt (thresholds `SIMILAR_LOW=80`, `SIMILAR_HIGH=87`, `DUPLICATE_MIN=95`).
+- Removes `CharacterTextSplitter` so one CSV row == one document.
+- Sets `retriever` to `k=len(docs)` and precomputes all pairwise cosine scores in Python (`build_candidate_table`).
+- Modernizes imports (`langchain_core.*`, `langchain_community.*`, `langchain_openai.OpenAIEmbeddings`), wraps side-effectful steps in `build_rag_chain()`, adds a deterministic short-circuit.
+- **Leaves the output path completely unchanged: `... | llm | StrOutputParser()` and `return rag_chain.invoke(query)` (a `str`).**
+
+So the one thing the test measures was never touched.
+
+### 2. The test contract is still violated (decisive)
+```python
+result = run_agent(query)
+self.assertIsInstance(result, dict)      # -> fails: str
+self.assertIn("results", result)          # -> fails: TypeError/AssertionError on str
+self.assertIsInstance(result["results"], list)
+for item in result["results"]: self.assertIsInstance(item, dict)
+```
+Both return points of `run_agent` yield a string:
+- normal path: `StrOutputParser()` returns a plain string (verified: `langchain_core.output_parsers.StrOutputParser` produces strings, not dicts),
+- short-circuit path: `return f"No similar or duplicate control pairs were found ..."`.
+
+There is **no** `JsonOutputParser`, no `PydanticOutputParser`, no `llm.with_structured_output(...)`, no `json.loads`, and no `{"results": [...]}` envelope anywhere in the fixed file. The candidate table is passed *into* the prompt as text, which makes the model's answer even more certainly prose (the system message explicitly forbids anything but "one line per qualifying pair" — definitely not JSON). To satisfy the test, the chain would have to be something like `prompt | llm.with_structured_output(PairList)` (verified to exist on `ChatOpenAI`) or `prompt | llm | JsonOutputParser()` plus a coercion to `{"results": [...]}`.
+
+### 3. Domain/task mismatch
+The test query is *"Find movies for family. Return only the title, genre and budget."*, and items are expected to be dicts describing movies. The fixed code hardcodes a controls-comparison task (`control.csv`, "Control A / Control B / Similarity / Classification", "row N" ids) and its prompt says nothing about `title`, `genre`, `budget`, or any per-item dict fields. Even if the output were JSON-parsed, the shape would not match the expected `results` items.
+
+### 4. Secondary defects (non-blocking but confirming low quality)
+- `classify()` maps a score of exactly `95.0` to `"borderline"`, while the system prompt says `score > 95 -> duplicate`; `DUPLICATE_MIN` is used as an exclusive bound in one place and treated as inclusive-adjacent in another — an off-by-one at the boundary.
+- `format_corpus()` and `format_retrieved()` are identical duplicates; the "TOP RETRIEVED CONTROLS" block is redundant with the corpus block and inflates the prompt.
+- `os` is imported and `CSV_PATH = os.getenv("CONTROL_CSV", "control.csv")` silently makes the file source configurable — a hidden dependency change relative to the buggy version's fixed `control.csv`.
+- Docstring says `Run: python rag_chain.py` while the module under test is `run_fixed.py`.
+- `build_rag_chain` always re-loads the CSV, re-embeds, and rebuilds a Chroma store on **every** `run_agent` call (no caching), so the test triggers a full corpus embedding pass per invocation.
+
+### 5. Note on the automated validator
+`validate_fixed_code` returned "ACCEPT fixed code matches expected structure and output format." That check evidently inspects formatting/structural heuristics of the diff, not the runtime return-type contract asserted by the test (`assertIsInstance(result, dict)`). Given that the fixed code unambiguously returns a `str` on both paths and contains no structured-output machinery, the test as written cannot pass. I therefore reject despite that signal.
+
+**Conclusion:** The change improves prompt specificity and similarity math but never addresses the failing requirement — returning a `dict` with a `results` list of item `dict`s. The buggy and fixed versions both return a `str`, so the failure is unchanged. **REJECT.**
+--------------------------------------------------------------------------------
+"""
+Fixed LangChain RAG pipeline for finding *similar* and *duplicate* controls.
+
+Why the original output was wrong
+---------------------------------
+1. WRONG PROMPT.  The template was a generic "question-answering / answer in three sentences"
+   prompt.  The real task is a *pairwise comparison* task: enumerate every pair of controls,
+   give a similarity score, and classify it with thresholds (80-87 -> similar, >95 -> duplicate).
+   A QA prompt never asks for pairs, scores or thresholds, so the model answered with a short
+   paragraph and no list.
+2. ROW DESTRUCTION.  CharacterTextSplitter(chunk_size=500, chunk_overlap=50) chopped the CSV
+   documents, so one control could be split across two chunks (or glued to the next row).
+   A control must stay a single, complete document to be comparable.
+3. TRUNCATED CONTEXT.  vectorstore.as_retriever() returns only the top-k chunks (default k=4),
+   so most controls were never in the prompt.  Duplicate detection needs the *whole* corpus
+   compared pairwise - not a semantic top-k retrieval of one query.
+4. NO SCORES AT ALL.  The similarity score/threshold logic lived nowhere: a chat model cannot
+   reliably compute cosine similarity, so scores have to be computed in Python (embeddings +
+   cosine similarity) and handed to the model, which then only formats/explains them.
+
+Run:  python rag_chain.py
+"""
+
+import os
+from itertools import combinations
+
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import CSVLoader
+from langchain_community.vectorstores import Chroma
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+
+load_dotenv()
+
+CSV_PATH = os.getenv("CONTROL_CSV", "control.csv")
+EMBED_MODEL = "text-embedding-3-small"
+LLM_MODEL = "gpt-4o-mini"
+
+# Similarity thresholds (cosine similarity rescaled to 0-100)
+SIMILAR_LOW = 80.0
+SIMILAR_HIGH = 87.0
+DUPLICATE_MIN = 95.0
+MAX_PAIRS_IN_CONTEXT = 200  # keep the prompt bounded for large CSVs
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def cosine_score(vec_a, vec_b):
+    """Cosine similarity of two embedding vectors, rescaled to 0-100."""
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = sum(a * a for a in vec_a) ** 0.5
+    norm_b = sum(b * b for b in vec_b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return round(max(-1.0, min(1.0, dot / (norm_a * norm_b))) * 100.0, 2)
+
+
+def classify(score):
+    if score > DUPLICATE_MIN:
+        return "duplicate"
+    if SIMILAR_LOW <= score <= SIMILAR_HIGH:
+        return "similar"
+    if score >= SIMILAR_LOW:  # 87 < score <= 95
+        return "borderline"
+    return "not-a-match"
+
+
+def control_id(doc, index):
+    """Human readable control identifier (CSVLoader stores the line index in metadata['row'])."""
+    row = doc.metadata.get("row")
+    return f"row {row}" if row is not None else f"control {index + 1}"
+
+
+def format_corpus(docs):
+    return "\n".join(
+        f"- {control_id(doc, i)}: {doc.page_content.strip()}" for i, doc in enumerate(docs)
+    )
+
+
+def build_candidate_table(docs, embeddings):
+    """Compute EVERY pairwise similarity in Python and keep pairs above the threshold."""
+    vectors = embeddings.embed_documents([doc.page_content for doc in docs])
+
+    scored = []
+    for i, j in combinations(range(len(docs)), 2):
+        score = cosine_score(vectors[i], vectors[j])
+        if score >= SIMILAR_LOW:
+            scored.append((score, i, j))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    if not scored:
+        return (
+            "NO PAIR OF CONTROLS REACHES THE 80.0 SIMILARITY THRESHOLD.",
+            [],
+        )
+
+    lines = []
+    for rank, (score, i, j) in enumerate(scored[:MAX_PAIRS_IN_CONTEXT], start=1):
+        lines.append(
+            f"{rank}. Control A: {control_id(docs[i], i)} | "
+            f"Control B: {control_id(docs[j], j)} | "
+            f"Similarity: {score:.2f} | Expected classification: {classify(score)}"
+        )
+    if len(scored) > MAX_PAIRS_IN_CONTEXT:
+        lines.append(
+            f"... {len(scored) - MAX_PAIRS_IN_CONTEXT} further pairs above the threshold were omitted."
+        )
+    return "\n".join(lines), scored
+
+
+def format_retrieved(docs):
+    return "\n".join(
+        f"- {control_id(doc, i)}: {doc.page_content.strip()}" for i, doc in enumerate(docs)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# chain
+# --------------------------------------------------------------------------- #
+def build_rag_chain(csv_path=CSV_PATH):
+    # 1) One CSV row == one control -> no text splitting, otherwise controls get mangled.
+    loader = CSVLoader(file_path=csv_path, encoding="utf-8")
+    docs = loader.load()
+    if not docs:
+        raise ValueError(f"No controls were loaded from {csv_path!r}; check the file path/format.")
+
+    embeddings = OpenAIEmbeddings(model=EMBED_MODEL, encode_kwargs={"normalize_embeddings": True})
+    vectorstore = Chroma.from_documents(documents=docs, embedding=embeddings)
+
+    # 2) Pairwise comparison needs the whole corpus, not the top-k of a single query.
+    retriever = vectorstore.as_retriever(
+        search_type="similarity", search_kwargs={"k": len(docs)}
+    )
+
+    # 3) Precompute the pair candidates (an LLM cannot compute trustworthy numeric similarity).
+    candidates_block, _ = build_candidate_table(docs, embeddings)
+    corpus_block = format_corpus(docs)
+
+    # 4) Task-specific prompt: explicit role, explicit thresholds, explicit output format.
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a data-quality analyst who finds similar and duplicate controls in a CSV.\n\n"
+                "You do NOT estimate similarity yourself. Every similarity score has already been "
+                "computed with cosine similarity over text embeddings and is listed in the "
+                "PRECOMPUTED PAIR CANDIDATES section (scale 0-100).\n\n"
+                "Classification rules:\n"
+                f"- {SIMILAR_LOW:.0f} <= score <= {SIMILAR_HIGH:.0f}  -> \"similar\"\n"
+                f"- score > {DUPLICATE_MIN:.0f}                 -> \"duplicate\"\n"
+                "- scores strictly between 87 and 95        -> \"borderline\" (report, do not call "
+                "it similar or duplicate)\n"
+                f"- score < {SIMILAR_LOW:.0f}                     -> ignore, never report\n\n"
+                "Hard rules:\n"
+                "1. Compare each control with every OTHER control; never pair a control with itself.\n"
+                "2. Use ONLY the exact scores from PRECOMPUTED PAIR CANDIDATES - never invent, "
+                "guess or re-round a score.\n"
+                "3. Output one line per qualifying pair, sorted by descending similarity.\n"
+                "4. Keep each line in exactly this format:\n"
+                "   n. Control A: <id> | Control B: <id> | Similarity: <score> | "
+                "Classification: <similar|duplicate|borderline> | Reason: <one short sentence>\n"
+                "5. If the candidates section says no pair reaches the threshold, answer exactly: "
+                "\"No similar or duplicate control pairs were found above the 80 threshold.\"\n"
+                "6. Do not write an introduction, a summary or a three-sentence answer - only the list.",
+            ),
+            (
+                "human",
+                "Task: {question}\n\n"
+                "PRECOMPUTED PAIR CANDIDATES (cosine similarity 0-100, threshold >= {similar_low}):\n"
+                "{candidates}\n\n"
+                "CONTROLS IN THE DATASET (all rows, for reference only):\n"
+                "{corpus}\n\n"
+                "TOP RETRIEVED CONTROLS FOR THIS TASK:\n"
+                "{context}",
+            ),
+        ]
+    )
+
+    llm = ChatOpenAI(temperature=0, model=LLM_MODEL)
+
+    rag_chain = (
+        {
+            "context": RunnableLambda(lambda q: format_retrieved(retriever.invoke(q))),
+            "candidates": RunnableLambda(lambda _q: candidates_block),
+            "corpus": RunnableLambda(lambda _q: corpus_block),
+            "similar_low": RunnableLambda(lambda _q: f"{SIMILAR_LOW:.0f}"),
+            "question": RunnablePassthrough(),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return rag_chain, candidates_block
+
+
+def run_agent(query):
+    rag_chain, candidates_block = build_rag_chain()
+    # Deterministic short-circuit: never let the model hallucinate pairs when none qualify.
+    if candidates_block.startswith("NO PAIR OF CONTROLS"):
+        return f"No similar or duplicate control pairs were found above the {SIMILAR_LOW:.0f} threshold."
+    return rag_chain.invoke(query)
+
+
+if __name__ == "__main__":
+    query = (
+        "Compare every control in the dataset with every other control and list all pairs of "
+        "similar and duplicate controls together with their similarity score and the threshold "
+        "that applies to each pair."
+    )
+    print(run_agent(query))
+
+--------------------------------------------------------------------------------

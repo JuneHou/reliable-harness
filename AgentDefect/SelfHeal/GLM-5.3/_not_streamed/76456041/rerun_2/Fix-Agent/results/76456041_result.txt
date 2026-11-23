@@ -1,0 +1,326 @@
+Case ID: 76456041
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 20:19:10
+End Time: 2026-11-04 20:45:02
+Total Duration: 1552.22 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import warnings
+from dotenv import load_dotenv, find_dotenv
+from langchain.document_loaders import CSVLoader
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+
+# ---------------------------------------------------------------------------
+# Custom prompts for the "map_reduce" chain.
+#
+# Root cause of the wrong answers: LangChain's default map_reduce prompts are
+# written for *summarization*.  The default combine (reduce) prompt says
+# "Write a response that is about 400 words long" over a set of summaries, so
+# partial per-chunk answers (e.g. the German drivers found in each chunk) get
+# summarized away instead of being merged, counted or compared.  That is why
+# "stuff" (single prompt, whole small sample) answers correctly while
+# "map_reduce" over the full CSV does not.
+#
+# MAP prompt: run on every chunk of the CSV.  It must look at EVERY row,
+# return every match, and clearly signal when a chunk has no match.
+# ---------------------------------------------------------------------------
+MAP_PROMPT_TEMPLATE = """Use the following portion of a CSV document to answer the question.
+Go through EVERY row in this portion of the CSV.
+List every row that answers the question, one per line.
+If the question asks for a count, also state how many matching rows are in this portion.
+If the question asks for an extreme value (oldest/youngest, max/min), give the value and the rows that have it in this portion.
+If no row in this portion matches, answer exactly: NO_MATCHES_IN_THIS_PORTION
+Do not make up names, values or rows that are not present in this portion.
+
+Portion of the CSV:
+{context}
+
+Question: {question}
+Answer (one matching row per line, plus the number of matches in this portion):
+"""
+
+QUESTION_PROMPT = PromptTemplate(
+    template=MAP_PROMPT_TEMPLATE, input_variables=["context", "question"]
+)
+
+# ---------------------------------------------------------------------------
+# COMBINE (reduce) prompt: run once over all partial answers produced by the
+# map step.  It must merge ALL partial answers into one complete answer
+# (list every match from every chunk, dedupe, total the counts) instead of
+# writing a prose summary of them.
+# ---------------------------------------------------------------------------
+COMBINE_PROMPT_TEMPLATE = """Below are partial answers to a question. Each partial answer was produced
+from a different portion of a large CSV file.
+
+Combine ALL of the partial answers into ONE final, complete answer to the question.
+Rules:
+- Include EVERY match that appears in ANY partial answer. Never drop, shorten or paraphrase away rows.
+- Remove duplicate rows (the same row may appear in more than one partial answer).
+- Ignore any partial answer that is exactly NO_MATCHES_IN_THIS_PORTION.
+- If the question asks for a count, give the total number of distinct matches across all partial answers, followed by the full list.
+- If the question asks for an extreme value (oldest/youngest, max/min), give the overall extreme value across all partial answers, followed by the rows that have it.
+- If no partial answer contains any match, answer exactly: I don't know.
+
+Partial answers:
+{summaries}
+
+Question: {question}
+Final answer:
+"""
+
+COMBINE_PROMPT = PromptTemplate(
+    template=COMBINE_PROMPT_TEMPLATE, input_variables=["summaries", "question"]
+)
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as cb:
+
+            loader = CSVLoader(file_path=file, encoding='utf-8')
+            docs = loader.load()
+
+            embeddings = OpenAIEmbeddings()
+
+            # create the vectorstore to use as the index
+            db = Chroma.from_documents(docs, embeddings)
+            # Retrieve EVERY row of the file.  A fixed k (e.g. 1000) silently
+            # drops rows when the full CSV is larger, which corrupts
+            # aggregation answers (counts / oldest birthdate), so set k to the
+            # actual number of rows.
+            retriever = db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": len(docs)}
+            )
+
+            # Build the map_reduce chain ONCE per file and reuse it for every
+            # query (instead of re-creating it inside the query loop).
+            # temperature=0 keeps aggregation deterministic, and the custom
+            # question/combine prompts make the map step keep every matching
+            # row and the reduce step merge the partial lists instead of
+            # summarizing them.
+            qa_stuff = RetrievalQA.from_chain_type(
+                llm=OpenAI(temperature=0),
+                chain_type="map_reduce",
+                retriever=retriever,
+                chain_type_kwargs={
+                    "question_prompt": QUESTION_PROMPT,
+                    "combine_prompt": COMBINE_PROMPT,
+                },
+                verbose=False
+            )
+
+            for query in queries:
+                print(query)
+                result = qa_stuff.run(query)
+                results.append(result)
+
+                print(result)
+
+            print(cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 20:45:02
+Duration: 1552.22 seconds
+Verdict: ## Analysis
+
+**Bug context:** The buggy code asks "Tell me the name of every driver who is German" over CSVs using a `map_reduce` RetrievalQA chain with **default prompts**. LangChain's default map_reduce QA prompts are summarization-oriented (the default combine prompt asks for "a response that is about 400 words long"), so per-chunk matches get summarized away instead of merged into a complete list. Additionally, `search_kwargs={"k": 1000}` silently drops rows when the full CSV exceeds 1000 rows, corrupting exhaustive/aggregate answers.
+
+**What the fix changes:**
+
+1. **Custom `question_prompt` / `combine_prompt`** passed via `chain_type_kwargs` to `RetrievalQA.from_chain_type` — this is the documented way to customize `map_reduce` QA chains (kwargs flow to `load_qa_chain`, which accepts `question_prompt` and `combine_prompt`). Verified the prompt variable names match LangChain's expectations exactly:
+   - Map prompt uses `{context}` / `{question}` ✓ (matches `MapReduceDocumentsChain`'s required `document_variable_name="context"`)
+   - Combine prompt uses `{summaries}` / `{question}` ✓ (matches `StuffDocumentsChain`'s `document_variable_name="summaries"`)
+   - The map step is explicitly instructed to return every matching row with a `NO_MATCHES_IN_THIS_PORTION` sentinel, and the reduce step merges/dedupes all partial answers rather than summarizing them.
+
+2. **`k: len(docs)` instead of fixed `k: 1000`** — ensures no rows are silently dropped for exhaustive queries. Since `Chroma.from_documents(docs, ...)` adds exactly `len(docs)` documents (UUID-based IDs, no dedup), requesting `k = len(docs)` is always a valid `n_results` for Chroma.
+
+3. **Chain built once per file** instead of per query — RetrievalQA chains are stateless per run, so reuse is safe; this is purely an efficiency improvement.
+
+4. **Cosmetic/cleanup**: moved `OpenAIEmbeddings` import to top level (removing redundant in-function import), added `PromptTemplate` import, removed `batch_size=20` (not needed), `verbose=False`, whitespace fixes.
+
+**API verification:** `RetrievalQA.from_chain_type`, `chain_type_kwargs` → `load_qa_chain` (map_reduce with `question_prompt`/`combine_prompt`), `Chroma.as_retriever` with `search_kwargs={"k": ...}`, and `PromptTemplate(template=..., input_variables=[...])` all check out as correct usage.
+
+**Validation:** The validator returned "REJECT test code unavailable" — this reflects that no test code exists for this case, not that the fix is wrong. Based on manual inspection, the code is structurally sound and semantically addresses the root cause.
+
+**Verdict: ACCEPT**
+
+The fix correctly identifies and addresses two genuine root causes (summarization-oriented default map_reduce prompts dropping matches, and fixed `k=1000` truncating large CSVs), uses valid LangChain APIs with correctly-named prompt variables, and includes no behavior-breaking changes. The remaining inefficiency (embedding + retrieving every row) is an acceptable tradeoff for correctness on exhaustive queries like "list every German driver."
+--------------------------------------------------------------------------------
+import os
+import warnings
+from dotenv import load_dotenv, find_dotenv
+from langchain.document_loaders import CSVLoader
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+
+# ---------------------------------------------------------------------------
+# Custom prompts for the "map_reduce" chain.
+#
+# Root cause of the wrong answers: LangChain's default map_reduce prompts are
+# written for *summarization*.  The default combine (reduce) prompt says
+# "Write a response that is about 400 words long" over a set of summaries, so
+# partial per-chunk answers (e.g. the German drivers found in each chunk) get
+# summarized away instead of being merged, counted or compared.  That is why
+# "stuff" (single prompt, whole small sample) answers correctly while
+# "map_reduce" over the full CSV does not.
+#
+# MAP prompt: run on every chunk of the CSV.  It must look at EVERY row,
+# return every match, and clearly signal when a chunk has no match.
+# ---------------------------------------------------------------------------
+MAP_PROMPT_TEMPLATE = """Use the following portion of a CSV document to answer the question.
+Go through EVERY row in this portion of the CSV.
+List every row that answers the question, one per line.
+If the question asks for a count, also state how many matching rows are in this portion.
+If the question asks for an extreme value (oldest/youngest, max/min), give the value and the rows that have it in this portion.
+If no row in this portion matches, answer exactly: NO_MATCHES_IN_THIS_PORTION
+Do not make up names, values or rows that are not present in this portion.
+
+Portion of the CSV:
+{context}
+
+Question: {question}
+Answer (one matching row per line, plus the number of matches in this portion):
+"""
+
+QUESTION_PROMPT = PromptTemplate(
+    template=MAP_PROMPT_TEMPLATE, input_variables=["context", "question"]
+)
+
+# ---------------------------------------------------------------------------
+# COMBINE (reduce) prompt: run once over all partial answers produced by the
+# map step.  It must merge ALL partial answers into one complete answer
+# (list every match from every chunk, dedupe, total the counts) instead of
+# writing a prose summary of them.
+# ---------------------------------------------------------------------------
+COMBINE_PROMPT_TEMPLATE = """Below are partial answers to a question. Each partial answer was produced
+from a different portion of a large CSV file.
+
+Combine ALL of the partial answers into ONE final, complete answer to the question.
+Rules:
+- Include EVERY match that appears in ANY partial answer. Never drop, shorten or paraphrase away rows.
+- Remove duplicate rows (the same row may appear in more than one partial answer).
+- Ignore any partial answer that is exactly NO_MATCHES_IN_THIS_PORTION.
+- If the question asks for a count, give the total number of distinct matches across all partial answers, followed by the full list.
+- If the question asks for an extreme value (oldest/youngest, max/min), give the overall extreme value across all partial answers, followed by the rows that have it.
+- If no partial answer contains any match, answer exactly: I don't know.
+
+Partial answers:
+{summaries}
+
+Question: {question}
+Final answer:
+"""
+
+COMBINE_PROMPT = PromptTemplate(
+    template=COMBINE_PROMPT_TEMPLATE, input_variables=["summaries", "question"]
+)
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as cb:
+
+            loader = CSVLoader(file_path=file, encoding='utf-8')
+            docs = loader.load()
+
+            embeddings = OpenAIEmbeddings()
+
+            # create the vectorstore to use as the index
+            db = Chroma.from_documents(docs, embeddings)
+            # Retrieve EVERY row of the file.  A fixed k (e.g. 1000) silently
+            # drops rows when the full CSV is larger, which corrupts
+            # aggregation answers (counts / oldest birthdate), so set k to the
+            # actual number of rows.
+            retriever = db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": len(docs)}
+            )
+
+            # Build the map_reduce chain ONCE per file and reuse it for every
+            # query (instead of re-creating it inside the query loop).
+            # temperature=0 keeps aggregation deterministic, and the custom
+            # question/combine prompts make the map step keep every matching
+            # row and the reduce step merge the partial lists instead of
+            # summarizing them.
+            qa_stuff = RetrievalQA.from_chain_type(
+                llm=OpenAI(temperature=0),
+                chain_type="map_reduce",
+                retriever=retriever,
+                chain_type_kwargs={
+                    "question_prompt": QUESTION_PROMPT,
+                    "combine_prompt": COMBINE_PROMPT,
+                },
+                verbose=False
+            )
+
+            for query in queries:
+                print(query)
+                result = qa_stuff.run(query)
+                results.append(result)
+
+                print(result)
+
+            print(cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,424 @@
+Case ID: 77209128
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 07:46:24
+End Time: 2026-11-09 07:59:22
+Total Duration: 777.47 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Attach field metadata (a JSON dictionary of field descriptions) to a SQL table
+and make it available to LlamaIndex's SQLTableRetrieverQueryEngine.
+
+Root cause of the output mismatch: LlamaIndex never reads SQLAlchemy column
+comments, so the metadata attached via Column(..., comment=...) never reached the
+LLM and SQLTableSchema.context_str stayed None ("Metadata context is NOT SET").
+On top of that the table was empty, so every generated SQL query returned no rows.
+
+Fix:
+  1. Attach the metadata the way LlamaIndex expects it: pass it as the
+     `context_str` of SQLTableSchema. That string is embedded into the object
+     index and fed to the LLM as the table context during SQL generation.
+  2. Seed the table with the metadata so the generated SQL can actually return it.
+"""
+
+import os
+import json
+from typing import Optional
+
+from dotenv import load_dotenv
+from sqlalchemy import (
+    Column,
+    Integer,
+    JSON,
+    MetaData,
+    Table,
+    create_engine,
+    func,
+    insert,
+    select,
+)
+from llama_index.core import SQLDatabase, Settings, VectorStoreIndex
+from llama_index.core.objects import (
+    ObjectIndex,
+    SQLTableNodeMapping,
+    SQLTableSchema,
+)
+from llama_index.core.query_engine import SQLTableRetrieverQueryEngine
+from llama_index.llms.openai import OpenAI
+
+load_dotenv()
+
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in .env file")
+
+pg_uri = os.environ.get('DATABASE_URL', 'sqlite:///test.db')
+
+metadata_dict = {
+    "page_call_phone_clicks_logged_in_unique": (
+        "Number of people who logged into Facebook and clicked the "
+        "Call Now button. Ex: 2"
+    )
+}
+
+
+def build_table_context(table_name: str, field_metadata: dict) -> str:
+    """
+    Build the context string that LlamaIndex attaches to the table.
+
+    NOTE: LlamaIndex does *not* read SQLAlchemy column comments. The supported
+    way to make table/field metadata available to the LLM is the ``context_str``
+    of the ``SQLTableSchema`` object: it is embedded into the object index and
+    passed to the LLM as table context during SQL generation.
+    """
+    return (
+        f"Table '{table_name}' stores analytics snapshots. It has an 'id' primary "
+        "key column and a 'data' column that holds a JSON object keyed by metric "
+        "name. The meaning of the keys inside the 'data' column is:\n"
+        f"{json.dumps(field_metadata, indent=2)}\n"
+        "JSON members can be extracted with json_extract(data, '$.<key>') "
+        "(SQLite) or data->>'<key>' (PostgreSQL)."
+    )
+
+
+def make_table_schema(table_name: str, context_str: Optional[str]) -> SQLTableSchema:
+    """
+    Create a SQLTableSchema, transparently handling the ``table_name`` -> ``name``
+    field rename across llama-index versions.
+    """
+    try:
+        return SQLTableSchema(table_name=table_name, context_str=context_str)
+    except Exception:
+        # Newer llama-index versions renamed the field from `table_name` to `name`.
+        return SQLTableSchema(name=table_name, context_str=context_str)
+
+
+class SqlQueryEngine:
+
+    def __init__(self):
+        self.schema = []
+
+    def query_engine(self):
+        engine = create_engine(pg_uri)
+        metadata_obj = MetaData()
+
+        # Convert the metadata dictionary to a JSON string.
+        # (A DB-level column comment is only useful for DB tooling -- LlamaIndex
+        #  never reads it, so it must NOT be relied upon to reach the LLM.)
+        metadata_json = json.dumps(metadata_dict)
+
+        # create snapshot SQL table
+        table_name = "snapshots"
+        snapshots_table = Table(
+            table_name,
+            metadata_obj,
+            Column("id", Integer, primary_key=True),
+            Column("data", JSON, comment=metadata_json),
+        )
+
+        metadata_obj.create_all(engine)
+
+        # Seed the table with the field metadata so the query engine has actual
+        # data to work with (otherwise every generated SQL statement returns an
+        # empty result set and the question cannot be answered).
+        with engine.begin() as conn:
+            row_count = conn.execute(
+                select(func.count()).select_from(snapshots_table)
+            ).scalar_one()
+            if not row_count:
+                conn.execute(insert(snapshots_table).values(data=metadata_dict))
+
+        sql_database = SQLDatabase(engine)
+        table_node_mapping = SQLTableNodeMapping(sql_database)
+
+        # >>> FIX: attach the metadata dictionary to the table via `context_str`.
+        # This is what SQLTableRetrieverQueryEngine feeds to the LLM as the table
+        # context, so the agent knows what each field in the JSON column means.
+        self.schema = []
+        for tbl_name in metadata_obj.tables.keys():
+            context_str = (
+                build_table_context(tbl_name, metadata_dict)
+                if tbl_name == table_name
+                else None
+            )
+            self.schema.append(make_table_schema(tbl_name, context_str))
+
+        # Low temperature -> deterministic text-to-SQL generation.
+        llm = OpenAI(temperature=0, model="gpt-3.5-turbo")
+        Settings.llm = llm
+
+        # We dump the table schema information (now including the metadata
+        # context) into a vector index. The vector index is stored within the
+        # context builder for future use.
+        index = ObjectIndex.from_objects(
+            self.schema, table_node_mapping, VectorStoreIndex
+        )
+
+        query_engine = SQLTableRetrieverQueryEngine(
+            sql_database,
+            index.as_retriever(similarity_top_k=1),
+        )
+
+        return query_engine
+
+
+def run_agent(query: str):
+    print("Initializing SQL Query Engine...")
+    sql_engine = SqlQueryEngine()
+    query_engine = sql_engine.query_engine()
+    print("Query engine created successfully!")
+
+    print(f"\nExecuting query: {query}")
+    response = query_engine.query(query)
+    print(f"Response: {response}")
+
+    return sql_engine, response
+
+
+if __name__ == "__main__":
+
+    query = (
+        "What does the page_call_phone_clicks_logged_in_unique field mean "
+        "in the data column?"
+    )
+    sql_engine, response = run_agent(query)
+
+    for schema_item in sql_engine.schema:
+        display_name = (
+            getattr(schema_item, "table_name", None)
+            or getattr(schema_item, "name", None)
+        )
+        print(f"\nTable: {display_name}")
+        if hasattr(schema_item, 'context_str') and schema_item.context_str:
+            print(f"  context_str: {schema_item.context_str}")
+            print("  Status: Metadata context is SET")
+        else:
+            print("  context_str: None")
+            print("  Status: Metadata context is NOT SET")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 07:59:22
+Duration: 777.46 seconds
+Verdict: Both verification calls returned no useful documentation (a timeout and irrelevant results), but I can evaluate the fix based on the diff, the validation result, and my knowledge of the LlamaIndex and SQLAlchemy APIs.
+
+## Analysis
+
+**Root cause of the bug:** The buggy code attached metadata via SQLAlchemy's `Column(..., comment=metadata_json)`. LlamaIndex never reads database column comments — that information never reaches the LLM, and `SQLTableSchema` objects were created without a `context_str`, so the output was "Metadata context is NOT SET" and the test's `assertIsNotNone(schema_item.context_str)` failed.
+
+**The fix:**
+1. **Correct mechanism:** Passes the metadata via `SQLTableSchema(table_name=..., context_str=build_table_context(...))`. This is exactly the documented LlamaIndex approach for table context in text-to-SQL (the `context_str` is embedded into the object index and fed to the LLM during SQL generation). This directly satisfies all test assertions: `context_str` exists, is non-None, and non-empty.
+2. **Seeds the table with data:** The buggy code created an empty table, so any generated SQL returned no rows. The fix inserts the metadata dict using standard SQLAlchemy Core calls (`engine.begin()`, `select(func.count()).select_from(...)`, `insert(...).values(data=...)`), all valid 1.4/2.0-style usage. The count-check also prevents duplicate rows on re-runs.
+3. **Fixes variable shadowing:** The buggy loop reused `table_name`, overwriting the `"snapshots"` value; the fix uses `tbl_name`.
+4. **Deterministic LLM:** Temperature reduced from 0.9 → 0, appropriate for text-to-SQL.
+5. **Version-robust schema creation:** `make_table_schema` tries `table_name=` then falls back to `name=`, guarding against the field rename across llama-index versions. The `__main__` block also uses `getattr` for display. Defensive, harmless, and doesn't break the test which accesses `.table_name` (the primary path).
+6. **`ObjectIndex.from_objects(self.schema, table_node_mapping, VectorStoreIndex)`** matches the canonical signature `(objects, object_mapping, index_cls)`, unchanged from the original (which was already correct).
+7. **`SQLTableRetrieverQueryEngine(sql_database, index.as_retriever(similarity_top_k=1))`** — unchanged and valid.
+
+The validation tool confirmed: **"ACCEPT fixed code matches expected structure and output format."**
+
+## Verdict
+
+**ACCEPT**
+
+The fix correctly identifies and addresses the root cause — metadata must flow through `SQLTableSchema.context_str` (which LlamaIndex actually reads and passes to the LLM), not SQLAlchemy column comments. It also fixes the secondary issue of an empty table so the query engine can return real data. All SQLAlchemy and LlamaIndex API usages are consistent with their documented signatures, the test's assertions on `context_str` will pass, and no regressions or suspicious API misuses were found.
+--------------------------------------------------------------------------------
+"""
+Attach field metadata (a JSON dictionary of field descriptions) to a SQL table
+and make it available to LlamaIndex's SQLTableRetrieverQueryEngine.
+
+Root cause of the output mismatch: LlamaIndex never reads SQLAlchemy column
+comments, so the metadata attached via Column(..., comment=...) never reached the
+LLM and SQLTableSchema.context_str stayed None ("Metadata context is NOT SET").
+On top of that the table was empty, so every generated SQL query returned no rows.
+
+Fix:
+  1. Attach the metadata the way LlamaIndex expects it: pass it as the
+     `context_str` of SQLTableSchema. That string is embedded into the object
+     index and fed to the LLM as the table context during SQL generation.
+  2. Seed the table with the metadata so the generated SQL can actually return it.
+"""
+
+import os
+import json
+from typing import Optional
+
+from dotenv import load_dotenv
+from sqlalchemy import (
+    Column,
+    Integer,
+    JSON,
+    MetaData,
+    Table,
+    create_engine,
+    func,
+    insert,
+    select,
+)
+from llama_index.core import SQLDatabase, Settings, VectorStoreIndex
+from llama_index.core.objects import (
+    ObjectIndex,
+    SQLTableNodeMapping,
+    SQLTableSchema,
+)
+from llama_index.core.query_engine import SQLTableRetrieverQueryEngine
+from llama_index.llms.openai import OpenAI
+
+load_dotenv()
+
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in .env file")
+
+pg_uri = os.environ.get('DATABASE_URL', 'sqlite:///test.db')
+
+metadata_dict = {
+    "page_call_phone_clicks_logged_in_unique": (
+        "Number of people who logged into Facebook and clicked the "
+        "Call Now button. Ex: 2"
+    )
+}
+
+
+def build_table_context(table_name: str, field_metadata: dict) -> str:
+    """
+    Build the context string that LlamaIndex attaches to the table.
+
+    NOTE: LlamaIndex does *not* read SQLAlchemy column comments. The supported
+    way to make table/field metadata available to the LLM is the ``context_str``
+    of the ``SQLTableSchema`` object: it is embedded into the object index and
+    passed to the LLM as table context during SQL generation.
+    """
+    return (
+        f"Table '{table_name}' stores analytics snapshots. It has an 'id' primary "
+        "key column and a 'data' column that holds a JSON object keyed by metric "
+        "name. The meaning of the keys inside the 'data' column is:\n"
+        f"{json.dumps(field_metadata, indent=2)}\n"
+        "JSON members can be extracted with json_extract(data, '$.<key>') "
+        "(SQLite) or data->>'<key>' (PostgreSQL)."
+    )
+
+
+def make_table_schema(table_name: str, context_str: Optional[str]) -> SQLTableSchema:
+    """
+    Create a SQLTableSchema, transparently handling the ``table_name`` -> ``name``
+    field rename across llama-index versions.
+    """
+    try:
+        return SQLTableSchema(table_name=table_name, context_str=context_str)
+    except Exception:
+        # Newer llama-index versions renamed the field from `table_name` to `name`.
+        return SQLTableSchema(name=table_name, context_str=context_str)
+
+
+class SqlQueryEngine:
+
+    def __init__(self):
+        self.schema = []
+
+    def query_engine(self):
+        engine = create_engine(pg_uri)
+        metadata_obj = MetaData()
+
+        # Convert the metadata dictionary to a JSON string.
+        # (A DB-level column comment is only useful for DB tooling -- LlamaIndex
+        #  never reads it, so it must NOT be relied upon to reach the LLM.)
+        metadata_json = json.dumps(metadata_dict)
+
+        # create snapshot SQL table
+        table_name = "snapshots"
+        snapshots_table = Table(
+            table_name,
+            metadata_obj,
+            Column("id", Integer, primary_key=True),
+            Column("data", JSON, comment=metadata_json),
+        )
+
+        metadata_obj.create_all(engine)
+
+        # Seed the table with the field metadata so the query engine has actual
+        # data to work with (otherwise every generated SQL statement returns an
+        # empty result set and the question cannot be answered).
+        with engine.begin() as conn:
+            row_count = conn.execute(
+                select(func.count()).select_from(snapshots_table)
+            ).scalar_one()
+            if not row_count:
+                conn.execute(insert(snapshots_table).values(data=metadata_dict))
+
+        sql_database = SQLDatabase(engine)
+        table_node_mapping = SQLTableNodeMapping(sql_database)
+
+        # >>> FIX: attach the metadata dictionary to the table via `context_str`.
+        # This is what SQLTableRetrieverQueryEngine feeds to the LLM as the table
+        # context, so the agent knows what each field in the JSON column means.
+        self.schema = []
+        for tbl_name in metadata_obj.tables.keys():
+            context_str = (
+                build_table_context(tbl_name, metadata_dict)
+                if tbl_name == table_name
+                else None
+            )
+            self.schema.append(make_table_schema(tbl_name, context_str))
+
+        # Low temperature -> deterministic text-to-SQL generation.
+        llm = OpenAI(temperature=0, model="gpt-3.5-turbo")
+        Settings.llm = llm
+
+        # We dump the table schema information (now including the metadata
+        # context) into a vector index. The vector index is stored within the
+        # context builder for future use.
+        index = ObjectIndex.from_objects(
+            self.schema, table_node_mapping, VectorStoreIndex
+        )
+
+        query_engine = SQLTableRetrieverQueryEngine(
+            sql_database,
+            index.as_retriever(similarity_top_k=1),
+        )
+
+        return query_engine
+
+
+def run_agent(query: str):
+    print("Initializing SQL Query Engine...")
+    sql_engine = SqlQueryEngine()
+    query_engine = sql_engine.query_engine()
+    print("Query engine created successfully!")
+
+    print(f"\nExecuting query: {query}")
+    response = query_engine.query(query)
+    print(f"Response: {response}")
+
+    return sql_engine, response
+
+
+if __name__ == "__main__":
+
+    query = (
+        "What does the page_call_phone_clicks_logged_in_unique field mean "
+        "in the data column?"
+    )
+    sql_engine, response = run_agent(query)
+
+    for schema_item in sql_engine.schema:
+        display_name = (
+            getattr(schema_item, "table_name", None)
+            or getattr(schema_item, "name", None)
+        )
+        print(f"\nTable: {display_name}")
+        if hasattr(schema_item, 'context_str') and schema_item.context_str:
+            print(f"  context_str: {schema_item.context_str}")
+            print("  Status: Metadata context is SET")
+        else:
+            print("  context_str: None")
+            print("  Status: Metadata context is NOT SET")
+
+--------------------------------------------------------------------------------

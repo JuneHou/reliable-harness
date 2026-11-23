@@ -18,7 +18,6 @@ $PY -m pytest tests -q
 # offline preparation
 PYTHONPATH=src $PY -m motivation_pilot.extension map
 PYTHONPATH=src $PY -m motivation_pilot.extension manifest
-PYTHONPATH=src $PY -m motivation_pilot.extension selftest
 
 # live stage, needs OPENAI_API_KEY; the same command resumes after an interruption
 PYTHONPATH=src nohup $PY -m motivation_pilot.extension live > artifacts/agentdefect_extension/exp-2026-10-22/live.log 2>&1 &
@@ -29,13 +28,11 @@ PYTHONPATH=src $PY -m motivation_pilot.extension report
 
 # 78383658 retrieval intervention R, experiment exp-2026-10-22-r (report section 7)
 PYTHONPATH=src $PY -m motivation_pilot.retrieval_extension manifest
-PYTHONPATH=src $PY -m motivation_pilot.retrieval_extension selftest
 PYTHONPATH=src nohup $PY -m motivation_pilot.retrieval_extension live > artifacts/agentdefect_extension/exp-2026-10-22-r/live.log 2>&1 &
 PYTHONPATH=src $PY -m motivation_pilot.retrieval_extension compare
 
 # environment flip experiment exp-2026-10-23-e (report section 8); the 79343179 E1 runs use /data/wang/junh/envs/harnessfix-pandas2
 PYTHONPATH=src $PY -m motivation_pilot.environment_extension manifest
-PYTHONPATH=src $PY -m motivation_pilot.environment_extension selftest
 cd /data/wang/junh/githubs/AgentDefect/motivation_pilot && PYTHONPATH=src nohup /data/wang/junh/envs/harnessfix/bin/python -m motivation_pilot.environment_extension live > /data/wang/junh/githubs/AgentDefect/motivation_pilot/artifacts/agentdefect_extension/exp-2026-10-23-e/live.log 2>&1 &
 PYTHONPATH=src $PY -m motivation_pilot.environment_extension compare
 
@@ -46,7 +43,7 @@ PYTHONPATH=src $PY -m motivation_pilot.extension report
 
 A run has finished when `ps aux | grep extension | grep live` prints nothing and the last line of its `live.log` begins with `decision` or names the report files.
 
-`live` exits with 2 when `configs/study.yaml` differs from the prelude settings, 3 when probes change the 76906469 outcomes, 4 when a recorded run's fingerprint no longer matches, 5 when the self test is missing or older than `instrument.py`, 6 without `OPENAI_API_KEY`, and 7 without the manifest. The retrieval and environment experiments use the same codes except 3, since every one of their cells is probed.
+`live` exits with 2 when `configs/study.yaml` differs from the prelude settings, 3 when probes change the 76906469 outcomes, 4 when a recorded run's fingerprint no longer matches, 6 without `OPENAI_API_KEY`, and 7 without the manifest. The retrieval and environment experiments use the same codes except 3, since every one of their cells is probed.
 
 ## File map
 

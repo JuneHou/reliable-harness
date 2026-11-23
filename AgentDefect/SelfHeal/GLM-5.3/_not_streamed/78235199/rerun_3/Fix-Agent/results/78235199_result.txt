@@ -1,0 +1,634 @@
+Case ID: 78235199
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 02:30:32
+End Time: 2026-11-05 02:42:32
+Total Duration: 719.77 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import json
+import os
+import traceback
+import uuid
+
+
+class CBEventType:
+    """Event types produced by the index/query pipeline (mirrors llama_index.callbacks)."""
+
+    LLM = "llm"
+    CHUNKING = "chunking"
+    NODE_PARSING = "node_parsing"
+    EMBEDDING = "embedding"
+    RETRIEVE = "retrieve"
+    SYNTHESIZE = "synthesize"
+    QUERY = "query"
+
+
+class EventPayload:
+    PROMPT = "prompt"
+    MESSAGES = "messages"
+    COMPLETION = "completion"
+    RESPONSE = "response"
+
+
+class BaseCallbackHandler:
+    """Base handler with no-op hooks so managers can safely fan out to all handlers."""
+
+    def __init__(self, event_starts_to_ignore=None, event_ends_to_ignore=None):
+        self.event_starts_to_ignore = event_starts_to_ignore or []
+        self.event_ends_to_ignore = event_ends_to_ignore or []
+
+    def on_event_start(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        pass
+
+    def on_event_end(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        pass
+
+    def start_trace(self, trace_id):
+        pass
+
+    def end_trace(self, trace_id=None):
+        pass
+
+
+class OpenAIFineTuningHandler(BaseCallbackHandler):
+    """
+    Callback handler that records every LLM prompt/completion pair so it can be
+    dumped to a JSONL file suitable for OpenAI fine-tuning.
+
+    The handler only accumulates data when LLM events actually flow through the
+    callback manager it is registered with, so the LLM used for querying must
+    carry that same callback manager.
+    """
+
+    def __init__(self, start_trace_callback=None):
+        super().__init__()
+        self.data = []
+        self._start_trace_callback = start_trace_callback
+        self.cur_trace_id = None
+        self.cur_event_id = None
+        self.event_id_to_exclude = set()
+
+    def start_trace(self, trace_id):
+        if self._start_trace_callback is not None:
+            self._start_trace_callback(trace_id)
+        self.cur_trace_id = trace_id
+
+    def end_trace(self, trace_id=None):
+        self.cur_event_id = None
+
+    def on_event_start(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        if event_type == CBEventType.LLM:
+            self.cur_event_id = event_id or str(uuid.uuid4())
+            return self.cur_event_id
+        return None
+
+    def on_event_end(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        if event_type != CBEventType.LLM:
+            return
+
+        event_id = event_id or self.cur_event_id
+        if event_id is None or event_id in self.event_id_to_exclude:
+            return
+
+        payload = payload or {}
+        messages = payload.get(EventPayload.MESSAGES)
+        if not messages:
+            prompt = payload.get(EventPayload.PROMPT)
+            if not prompt:
+                raise ValueError(
+                    "LLM event payload is missing both 'messages' and 'prompt'; "
+                    "the handler cannot build a fine-tuning example."
+                )
+            messages = [{"role": "user", "content": prompt}]
+
+        completion = payload.get(EventPayload.COMPLETION)
+        if completion is None:
+            response = payload.get(EventPayload.RESPONSE)
+            completion = getattr(response, "response", response)
+        if completion is None:
+            raise ValueError(
+                "LLM event payload is missing 'completion'; the handler cannot "
+                "build a fine-tuning example."
+            )
+
+        example = {
+            "id": str(uuid.uuid4()),
+            "messages": [
+                *[
+                    {"role": message["role"], "content": message["content"]}
+                    for message in messages[:-1]
+                ],
+                {"role": "user", "content": messages[-1]["content"]},
+                {"role": "assistant", "content": completion},
+            ],
+        }
+        self.data.append(example)
+        self.event_id_to_exclude.add(event_id)
+
+    def get_finetuning_events(self):
+        return self.data
+
+    def save_finetuning_events(self, path):
+        """Write every collected example to `path` and report the true count."""
+        with open(path, "w", encoding="utf-8") as f:
+            for data_point in self.data:
+                f.write(json.dumps(data_point) + "\n")
+        print(f"Wrote {len(self.data)} examples to {path}")
+
+
+class CallbackManager:
+    """Fans events out to every registered handler and propagates event ids."""
+
+    def __init__(self, handlers):
+        self.handlers = handlers
+
+    def on_event_start(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        if event_id is None:
+            event_id = str(uuid.uuid4())
+        for handler in self.handlers:
+            result = handler.on_event_start(
+                event_type, payload, event_id=event_id, parent_id=parent_id, **kwargs
+            )
+            if result is not None:
+                event_id = result
+        return event_id
+
+    def on_event_end(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        for handler in self.handlers:
+            handler.on_event_end(
+                event_type, payload, event_id=event_id, parent_id=parent_id, **kwargs
+            )
+
+    def start_trace(self, trace_id):
+        for handler in self.handlers:
+            handler.start_trace(trace_id)
+
+    def end_trace(self, trace_id=None):
+        for handler in self.handlers:
+            handler.end_trace(trace_id)
+
+
+class MockLLM:
+    """
+    LLM whose completions flow through its callback manager. Without this
+    event dispatch, the fine-tuning handler never sees any LLM calls.
+    """
+
+    def __init__(self, callback_manager=None):
+        if callback_manager is None:
+            raise ValueError(
+                "MockLLM requires a callback_manager so LLM events can be "
+                "captured by the fine-tuning handler."
+            )
+        self.callback_manager = callback_manager
+
+    def complete(self, prompt, **kwargs):
+        event_id = self.callback_manager.on_event_start(
+            CBEventType.LLM, payload={EventPayload.PROMPT: prompt}
+        )
+        response_text = f"Answer to: {prompt}"
+        self.callback_manager.on_event_end(
+            CBEventType.LLM,
+            payload={
+                EventPayload.PROMPT: prompt,
+                EventPayload.COMPLETION: response_text,
+            },
+            event_id=event_id,
+        )
+        return response_text
+
+
+class QueryEngine:
+    def __init__(self, index, similarity_top_k=2, llm=None):
+        if llm is None:
+            raise ValueError(
+                "An llm must be passed to as_query_engine(); otherwise the "
+                "query engine uses a default LLM whose callback manager does "
+                "not contain the fine-tuning handler and no events are recorded."
+            )
+        self.index = index
+        self.similarity_top_k = similarity_top_k
+        self.llm = llm
+
+    def query(self, question):
+        # Route the question through the provided LLM so that its callback
+        # manager (which owns the fine-tuning handler) receives the LLM event.
+        response = self.llm.complete(question)
+        if response is None:
+            raise RuntimeError(f"No response produced for question: {question}")
+        return response
+
+
+class VectorStoreIndex:
+    def __init__(self, nodes=None):
+        self.nodes = nodes or []
+
+    @staticmethod
+    def from_documents(docs):
+        return VectorStoreIndex(docs)
+
+    def as_query_engine(self, similarity_top_k, llm):
+        return QueryEngine(self, similarity_top_k=similarity_top_k, llm=llm)
+
+
+class FineTuningExample:
+    def __init__(self, dataset_path, documents):
+        self.dataset_path = dataset_path
+        self.documents = documents
+        self.llm = None
+
+    def jsonl_generation(self):
+        """Generate JSONL file for fine-tuning events."""
+        os.makedirs(self.dataset_path, exist_ok=True)
+
+        finetuning_handler = OpenAIFineTuningHandler()
+        callback_manager = CallbackManager([finetuning_handler])
+        # The LLM must be constructed with the callback manager that holds the
+        # fine-tuning handler, and that same LLM must be handed to the query
+        # engine -- otherwise no LLM events are ever captured.
+        self.llm = MockLLM(callback_manager=callback_manager)
+
+        questions_path = os.path.join(self.dataset_path, "train_questions.txt")
+        if not os.path.exists(questions_path):
+            raise FileNotFoundError(f"Questions file not found: {questions_path}")
+
+        questions = []
+        with open(questions_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    questions.append(line)
+
+        try:
+            index = VectorStoreIndex.from_documents(self.documents)
+            query_engine = index.as_query_engine(similarity_top_k=2, llm=self.llm)
+            for question in questions:
+                response = query_engine.query(question)
+                print(f"Q: {question}\nA: {response}\n")
+        except Exception:
+            # Never silently swallow errors: a swallowed failure is exactly what
+            # makes the run appear to succeed while zero events get collected.
+            traceback.print_exc()
+            raise
+        finally:
+            finetuning_handler.save_finetuning_events(
+                os.path.join(self.dataset_path, "finetuning_events.jsonl")
+            )
+
+
+def prepare_test_data(questions_path):
+    os.makedirs(os.path.dirname(questions_path), exist_ok=True)
+    with open(questions_path, "w", encoding="utf-8") as f:
+        f.write("Question 1\nQuestion 2\n")
+
+
+def run_agent(questions_path):
+    dataset_path = os.path.dirname(questions_path)
+    ft = FineTuningExample(dataset_path=dataset_path, documents=[])
+    ft.jsonl_generation()
+
+
+if __name__ == "__main__":
+    questions_path = "./dataset_data/train_questions.txt"
+    prepare_test_data(questions_path)
+    run_agent(questions_path)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 02:42:32
+Duration: 719.77 seconds
+Verdict: Both API verifications confirm correct usage. Let me now provide my complete evaluation.
+
+## Evaluation Analysis
+
+### Root Cause of the Bug
+The original code had multiple interrelated defects that guaranteed the output file would always be empty:
+1. **`save_finetuning_events` was hardcoded to write nothing** — it wrote `""` and printed "Wrote 0 examples" unconditionally
+2. **The handler never collected any data** — it had no `on_event_start`/`on_event_end` logic and no `data` attribute
+3. **The LLM was a lifeless stub** — `type("LLM", (), {"callback_manager": callback_manager})()` never dispatched any LLM events through the callback manager
+4. **`VectorStoreIndex.query` returned `None`** — no actual query/LLM flow occurred
+5. **Errors were silently swallowed** — the broad `except Exception` masked failures that would make the run appear successful while collecting zero events
+
+### Assessment of the Fix
+The fixed code addresses all root causes coherently:
+
+✅ **`OpenAIFineTuningHandler` now implements real event capture**: `on_event_end` for `LLM` events extracts messages/prompt and completion payloads, builds a fine-tuning example (`{"id", "messages"}` with user/assistant roles — valid JSONL format), and appends to `self.data`.
+
+✅ **`save_finetuning_events` writes actual data**: iterates `self.data`, writes `json.dumps(data_point) + "\n"` per example (verified: `json.dumps` correctly serializes dicts to JSON strings), and reports the true count.
+
+✅ **`CallbackManager` properly fans out events** to all registered handlers and propagates event IDs, including deduplication via `event_id_to_exclude`.
+
+✅ **`MockLLM` is functional**: `complete()` dispatches real LLM events (start with prompt, end with prompt + completion) through its callback manager — this is the critical missing link that makes the handler capture data.
+
+✅ **`QueryEngine.query` routes through the LLM**: each question triggers `llm.complete(question)`, producing one recorded event per question.
+
+✅ **Errors are no longer silently swallowed**: `traceback.print_exc()` followed by `raise`, with the `finally` block still saving collected events.
+
+✅ **Test flow verified end-to-end**: `prepare_test_data` writes "Question 1\nQuestion 2\n" → 2 questions read (empty lines filtered) → 2 LLM events dispatched and captured → JSONL file written with 2 non-empty lines → `assertGreater(len(lines), 0)` passes. File existence assertion also passes.
+
+✅ **API usage verified**: `json.dumps` (dict → JSON string) and `os.makedirs(..., exist_ok=True)` (recursive directory creation) are both used correctly.
+
+✅ **Public interface preserved**: `prepare_test_data` and `run_agent` retain their signatures for the test's import from `run_buggy`; only stdlib imports (`json`, `traceback`, `uuid`) were added.
+
+### Conclusion
+
+**ACCEPT**
+
+The fix is a legitimate, root-cause repair rather than a test-gaming workaround. It implements genuine callback-based event collection (prompt/completion pairs recorded through the callback manager the LLM carries) and writes the actual collected examples as valid JSONL. The structural validation passed, the end-to-end flow produces 2 data lines satisfying `assertGreater(len(lines), 0)`, and all API calls (`json.dumps`, `os.makedirs`) were verified as correctly used.
+--------------------------------------------------------------------------------
+import json
+import os
+import traceback
+import uuid
+
+
+class CBEventType:
+    """Event types produced by the index/query pipeline (mirrors llama_index.callbacks)."""
+
+    LLM = "llm"
+    CHUNKING = "chunking"
+    NODE_PARSING = "node_parsing"
+    EMBEDDING = "embedding"
+    RETRIEVE = "retrieve"
+    SYNTHESIZE = "synthesize"
+    QUERY = "query"
+
+
+class EventPayload:
+    PROMPT = "prompt"
+    MESSAGES = "messages"
+    COMPLETION = "completion"
+    RESPONSE = "response"
+
+
+class BaseCallbackHandler:
+    """Base handler with no-op hooks so managers can safely fan out to all handlers."""
+
+    def __init__(self, event_starts_to_ignore=None, event_ends_to_ignore=None):
+        self.event_starts_to_ignore = event_starts_to_ignore or []
+        self.event_ends_to_ignore = event_ends_to_ignore or []
+
+    def on_event_start(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        pass
+
+    def on_event_end(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        pass
+
+    def start_trace(self, trace_id):
+        pass
+
+    def end_trace(self, trace_id=None):
+        pass
+
+
+class OpenAIFineTuningHandler(BaseCallbackHandler):
+    """
+    Callback handler that records every LLM prompt/completion pair so it can be
+    dumped to a JSONL file suitable for OpenAI fine-tuning.
+
+    The handler only accumulates data when LLM events actually flow through the
+    callback manager it is registered with, so the LLM used for querying must
+    carry that same callback manager.
+    """
+
+    def __init__(self, start_trace_callback=None):
+        super().__init__()
+        self.data = []
+        self._start_trace_callback = start_trace_callback
+        self.cur_trace_id = None
+        self.cur_event_id = None
+        self.event_id_to_exclude = set()
+
+    def start_trace(self, trace_id):
+        if self._start_trace_callback is not None:
+            self._start_trace_callback(trace_id)
+        self.cur_trace_id = trace_id
+
+    def end_trace(self, trace_id=None):
+        self.cur_event_id = None
+
+    def on_event_start(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        if event_type == CBEventType.LLM:
+            self.cur_event_id = event_id or str(uuid.uuid4())
+            return self.cur_event_id
+        return None
+
+    def on_event_end(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        if event_type != CBEventType.LLM:
+            return
+
+        event_id = event_id or self.cur_event_id
+        if event_id is None or event_id in self.event_id_to_exclude:
+            return
+
+        payload = payload or {}
+        messages = payload.get(EventPayload.MESSAGES)
+        if not messages:
+            prompt = payload.get(EventPayload.PROMPT)
+            if not prompt:
+                raise ValueError(
+                    "LLM event payload is missing both 'messages' and 'prompt'; "
+                    "the handler cannot build a fine-tuning example."
+                )
+            messages = [{"role": "user", "content": prompt}]
+
+        completion = payload.get(EventPayload.COMPLETION)
+        if completion is None:
+            response = payload.get(EventPayload.RESPONSE)
+            completion = getattr(response, "response", response)
+        if completion is None:
+            raise ValueError(
+                "LLM event payload is missing 'completion'; the handler cannot "
+                "build a fine-tuning example."
+            )
+
+        example = {
+            "id": str(uuid.uuid4()),
+            "messages": [
+                *[
+                    {"role": message["role"], "content": message["content"]}
+                    for message in messages[:-1]
+                ],
+                {"role": "user", "content": messages[-1]["content"]},
+                {"role": "assistant", "content": completion},
+            ],
+        }
+        self.data.append(example)
+        self.event_id_to_exclude.add(event_id)
+
+    def get_finetuning_events(self):
+        return self.data
+
+    def save_finetuning_events(self, path):
+        """Write every collected example to `path` and report the true count."""
+        with open(path, "w", encoding="utf-8") as f:
+            for data_point in self.data:
+                f.write(json.dumps(data_point) + "\n")
+        print(f"Wrote {len(self.data)} examples to {path}")
+
+
+class CallbackManager:
+    """Fans events out to every registered handler and propagates event ids."""
+
+    def __init__(self, handlers):
+        self.handlers = handlers
+
+    def on_event_start(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        if event_id is None:
+            event_id = str(uuid.uuid4())
+        for handler in self.handlers:
+            result = handler.on_event_start(
+                event_type, payload, event_id=event_id, parent_id=parent_id, **kwargs
+            )
+            if result is not None:
+                event_id = result
+        return event_id
+
+    def on_event_end(self, event_type, payload=None, event_id=None, parent_id=None, **kwargs):
+        for handler in self.handlers:
+            handler.on_event_end(
+                event_type, payload, event_id=event_id, parent_id=parent_id, **kwargs
+            )
+
+    def start_trace(self, trace_id):
+        for handler in self.handlers:
+            handler.start_trace(trace_id)
+
+    def end_trace(self, trace_id=None):
+        for handler in self.handlers:
+            handler.end_trace(trace_id)
+
+
+class MockLLM:
+    """
+    LLM whose completions flow through its callback manager. Without this
+    event dispatch, the fine-tuning handler never sees any LLM calls.
+    """
+
+    def __init__(self, callback_manager=None):
+        if callback_manager is None:
+            raise ValueError(
+                "MockLLM requires a callback_manager so LLM events can be "
+                "captured by the fine-tuning handler."
+            )
+        self.callback_manager = callback_manager
+
+    def complete(self, prompt, **kwargs):
+        event_id = self.callback_manager.on_event_start(
+            CBEventType.LLM, payload={EventPayload.PROMPT: prompt}
+        )
+        response_text = f"Answer to: {prompt}"
+        self.callback_manager.on_event_end(
+            CBEventType.LLM,
+            payload={
+                EventPayload.PROMPT: prompt,
+                EventPayload.COMPLETION: response_text,
+            },
+            event_id=event_id,
+        )
+        return response_text
+
+
+class QueryEngine:
+    def __init__(self, index, similarity_top_k=2, llm=None):
+        if llm is None:
+            raise ValueError(
+                "An llm must be passed to as_query_engine(); otherwise the "
+                "query engine uses a default LLM whose callback manager does "
+                "not contain the fine-tuning handler and no events are recorded."
+            )
+        self.index = index
+        self.similarity_top_k = similarity_top_k
+        self.llm = llm
+
+    def query(self, question):
+        # Route the question through the provided LLM so that its callback
+        # manager (which owns the fine-tuning handler) receives the LLM event.
+        response = self.llm.complete(question)
+        if response is None:
+            raise RuntimeError(f"No response produced for question: {question}")
+        return response
+
+
+class VectorStoreIndex:
+    def __init__(self, nodes=None):
+        self.nodes = nodes or []
+
+    @staticmethod
+    def from_documents(docs):
+        return VectorStoreIndex(docs)
+
+    def as_query_engine(self, similarity_top_k, llm):
+        return QueryEngine(self, similarity_top_k=similarity_top_k, llm=llm)
+
+
+class FineTuningExample:
+    def __init__(self, dataset_path, documents):
+        self.dataset_path = dataset_path
+        self.documents = documents
+        self.llm = None
+
+    def jsonl_generation(self):
+        """Generate JSONL file for fine-tuning events."""
+        os.makedirs(self.dataset_path, exist_ok=True)
+
+        finetuning_handler = OpenAIFineTuningHandler()
+        callback_manager = CallbackManager([finetuning_handler])
+        # The LLM must be constructed with the callback manager that holds the
+        # fine-tuning handler, and that same LLM must be handed to the query
+        # engine -- otherwise no LLM events are ever captured.
+        self.llm = MockLLM(callback_manager=callback_manager)
+
+        questions_path = os.path.join(self.dataset_path, "train_questions.txt")
+        if not os.path.exists(questions_path):
+            raise FileNotFoundError(f"Questions file not found: {questions_path}")
+
+        questions = []
+        with open(questions_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    questions.append(line)
+
+        try:
+            index = VectorStoreIndex.from_documents(self.documents)
+            query_engine = index.as_query_engine(similarity_top_k=2, llm=self.llm)
+            for question in questions:
+                response = query_engine.query(question)
+                print(f"Q: {question}\nA: {response}\n")
+        except Exception:
+            # Never silently swallow errors: a swallowed failure is exactly what
+            # makes the run appear to succeed while zero events get collected.
+            traceback.print_exc()
+            raise
+        finally:
+            finetuning_handler.save_finetuning_events(
+                os.path.join(self.dataset_path, "finetuning_events.jsonl")
+            )
+
+
+def prepare_test_data(questions_path):
+    os.makedirs(os.path.dirname(questions_path), exist_ok=True)
+    with open(questions_path, "w", encoding="utf-8") as f:
+        f.write("Question 1\nQuestion 2\n")
+
+
+def run_agent(questions_path):
+    dataset_path = os.path.dirname(questions_path)
+    ft = FineTuningExample(dataset_path=dataset_path, documents=[])
+    ft.jsonl_generation()
+
+
+if __name__ == "__main__":
+    questions_path = "./dataset_data/train_questions.txt"
+    prepare_test_data(questions_path)
+    run_agent(questions_path)
+
+--------------------------------------------------------------------------------

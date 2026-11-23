@@ -1,0 +1,2344 @@
+Case ID: lagent_279
+Status: ACCEPTED
+Final Attempt: 3
+Start Time: 2026-11-12 18:51:04
+End Time: 2026-11-12 19:28:56
+Total Duration: 2272.57 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### lagent/distributed/http_serve/app.py
+import argparse
+import json
+import logging
+import time
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
+
+from lagent.schema import AgentMessage
+from lagent.utils import load_class_from_string
+
+
+class AgentAPIServer:
+
+    def __init__(self,
+                 config: dict,
+                 host: str = '127.0.0.1',
+                 port: int = 8090):
+        self.app = FastAPI(docs_url='/')
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=['*'],
+            allow_credentials=True,
+            allow_methods=['*'],
+            allow_headers=['*'],
+        )
+        cls_name = config.pop('type')
+        python_path = config.pop('python_path', None)
+        cls_name = load_class_from_string(cls_name, python_path) if isinstance(
+            cls_name, str) else cls_name
+        self.agent = cls_name(**config)
+        self.setup_routes()
+        self.run(host, port)
+
+    def setup_routes(self):
+
+        def heartbeat():
+            return {'status': 'success', 'timestamp': time.time()}
+
+        async def process_message(request: Request):
+            try:
+                body = await request.json()
+                message = [
+                    m if isinstance(m, str) else AgentMessage.model_validate(m)
+                    for m in body.pop('message')
+                ]
+                result = await self.agent(*message, **body)
+                return result
+            except Exception as e:
+                logging.error(f'Error processing message: {str(e)}')
+                raise HTTPException(
+                    status_code=500, detail='Internal Server Error')
+
+        def get_memory(session_id: int = 0):
+            try:
+                result = self.agent.state_dict(session_id)
+                return result
+            except KeyError:
+                raise HTTPException(
+                    status_code=404, detail="Session ID not found")
+            except Exception as e:
+                logging.error(f'Error processing message: {str(e)}')
+                raise HTTPException(
+                    status_code=500, detail='Internal Server Error')
+
+        self.app.add_api_route('/health_check', heartbeat, methods=['GET'])
+        self.app.add_api_route(
+            '/chat_completion', process_message, methods=['POST'])
+        self.app.add_api_route(
+            '/memory/{session_id}', get_memory, methods=['GET'])
+
+    def run(self, host='127.0.0.1', port=8090):
+        logging.info(f'Starting server at {host}:{port}')
+        uvicorn.run(self.app, host=host, port=port)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Async Agent API Server')
+    parser.add_argument('--host', type=str, default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=8090)
+    parser.add_argument(
+        '--config',
+        type=json.loads,
+        required=True,
+        help='JSON configuration for the agent')
+    args = parser.parse_args()
+
+    return args
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    args = parse_args()
+    AgentAPIServer(args.config, host=args.host, port=args.port)
+
+
+### lagent/actions/__init__.py
+from .action_executor import ActionExecutor, AsyncActionExecutor
+from .arxiv_search import ArxivSearch, AsyncArxivSearch
+from .base_action import BaseAction, tool_api
+from .bing_map import AsyncBINGMap, BINGMap
+from .builtin_actions import FinishAction, InvalidAction, NoAction
+from .google_scholar_search import AsyncGoogleScholar, GoogleScholar
+from .google_search import AsyncGoogleSearch, GoogleSearch
+from .ipython_interactive import AsyncIPythonInteractive, IPythonInteractive
+from .ipython_interpreter import AsyncIPythonInterpreter, IPythonInterpreter
+from .ipython_manager import IPythonInteractiveManager
+from .parser import BaseParser, JsonParser, TupleParser
+from .ppt import PPT, AsyncPPT
+from .python_interpreter import AsyncPythonInterpreter, PythonInterpreter
+from .web_browser import AsyncWebBrowser, WebBrowser
+
+__all__ = [
+    'BaseAction', 'ActionExecutor', 'AsyncActionExecutor', 'InvalidAction',
+    'FinishAction', 'NoAction', 'BINGMap', 'AsyncBINGMap', 'ArxivSearch',
+    'AsyncArxivSearch', 'GoogleSearch', 'AsyncGoogleSearch', 'GoogleScholar',
+    'AsyncGoogleScholar', 'IPythonInterpreter', 'AsyncIPythonInterpreter',
+    'IPythonInteractive', 'AsyncIPythonInteractive',
+    'IPythonInteractiveManager', 'PythonInterpreter', 'AsyncPythonInterpreter',
+    'PPT', 'AsyncPPT', 'WebBrowser', 'AsyncWebBrowser', 'BaseParser',
+    'JsonParser', 'TupleParser', 'tool_api'
+]
+
+
+### lagent/actions/ipython_interpreter.py
+# flake8: noqa: E501
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import queue
+import re
+import signal
+import sys
+import tempfile
+import traceback
+import uuid
+from typing import Optional, Tuple, Type
+
+from jupyter_client import AsyncKernelClient, AsyncKernelManager, AsyncMultiKernelManager
+
+from lagent.actions.base_action import AsyncActionMixin, BaseAction, tool_api
+from lagent.actions.parser import BaseParser, JsonParser
+from lagent.schema import ActionReturn, ActionStatusCode
+
+logger = logging.getLogger(__name__)
+
+START_CODE = """
+def input(*args, **kwargs):
+    raise NotImplementedError('Python input() function is disabled.')
+
+get_ipython().system = lambda *args: print('Assume we have this package, ! is disabled!')
+{}
+"""  # noqa
+
+
+class TimeoutError(Exception):
+    pass
+
+
+class KernelDeath(Exception):
+    pass
+
+
+async def async_run_code(
+    km: AsyncKernelManager,
+    code,
+    *,
+    interrupt_after=30,
+    iopub_timeout=40,
+    wait_for_ready_timeout=60,
+    shutdown_kernel=True,
+):
+    assert iopub_timeout > interrupt_after
+    try:
+
+        async def get_iopub_msg_with_death_detection(kc: AsyncKernelClient,
+                                                     *,
+                                                     timeout=None):
+            loop = asyncio.get_running_loop()
+            dead_fut = loop.create_future()
+
+            def restarting():
+                assert (
+                    False
+                ), "Restart shouldn't happen because config.KernelRestarter.restart_limit is expected to be set to 0"
+
+            def dead():
+                logger.info("Kernel has died, will NOT restart")
+                dead_fut.set_result(None)
+
+            msg_task = asyncio.create_task(kc.get_iopub_msg(timeout=timeout))
+            km.add_restart_callback(restarting, "restart")
+            km.add_restart_callback(dead, "dead")
+            try:
+                done, _ = await asyncio.wait(
+                    [dead_fut, msg_task], return_when=asyncio.FIRST_COMPLETED)
+                if dead_fut in done:
+                    raise KernelDeath()
+                assert msg_task in done
+                return await msg_task
+            finally:
+                msg_task.cancel()
+                km.remove_restart_callback(restarting, "restart")
+                km.remove_restart_callback(dead, "dead")
+
+        async def send_interrupt():
+            await asyncio.sleep(interrupt_after)
+            logger.info("Sending interrupt to kernel")
+            await km.interrupt_kernel()
+
+        def should_retry(ret) -> bool:
+            """Whether the execution result requires another attempt."""
+            if not isinstance(ret, tuple):
+                return False
+            stream_text = ret[-1]
+            if not isinstance(stream_text, str):
+                return False
+            return stream_text.strip() in [
+                'KeyboardInterrupt',
+                f"Kernel didn't respond in {wait_for_ready_timeout} seconds",
+            ]
+
+        async def run_once():
+            execute_result = None
+            error_traceback = None
+            stream_text_list = []
+            kc = km.client()
+            assert isinstance(kc, AsyncKernelClient)
+            kc.start_channels()
+            try:
+                await kc.wait_for_ready(timeout=wait_for_ready_timeout)
+                msg_id = kc.execute(code)
+                while True:
+                    message = await get_iopub_msg_with_death_detection(
+                        kc, timeout=iopub_timeout)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            json.dumps(message, indent=2, default=str))
+                    assert message["parent_header"]["msg_id"] == msg_id
+                    msg_type = message["msg_type"]
+                    if msg_type == "status":
+                        if message["content"]["execution_state"] == "idle":
+                            break
+                    elif msg_type == "stream":
+                        stream_name = message["content"]["name"]
+                        stream_text = message["content"]["text"]
+                        stream_text_list.append(stream_text)
+                    elif msg_type == "execute_result":
+                        execute_result = message["content"]["data"]
+                    elif msg_type == "error":
+                        error_traceback_lines = message["content"]["traceback"]
+                        error_traceback = "\n".join(error_traceback_lines)
+                    elif msg_type == "execute_input":
+                        pass
+                    else:
+                        assert False, f"Unknown message_type: {msg_type}"
+            finally:
+                kc.stop_channels()
+            return execute_result, error_traceback, "".join(stream_text_list)
+
+        async def run(max_attempts: int = 3, wait_time: float = 1):
+            """Run the code and retry a limited number of times.
+
+            This replaces the previous ``tenacity`` based implementation so
+            that ``lagent`` does not require ``tenacity`` as a runtime
+            dependency. The last result is returned when all attempts fail.
+            """
+            result = None
+            for attempt in range(max_attempts):
+                result = await run_once()
+                if not should_retry(result) or attempt + 1 >= max_attempts:
+                    break
+                logger.info(
+                    f'Retrying code execution (attempt {attempt + 2}/{max_attempts})'
+                )
+                await asyncio.sleep(wait_time)
+            return result
+
+        if interrupt_after:
+            run_task = asyncio.create_task(run())
+            send_interrupt_task = asyncio.create_task(send_interrupt())
+            done, _ = await asyncio.wait([run_task, send_interrupt_task],
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if run_task in done:
+                send_interrupt_task.cancel()
+            else:
+                assert send_interrupt_task in done
+            result = await run_task
+        else:
+            result = await run()
+        return result
+    finally:
+        if shutdown_kernel:
+            await km.shutdown_kernel()
+
+
+class IPythonInterpreter(BaseAction):
+    """A IPython executor that can execute Python scripts in a jupyter manner.
+
+    Args:
+        timeout (int): Upper bound of waiting time for Python script execution.
+            Defaults to 20.
+        user_data_dir (str, optional): Specified the user data directory for files
+            loading. If set to `ENV`, use `USER_DATA_DIR` environment variable.
+            Defaults to `ENV`.
+        work_dir (str, optional): Specify which directory to save output images to.
+            Defaults to ``'./work_dir/tmp_dir'``.
+        description (dict): The description of the action. Defaults to ``None``.
+        parser (Type[BaseParser]): The parser class to process the
+            action's inputs and outputs. Defaults to :class:`JsonParser`.
+    """
+
+    _KERNEL_CLIENTS = {}
+
+    def __init__(
+        self,
+        timeout: int = 20,
+        user_data_dir: str = 'ENV',
+        work_dir='./work_dir/tmp_dir',
+        description: Optional[dict] = None,
+        parser: Type[BaseParser] = JsonParser,
+    ):
+        super().__init__(description, parser)
+
+        self.timeout = timeout
+        if user_data_dir == 'ENV':
+            user_data_dir = os.environ.get('USER_DATA_DIR', '')
+
+        if user_data_dir:
+            user_data_dir = os.path.dirname(user_data_dir)
+            user_data_dir = f"import os\nos.chdir('{user_data_dir}')"
+        self.user_data_dir = user_data_dir
+        self._initialized = False
+        self.work_dir = work_dir
+        if not os.path.exists(self.work_dir):
+            os.makedirs(self.work_dir, exist_ok=True)
+
+    @staticmethod
+    def start_kernel():
+        from jupyter_client import KernelManager
+
+        # start the kernel and manager
+        km = KernelManager()
+        km.start_kernel()
+        kc = km.client()
+        return km, kc
+
+    def initialize(self):
+        if self._initialized:
+            return
+        pid = os.getpid()
+        if pid not in self._KERNEL_CLIENTS:
+            self._KERNEL_CLIENTS[pid] = self.start_kernel()
+        self.kernel_manager, self.kernel_client = self._KERNEL_CLIENTS[pid]
+        self._initialized = True
+        self._call(START_CODE.format(self.user_data_dir), None)
+
+    def reset(self):
+        if not self._initialized:
+            self.initialize()
+        else:
+            code = "get_ipython().run_line_magic('reset', '-f')\n" + \
+                START_CODE.format(self.user_data_dir)
+            self._call(code, None)
+
+    def _call(self,
+              command: str,
+              timeout: Optional[int] = None) -> Tuple[str, bool]:
+        self.initialize()
+        command = extract_code(command)
+
+        # check previous remaining result
+        while True:
+            try:
+                msg = self.kernel_client.get_iopub_msg(timeout=5)
+                msg_type = msg['msg_type']
+                if msg_type == 'status':
+                    if msg['content'].get('execution_state') == 'idle':
+                        break
+            except queue.Empty:
+                # assume no result
+                break
+
+        self.kernel_client.execute(command)
+
+        def _inner_call():
+            result = ''
+            images = []
+            succeed = True
+            image_idx = 0
+
+            while True:
+                text = ''
+                image = ''
+                finished = False
+                msg_type = 'error'
+                try:
+                    msg = self.kernel_client.get_iopub_msg(timeout=20)
+                    msg_type = msg['msg_type']
+                    if msg_type == 'status':
+                        if msg['content'].get('execution_state') == 'idle':
+                            finished = True
+                    elif msg_type == 'execute_result':
+                        text = msg['content']['data'].get('text/plain', '')
+                        if 'image/png' in msg['content']['data']:
+                            image_b64 = msg['content']['data']['image/png']
+                            image_url = publish_image_to_local(
+                                image_b64, self.work_dir)
+                            image_idx += 1
+                            image = '![fig-%03d](%s)' % (image_idx, image_url)
+
+                    elif msg_type == 'display_data':
+                        if 'image/png' in msg['content']['data']:
+                            image_b64 = msg['content']['data']['image/png']
+                            image_url = publish_image_to_local(
+                                image_b64, self.work_dir)
+                            image_idx += 1
+                            image = '![fig-%03d](%s)' % (image_idx, image_url)
+
+                        else:
+                            text = msg['content']['data'].get('text/plain', '')
+                    elif msg_type == 'stream':
+                        msg_type = msg['content']['name']  # stdout, stderr
+                        text = msg['content']['text']
+                    elif msg_type == 'error':
+                        succeed = False
+                        text = escape_ansi('\n'.join(
+                            msg['content']['traceback']))
+                        if 'M6_CODE_INTERPRETER_TIMEOUT' in text:
+                            text = f'Timeout. No response after {timeout} seconds.'  # noqa
+                except queue.Empty:
+                    # stop current task in case break next input.
+                    self.kernel_manager.interrupt_kernel()
+                    succeed = False
+                    text = f'Timeout. No response after {timeout} seconds.'
+                    finished = True
+                except Exception:
+                    succeed = False
+                    msg = ''.join(traceback.format_exception(*sys.exc_info()))
+                    # text = 'The code interpreter encountered an unexpected error.'  # noqa
+                    text = msg
+                    logging.warning(msg)
+                    finished = True
+                if text:
+                    # result += f'\n\n{msg_type}:\n\n```\n{text}\n```'
+                    result += f'{text}'
+
+                if image:
+                    images.append(image_url)
+                if finished:
+                    return succeed, dict(text=result, image=images)
+
+        try:
+            if timeout:
+
+                def handler(signum, frame):
+                    raise TimeoutError()
+
+                signal.signal(signal.SIGALRM, handler)
+                signal.alarm(timeout)
+            succeed, result = _inner_call()
+        except TimeoutError:
+            succeed = False
+            text = 'The code interpreter encountered an unexpected error.'
+            result = f'\n\nerror:\n\n```\n{text}\n```'
+        finally:
+            if timeout:
+                signal.alarm(0)
+
+        # result = result.strip('\n')
+        return succeed, result
+
+    @tool_api
+    def run(self, command: str, timeout: Optional[int] = None) -> ActionReturn:
+        r"""When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 60.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is disabled. Do not make external web requests or API calls as they will fail.
+
+        Args:
+            command (:class:`str`): Python code
+            timeout (:class:`Optional[int]`): Upper bound of waiting time for Python script execution.
+        """
+        tool_return = ActionReturn(url=None, args=None, type=self.name)
+        tool_return.args = dict(text=command)
+        succeed, result = self._call(command, timeout)
+        if succeed:
+            text = result['text']
+            image = result.get('image', [])
+            resp = [dict(type='text', content=text)]
+            if image:
+                resp.extend([dict(type='image', content=im) for im in image])
+            tool_return.result = resp
+            # tool_return.result = dict(
+            #     text=result['text'], image=result.get('image', [])[0])
+            tool_return.state = ActionStatusCode.SUCCESS
+        else:
+            tool_return.errmsg = result.get('text', '') if isinstance(
+                result, dict) else result
+            tool_return.state = ActionStatusCode.API_ERROR
+        return tool_return
+
+
+class AsyncIPythonInterpreter(AsyncActionMixin, IPythonInterpreter):
+    """A IPython executor that can execute Python scripts in a jupyter manner.
+
+    Args:
+        timeout (int): Upper bound of waiting time for Python script execution.
+            Defaults to 20.
+        user_data_dir (str, optional): Specified the user data directory for files
+            loading. If set to `ENV`, use `USER_DATA_DIR` environment variable.
+            Defaults to `ENV`.
+        work_dir (str, optional): Specify which directory to save output images to.
+            Defaults to ``'./work_dir/tmp_dir'``.
+        description (dict): The description of the action. Defaults to ``None``.
+        parser (Type[BaseParser]): The parser class to process the
+            action's inputs and outputs. Defaults to :class:`JsonParser`.
+    """
+
+    _UNBOUND_KERNEL_CLIENTS = asyncio.Queue()
+
+    def __init__(
+        self,
+        timeout: int = 20,
+        user_data_dir: str = 'ENV',
+        work_dir=os.path.join(tempfile.gettempdir(), 'tmp_dir'),
+        max_kernels: Optional[int] = None,
+        reuse_kernel: bool = True,
+        startup_rate: bool = 32,
+        connection_dir: str = tempfile.gettempdir(),
+        description: Optional[dict] = None,
+        parser: Type[BaseParser] = JsonParser,
+    ):
+        super().__init__(timeout, user_data_dir, work_dir, description, parser)
+        from traitlets.config import Config
+
+        c = Config()
+        c.KernelManager.transport = 'ipc'
+        self._amkm = AsyncMultiKernelManager(
+            config=c, connection_dir=connection_dir)
+        self._max_kernels = max_kernels
+        self._reuse_kernel = reuse_kernel
+        self._sem = asyncio.Semaphore(startup_rate)
+        self._lock = asyncio.Lock()
+
+    async def initialize(self, session_id: str):
+        session_id = str(session_id)
+        while True:
+            if session_id in self._KERNEL_CLIENTS:
+                return self._KERNEL_CLIENTS[session_id]
+            if self._reuse_kernel and not self._UNBOUND_KERNEL_CLIENTS.empty():
+                self._KERNEL_CLIENTS[
+                    session_id] = await self._UNBOUND_KERNEL_CLIENTS.get()
+                return self._KERNEL_CLIENTS[session_id]
+            async with self._sem:
+                if self._max_kernels is None or len(
+                        self._KERNEL_CLIENTS
+                ) + self._UNBOUND_KERNEL_CLIENTS.qsize() < self._max_kernels:
+                    kernel_id = None
+                    try:
+                        kernel_id = await self._amkm.start_kernel()
+                        kernel = self._amkm.get_kernel(kernel_id)
+                        client = kernel.client()
+                        _, error_stacktrace, stream_text = await async_run_code(
+                            kernel,
+                            START_CODE.format(self.user_data_dir),
+                            shutdown_kernel=False)
+                        # check if the output of START_CODE meets expectations
+                        if not (error_stacktrace is None
+                                and stream_text == ''):
+                            raise RuntimeError
+                    except Exception as e:
+                        print(f'Starting kernel error: {e}')
+                        if kernel_id:
+                            await self._amkm.shutdown_kernel(kernel_id)
+                            self._amkm.remove_kernel(kernel_id)
+                        await asyncio.sleep(1)
+                        continue
+                    if self._max_kernels is None:
+                        self._KERNEL_CLIENTS[session_id] = (kernel_id, kernel,
+                                                            client)
+                        return kernel_id, kernel, client
+                    async with self._lock:
+                        if len(self._KERNEL_CLIENTS
+                               ) + self._UNBOUND_KERNEL_CLIENTS.qsize(
+                               ) < self._max_kernels:
+                            self._KERNEL_CLIENTS[session_id] = (kernel_id,
+                                                                kernel, client)
+                            return kernel_id, kernel, client
+                    await self._amkm.shutdown_kernel(kernel_id)
+                    self._amkm.remove_kernel(kernel_id)
+            await asyncio.sleep(1)
+
+    async def reset(self, session_id: str):
+        session_id = str(session_id)
+        if session_id not in self._KERNEL_CLIENTS:
+            return
+        _, kernel, _ = self._KERNEL_CLIENTS[session_id]
+        code = "get_ipython().run_line_magic('reset', '-f')\n" + \
+            START_CODE.format(self.user_data_dir)
+        await async_run_code(kernel, code, shutdown_kernel=False)
+
+    async def shutdown(self, session_id: str):
+        session_id = str(session_id)
+        if session_id in self._KERNEL_CLIENTS:
+            kernel_id, _, _ = self._KERNEL_CLIENTS.get(session_id)
+            await self._amkm.shutdown_kernel(kernel_id)
+            self._amkm.remove_kernel(kernel_id)
+            del self._KERNEL_CLIENTS[session_id]
+
+    async def close_session(self, session_id: str):
+        session_id = str(session_id)
+        if self._reuse_kernel:
+            if session_id in self._KERNEL_CLIENTS:
+                await self.reset(session_id)
+                await self._UNBOUND_KERNEL_CLIENTS.put(
+                    self._KERNEL_CLIENTS.pop(session_id))
+        else:
+            await self.shutdown(session_id)
+
+    async def _call(self, command, timeout=None, session_id=None):
+        _, kernel, _ = await self.initialize(str(session_id))
+        result = await async_run_code(
+            kernel,
+            extract_code(command),
+            interrupt_after=timeout or self.timeout,
+            shutdown_kernel=False)
+        execute_result, error_stacktrace, stream_text = result
+        if error_stacktrace is not None:
+            ret = re.sub('^-*\n', '', escape_ansi(error_stacktrace))
+            if ret.endswith('KeyboardInterrupt: '):
+                ret = 'The code interpreter encountered a timeout error.'
+            status, ret = False, ret.strip()
+        elif execute_result is not None:
+            status, ret = True, dict(text=execute_result.get('text/plain', ''))
+        else:
+            status, ret = True, dict(text=stream_text.strip())
+        return status, ret
+
+    @tool_api
+    async def run(self,
+                  command: str,
+                  timeout: Optional[int] = None,
+                  session_id: Optional[str] = None) -> ActionReturn:
+        r"""When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 60.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is disabled. Do not make external web requests or API calls as they will fail.
+
+        Args:
+            command (:class:`str`): Python code
+            timeout (:class:`Optional[int]`): Upper bound of waiting time for Python script execution.
+        """
+        tool_return = ActionReturn(url=None, args=None, type=self.name)
+        tool_return.args = dict(text=command)
+        succeed, result = await self._call(command, timeout, session_id)
+        if succeed:
+            text = result['text']
+            image = result.get('image', [])
+            resp = [dict(type='text', content=text)]
+            if image:
+                resp.extend([dict(type='image', content=im) for im in image])
+            tool_return.result = resp
+            # tool_return.result = dict(
+            #     text=result['text'], image=result.get('image', [])[0])
+            tool_return.state = ActionStatusCode.SUCCESS
+        else:
+            tool_return.errmsg = result.get('text', '') if isinstance(
+                result, dict) else result
+            tool_return.state = ActionStatusCode.API_ERROR
+        return tool_return
+
+
+def extract_code(text):
+    import json5
+
+    # Match triple backtick blocks first
+    triple_match = re.search(r'```[^\n]*\n(.+?)```', text, re.DOTALL)
+    # Match single backtick blocks second
+    single_match = re.search(r'`([^`]*)`', text, re.DOTALL)
+    if triple_match:
+        text = triple_match.group(1)
+    elif single_match:
+        text = single_match.group(1)
+    else:
+        try:
+            text = json5.loads(text)['code']
+        except Exception:
+            pass
+    # If no code blocks found, return original text
+    return text
+
+
+def escape_ansi(line):
+    ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+    return ansi_escape.sub('', line)
+
+
+def publish_image_to_local(image_base64: str, work_dir='./work_dir/tmp_dir'):
+    import PIL.Image
+    image_file = str(uuid.uuid4()) + '.png'
+    local_image_file = os.path.join(work_dir, image_file)
+
+    png_bytes = base64.b64decode(image_base64)
+    assert isinstance(png_bytes, bytes)
+    bytes_io = io.BytesIO(png_bytes)
+    PIL.Image.open(bytes_io).save(local_image_file, 'png')
+
+    return local_image_file
+
+
+# local test for code interpreter
+def get_multiline_input(hint):
+    print(hint)
+    print('// Press ENTER to make a new line. Press CTRL-D to end input.')
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:  # CTRL-D
+            break
+        lines.append(line)
+    print('// Input received.')
+    if lines:
+        return '\n'.join(lines)
+    else:
+        return ''
+
+
+if __name__ == '__main__':
+    code_interpreter = IPythonInterpreter()
+    while True:
+        print(code_interpreter(get_multiline_input('Enter python code:')))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-12 19:01:14
+Duration: 609.90 seconds
+Verdict: ## Evaluation Result: **REJECT**
+
+### What I attempted
+1. **`generate_diff('lagent_279')`** → returned `Error no fixed code available`
+2. **`validate_fixed_code('lagent_279')`** → returned a structural **REJECT**:
+   - `### lagent/distributed/http_serve/app.py` appears **0 times**, expected once
+   - `### lagent/actions/__init__.py` appears **0 times**, expected once
+   - `### lagent/actions/ipython_interpreter.py` appears **0 times**, expected once
+   - Notes: *"no required interface checked, because the issue and its test name none"*
+3. **`verify_api_usage('tenacity.retry')` / `verify_api_usage('tenacity.retry_if_result')`** → returned only generic dictionary/company/none-relevant search hits about the English word "tenacity," so no authoritative API confirmation was obtainable; these calls were inconclusive rather than affirmative.
+
+### Why this must be rejected
+- **No fixed code exists to evaluate.** Both `generate_diff` and `validate_fixed_code` report that no patched artifact is present for `lagent_279`. A patch cannot be judged correct when the patched source is absent — only the buggy snapshot was supplied in the prompt.
+- **The validator's required structure is unmet.** The expected fixed output should contain the three file-header markers (`### lagent/distributed/http_serve/app.py`, `### lagent/actions/__init__.py`, `### lagent/actions/ipython_interpreter.py`) exactly once each; the candidate contains **zero** occurrences of each, so the output format contract fails outright.
+- **The issue itself is unresolved by what was shown.** Issue #279 is a *missing declared dependency*: `lagent/actions/ipython_interpreter.py` does `from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed` at module import time, but `tenacity` is not declared in the packaging metadata. The provided test does `pip install -e <source_dir>` and then asserts `import tenacity` succeeds. The genuine fix must **declare `tenacity` in `setup.py` / `requirements.txt` `install_requires`** (optionally plus a graceful startup guard). None of that evidence is present, and the three flagged files alone are not where an install-time dependency is declared.
+
+### What an acceptable fix would need to show
+1. `setup.py` (or `requirements/*.txt`) with `tenacity` added to `install_requires`, so a clean `pip install -e .` pulls it in — this is the actual root-cause fix for "ModuleNotFoundError: No module named 'tenacity'".
+2. If keeping the import in `ipython_interpreter.py`, optionally a lazy/guarded import so other action modules remain importable when tenacity is absent.
+3. A diff that actually renders against the three expected file headers so `validate_fixed_code` can pass, and `pip install --upgrade pip && pip install -e . && python -c "import tenacity"` returning 0.
+
+Because the fixed code is unavailable (no diff producible) and the structural validation fails on all three required markers, the change cannot be accepted.
+
+**Verdict: REJECT** — no fixed code supplied for `lagent_279`; nothing to diff or validate, and the tenacity dependency-declaration fix is not demonstrably present.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-12 19:16:03
+Duration: 889.57 seconds
+Verdict: ## Analysis
+
+### The bug (issue #279)
+`lagent/actions/ipython_interpreter.py` did `from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed`, but `tenacity` is not declared in lagent's packaging requirements (`requirements/runtime.txt` / `setup.py`). Consequently, after `pip install lagent`, `tenacity` is absent and importing `lagent.actions` raises `ImportError`.
+
+### What the diff actually changes
+1. `lagent/distributed/http_serve/app.py`, `lagent/actions/__init__.py`, `lagent/actions/ipython_interpreter.py` — trailing blank-line cleanups (cosmetic).
+2. `ipython_interpreter.py` — removes the `from tenacity import ...` line and replaces the tenacity-decorated `run()` coroutine with a hand-rolled retry loop (`run_once()` + `should_retry()` + `run(max_attempts=3, wait_time=1)`).
+
+### Correctness of the refactor itself (looks OK, in isolation)
+- `should_retry()` faithfully reproduces the old `retry_if_result` predicate (tuple check, `.strip()` in `{'KeyboardInterrupt', "Kernel didn't respond in <n> seconds"}`) and adds a defensive `isinstance(stream_text, str)` guard.
+- `run()` loops ≤ 3 attempts with 1s `asyncio.sleep` between attempts and returns the last result — matching `stop_after_attempt(3)` + `wait_fixed(1)` + `retry_error_callback=lambda state: state.outcome.result()`.
+- Exceptions still propagate (old tenacity retried only on results, not exceptions), so `KernelDeath` handling is unchanged. `asyncio` is still imported, so no new NameError.
+- `run()` is still invoked as `run()` in the `interrupt_after` branch — signature default-compatible.
+
+### Why the fix does not satisfy the case
+The supplied test does **not** test the source code at all — it tests *packaging*:
+
+```python
+subprocess.run([sys.executable, "-m", "pip", "install", "-e", source_dir], check=True)
+import tenacity   # must succeed
+```
+
+- For the **buggy** version the test asserts `tenacity` is *missing* (bug reproduces). That proves the test environment does not otherwise provide `tenacity`.
+- For the **fixed/patched** version the test asserts `tenacity` **is installed and importable** after installing the fixed source tree.
+
+The fix removes the *use* of tenacity from the code but never adds `tenacity` to `requirements/runtime.txt` (or `setup.py`/`install_requires`) — no dependency file appears anywhere in the diff. Therefore, after `pip install -e <fixed source>`, `tenacity` will still not be installed, and both the `fixed` and `patched` test branches will print "tenacity is missing in fixed version" and `sys.exit(1)`.
+
+In other words, the patch sidesteps the import error at runtime, but it does not implement the change the issue and its regression test demand: **declare the missing dependency**. A reviewer cannot accept a patch that leaves the case's own verification script failing.
+
+### Secondary observations
+- `verify_api_usage` returned no usable signal for the tenacity APIs (search results were only dictionary/wikipedia hits), so behavior had to be reasoned from the decorator semantics directly; the hand-written retry loop is a reasonable reimplementation, but this makes the fix a larger behavioral change than necessary for a "missing dependency" bug.
+- If `tenacity` is used anywhere else in the tree (or intended to remain a supported public dependency), removing it in only this one file does not resolve the underlying packaging defect.
+
+## Verdict
+
+**REJECT**
+
+Reasoning: The refactor of `async_run_code` correctly and equivalently replaces the tenacity retry logic (predicate, 3 attempts, 1s wait, last-result return all preserved), and structural validation passes. However, the actual defect in issue #279 is a *missing declared dependency*: `tenacity` is imported but absent from lagent's requirements, so a plain install leaves `import tenacity`/`import lagent.actions` broken. The case's own test verifies exactly this — it requires `tenacity` to be importable after installing the fixed source, and asserts it is absent in the buggy source. Since the diff only removes the import (with cosmetic whitespace edits) and does not add `tenacity` to `requirements/runtime.txt`/`install_requires`, the regression test will still fail with "tenacity is missing in fixed version". The fix is therefore incomplete for this case.
+--------------------------------------------------------------------------------
+### lagent/distributed/http_serve/app.py
+import argparse
+import json
+import logging
+import time
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
+
+from lagent.schema import AgentMessage
+from lagent.utils import load_class_from_string
+
+
+class AgentAPIServer:
+
+    def __init__(self,
+                 config: dict,
+                 host: str = '127.0.0.1',
+                 port: int = 8090):
+        self.app = FastAPI(docs_url='/')
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=['*'],
+            allow_credentials=True,
+            allow_methods=['*'],
+            allow_headers=['*'],
+        )
+        cls_name = config.pop('type')
+        python_path = config.pop('python_path', None)
+        cls_name = load_class_from_string(cls_name, python_path) if isinstance(
+            cls_name, str) else cls_name
+        self.agent = cls_name(**config)
+        self.setup_routes()
+        self.run(host, port)
+
+    def setup_routes(self):
+
+        def heartbeat():
+            return {'status': 'success', 'timestamp': time.time()}
+
+        async def process_message(request: Request):
+            try:
+                body = await request.json()
+                message = [
+                    m if isinstance(m, str) else AgentMessage.model_validate(m)
+                    for m in body.pop('message')
+                ]
+                result = await self.agent(*message, **body)
+                return result
+            except Exception as e:
+                logging.error(f'Error processing message: {str(e)}')
+                raise HTTPException(
+                    status_code=500, detail='Internal Server Error')
+
+        def get_memory(session_id: int = 0):
+            try:
+                result = self.agent.state_dict(session_id)
+                return result
+            except KeyError:
+                raise HTTPException(
+                    status_code=404, detail="Session ID not found")
+            except Exception as e:
+                logging.error(f'Error processing message: {str(e)}')
+                raise HTTPException(
+                    status_code=500, detail='Internal Server Error')
+
+        self.app.add_api_route('/health_check', heartbeat, methods=['GET'])
+        self.app.add_api_route(
+            '/chat_completion', process_message, methods=['POST'])
+        self.app.add_api_route(
+            '/memory/{session_id}', get_memory, methods=['GET'])
+
+    def run(self, host='127.0.0.1', port=8090):
+        logging.info(f'Starting server at {host}:{port}')
+        uvicorn.run(self.app, host=host, port=port)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Async Agent API Server')
+    parser.add_argument('--host', type=str, default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=8090)
+    parser.add_argument(
+        '--config',
+        type=json.loads,
+        required=True,
+        help='JSON configuration for the agent')
+    args = parser.parse_args()
+
+    return args
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    args = parse_args()
+    AgentAPIServer(args.config, host=args.host, port=args.port)
+
+
+### lagent/actions/__init__.py
+from .action_executor import ActionExecutor, AsyncActionExecutor
+from .arxiv_search import ArxivSearch, AsyncArxivSearch
+from .base_action import BaseAction, tool_api
+from .bing_map import AsyncBINGMap, BINGMap
+from .builtin_actions import FinishAction, InvalidAction, NoAction
+from .google_scholar_search import AsyncGoogleScholar, GoogleScholar
+from .google_search import AsyncGoogleSearch, GoogleSearch
+from .ipython_interactive import AsyncIPythonInteractive, IPythonInteractive
+from .ipython_interpreter import AsyncIPythonInterpreter, IPythonInterpreter
+from .ipython_manager import IPythonInteractiveManager
+from .parser import BaseParser, JsonParser, TupleParser
+from .ppt import PPT, AsyncPPT
+from .python_interpreter import AsyncPythonInterpreter, PythonInterpreter
+from .web_browser import AsyncWebBrowser, WebBrowser
+
+__all__ = [
+    'BaseAction', 'ActionExecutor', 'AsyncActionExecutor', 'InvalidAction',
+    'FinishAction', 'NoAction', 'BINGMap', 'AsyncBINGMap', 'ArxivSearch',
+    'AsyncArxivSearch', 'GoogleSearch', 'AsyncGoogleSearch', 'GoogleScholar',
+    'AsyncGoogleScholar', 'IPythonInterpreter', 'AsyncIPythonInterpreter',
+    'IPythonInteractive', 'AsyncIPythonInteractive',
+    'IPythonInteractiveManager', 'PythonInterpreter', 'AsyncPythonInterpreter',
+    'PPT', 'AsyncPPT', 'WebBrowser', 'AsyncWebBrowser', 'BaseParser',
+    'JsonParser', 'TupleParser', 'tool_api'
+]
+
+
+### lagent/actions/ipython_interpreter.py
+# flake8: noqa: E501
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import queue
+import re
+import signal
+import sys
+import tempfile
+import traceback
+import uuid
+from typing import Optional, Tuple, Type
+
+from jupyter_client import AsyncKernelClient, AsyncKernelManager, AsyncMultiKernelManager
+
+from lagent.actions.base_action import AsyncActionMixin, BaseAction, tool_api
+from lagent.actions.parser import BaseParser, JsonParser
+from lagent.schema import ActionReturn, ActionStatusCode
+
+logger = logging.getLogger(__name__)
+
+START_CODE = """
+def input(*args, **kwargs):
+    raise NotImplementedError('Python input() function is disabled.')
+
+get_ipython().system = lambda *args: print('Assume we have this package, ! is disabled!')
+{}
+"""  # noqa
+
+
+class TimeoutError(Exception):
+    pass
+
+
+class KernelDeath(Exception):
+    pass
+
+
+async def async_run_code(
+    km: AsyncKernelManager,
+    code,
+    *,
+    interrupt_after=30,
+    iopub_timeout=40,
+    wait_for_ready_timeout=60,
+    shutdown_kernel=True,
+):
+    assert iopub_timeout > interrupt_after
+    try:
+
+        async def get_iopub_msg_with_death_detection(kc: AsyncKernelClient,
+                                                     *,
+                                                     timeout=None):
+            loop = asyncio.get_running_loop()
+            dead_fut = loop.create_future()
+
+            def restarting():
+                assert (
+                    False
+                ), "Restart shouldn't happen because config.KernelRestarter.restart_limit is expected to be set to 0"
+
+            def dead():
+                logger.info("Kernel has died, will NOT restart")
+                dead_fut.set_result(None)
+
+            msg_task = asyncio.create_task(kc.get_iopub_msg(timeout=timeout))
+            km.add_restart_callback(restarting, "restart")
+            km.add_restart_callback(dead, "dead")
+            try:
+                done, _ = await asyncio.wait(
+                    [dead_fut, msg_task], return_when=asyncio.FIRST_COMPLETED)
+                if dead_fut in done:
+                    raise KernelDeath()
+                assert msg_task in done
+                return await msg_task
+            finally:
+                msg_task.cancel()
+                km.remove_restart_callback(restarting, "restart")
+                km.remove_restart_callback(dead, "dead")
+
+        async def send_interrupt():
+            await asyncio.sleep(interrupt_after)
+            logger.info("Sending interrupt to kernel")
+            await km.interrupt_kernel()
+
+        def should_retry(ret) -> bool:
+            """Whether the execution result requires another attempt."""
+            if not isinstance(ret, tuple):
+                return False
+            stream_text = ret[-1]
+            if not isinstance(stream_text, str):
+                return False
+            return stream_text.strip() in [
+                'KeyboardInterrupt',
+                f"Kernel didn't respond in {wait_for_ready_timeout} seconds",
+            ]
+
+        async def run_once():
+            execute_result = None
+            error_traceback = None
+            stream_text_list = []
+            kc = km.client()
+            assert isinstance(kc, AsyncKernelClient)
+            kc.start_channels()
+            try:
+                await kc.wait_for_ready(timeout=wait_for_ready_timeout)
+                msg_id = kc.execute(code)
+                while True:
+                    message = await get_iopub_msg_with_death_detection(
+                        kc, timeout=iopub_timeout)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            json.dumps(message, indent=2, default=str))
+                    assert message["parent_header"]["msg_id"] == msg_id
+                    msg_type = message["msg_type"]
+                    if msg_type == "status":
+                        if message["content"]["execution_state"] == "idle":
+                            break
+                    elif msg_type == "stream":
+                        stream_name = message["content"]["name"]
+                        stream_text = message["content"]["text"]
+                        stream_text_list.append(stream_text)
+                    elif msg_type == "execute_result":
+                        execute_result = message["content"]["data"]
+                    elif msg_type == "error":
+                        error_traceback_lines = message["content"]["traceback"]
+                        error_traceback = "\n".join(error_traceback_lines)
+                    elif msg_type == "execute_input":
+                        pass
+                    else:
+                        assert False, f"Unknown message_type: {msg_type}"
+            finally:
+                kc.stop_channels()
+            return execute_result, error_traceback, "".join(stream_text_list)
+
+        async def run(max_attempts: int = 3, wait_time: float = 1):
+            """Run the code and retry a limited number of times.
+
+            This replaces the previous ``tenacity`` based implementation so
+            that ``lagent`` does not require ``tenacity`` as a runtime
+            dependency. The last result is returned when all attempts fail.
+            """
+            result = None
+            for attempt in range(max_attempts):
+                result = await run_once()
+                if not should_retry(result) or attempt + 1 >= max_attempts:
+                    break
+                logger.info(
+                    f'Retrying code execution (attempt {attempt + 2}/{max_attempts})'
+                )
+                await asyncio.sleep(wait_time)
+            return result
+
+        if interrupt_after:
+            run_task = asyncio.create_task(run())
+            send_interrupt_task = asyncio.create_task(send_interrupt())
+            done, _ = await asyncio.wait([run_task, send_interrupt_task],
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if run_task in done:
+                send_interrupt_task.cancel()
+            else:
+                assert send_interrupt_task in done
+            result = await run_task
+        else:
+            result = await run()
+        return result
+    finally:
+        if shutdown_kernel:
+            await km.shutdown_kernel()
+
+
+class IPythonInterpreter(BaseAction):
+    """A IPython executor that can execute Python scripts in a jupyter manner.
+
+    Args:
+        timeout (int): Upper bound of waiting time for Python script execution.
+            Defaults to 20.
+        user_data_dir (str, optional): Specified the user data directory for files
+            loading. If set to `ENV`, use `USER_DATA_DIR` environment variable.
+            Defaults to `ENV`.
+        work_dir (str, optional): Specify which directory to save output images to.
+            Defaults to ``'./work_dir/tmp_dir'``.
+        description (dict): The description of the action. Defaults to ``None``.
+        parser (Type[BaseParser]): The parser class to process the
+            action's inputs and outputs. Defaults to :class:`JsonParser`.
+    """
+
+    _KERNEL_CLIENTS = {}
+
+    def __init__(
+        self,
+        timeout: int = 20,
+        user_data_dir: str = 'ENV',
+        work_dir='./work_dir/tmp_dir',
+        description: Optional[dict] = None,
+        parser: Type[BaseParser] = JsonParser,
+    ):
+        super().__init__(description, parser)
+
+        self.timeout = timeout
+        if user_data_dir == 'ENV':
+            user_data_dir = os.environ.get('USER_DATA_DIR', '')
+
+        if user_data_dir:
+            user_data_dir = os.path.dirname(user_data_dir)
+            user_data_dir = f"import os\nos.chdir('{user_data_dir}')"
+        self.user_data_dir = user_data_dir
+        self._initialized = False
+        self.work_dir = work_dir
+        if not os.path.exists(self.work_dir):
+            os.makedirs(self.work_dir, exist_ok=True)
+
+    @staticmethod
+    def start_kernel():
+        from jupyter_client import KernelManager
+
+        # start the kernel and manager
+        km = KernelManager()
+        km.start_kernel()
+        kc = km.client()
+        return km, kc
+
+    def initialize(self):
+        if self._initialized:
+            return
+        pid = os.getpid()
+        if pid not in self._KERNEL_CLIENTS:
+            self._KERNEL_CLIENTS[pid] = self.start_kernel()
+        self.kernel_manager, self.kernel_client = self._KERNEL_CLIENTS[pid]
+        self._initialized = True
+        self._call(START_CODE.format(self.user_data_dir), None)
+
+    def reset(self):
+        if not self._initialized:
+            self.initialize()
+        else:
+            code = "get_ipython().run_line_magic('reset', '-f')\n" + \
+                START_CODE.format(self.user_data_dir)
+            self._call(code, None)
+
+    def _call(self,
+              command: str,
+              timeout: Optional[int] = None) -> Tuple[str, bool]:
+        self.initialize()
+        command = extract_code(command)
+
+        # check previous remaining result
+        while True:
+            try:
+                msg = self.kernel_client.get_iopub_msg(timeout=5)
+                msg_type = msg['msg_type']
+                if msg_type == 'status':
+                    if msg['content'].get('execution_state') == 'idle':
+                        break
+            except queue.Empty:
+                # assume no result
+                break
+
+        self.kernel_client.execute(command)
+
+        def _inner_call():
+            result = ''
+            images = []
+            succeed = True
+            image_idx = 0
+
+            while True:
+                text = ''
+                image = ''
+                finished = False
+                msg_type = 'error'
+                try:
+                    msg = self.kernel_client.get_iopub_msg(timeout=20)
+                    msg_type = msg['msg_type']
+                    if msg_type == 'status':
+                        if msg['content'].get('execution_state') == 'idle':
+                            finished = True
+                    elif msg_type == 'execute_result':
+                        text = msg['content']['data'].get('text/plain', '')
+                        if 'image/png' in msg['content']['data']:
+                            image_b64 = msg['content']['data']['image/png']
+                            image_url = publish_image_to_local(
+                                image_b64, self.work_dir)
+                            image_idx += 1
+                            image = '![fig-%03d](%s)' % (image_idx, image_url)
+
+                    elif msg_type == 'display_data':
+                        if 'image/png' in msg['content']['data']:
+                            image_b64 = msg['content']['data']['image/png']
+                            image_url = publish_image_to_local(
+                                image_b64, self.work_dir)
+                            image_idx += 1
+                            image = '![fig-%03d](%s)' % (image_idx, image_url)
+
+                        else:
+                            text = msg['content']['data'].get('text/plain', '')
+                    elif msg_type == 'stream':
+                        msg_type = msg['content']['name']  # stdout, stderr
+                        text = msg['content']['text']
+                    elif msg_type == 'error':
+                        succeed = False
+                        text = escape_ansi('\n'.join(
+                            msg['content']['traceback']))
+                        if 'M6_CODE_INTERPRETER_TIMEOUT' in text:
+                            text = f'Timeout. No response after {timeout} seconds.'  # noqa
+                except queue.Empty:
+                    # stop current task in case break next input.
+                    self.kernel_manager.interrupt_kernel()
+                    succeed = False
+                    text = f'Timeout. No response after {timeout} seconds.'
+                    finished = True
+                except Exception:
+                    succeed = False
+                    msg = ''.join(traceback.format_exception(*sys.exc_info()))
+                    # text = 'The code interpreter encountered an unexpected error.'  # noqa
+                    text = msg
+                    logging.warning(msg)
+                    finished = True
+                if text:
+                    # result += f'\n\n{msg_type}:\n\n```\n{text}\n```'
+                    result += f'{text}'
+
+                if image:
+                    images.append(image_url)
+                if finished:
+                    return succeed, dict(text=result, image=images)
+
+        try:
+            if timeout:
+
+                def handler(signum, frame):
+                    raise TimeoutError()
+
+                signal.signal(signal.SIGALRM, handler)
+                signal.alarm(timeout)
+            succeed, result = _inner_call()
+        except TimeoutError:
+            succeed = False
+            text = 'The code interpreter encountered an unexpected error.'
+            result = f'\n\nerror:\n\n```\n{text}\n```'
+        finally:
+            if timeout:
+                signal.alarm(0)
+
+        # result = result.strip('\n')
+        return succeed, result
+
+    @tool_api
+    def run(self, command: str, timeout: Optional[int] = None) -> ActionReturn:
+        r"""When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 60.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is disabled. Do not make external web requests or API calls as they will fail.
+
+        Args:
+            command (:class:`str`): Python code
+            timeout (:class:`Optional[int]`): Upper bound of waiting time for Python script execution.
+        """
+        tool_return = ActionReturn(url=None, args=None, type=self.name)
+        tool_return.args = dict(text=command)
+        succeed, result = self._call(command, timeout)
+        if succeed:
+            text = result['text']
+            image = result.get('image', [])
+            resp = [dict(type='text', content=text)]
+            if image:
+                resp.extend([dict(type='image', content=im) for im in image])
+            tool_return.result = resp
+            # tool_return.result = dict(
+            #     text=result['text'], image=result.get('image', [])[0])
+            tool_return.state = ActionStatusCode.SUCCESS
+        else:
+            tool_return.errmsg = result.get('text', '') if isinstance(
+                result, dict) else result
+            tool_return.state = ActionStatusCode.API_ERROR
+        return tool_return
+
+
+class AsyncIPythonInterpreter(AsyncActionMixin, IPythonInterpreter):
+    """A IPython executor that can execute Python scripts in a jupyter manner.
+
+    Args:
+        timeout (int): Upper bound of waiting time for Python script execution.
+            Defaults to 20.
+        user_data_dir (str, optional): Specified the user data directory for files
+            loading. If set to `ENV`, use `USER_DATA_DIR` environment variable.
+            Defaults to `ENV`.
+        work_dir (str, optional): Specify which directory to save output images to.
+            Defaults to ``'./work_dir/tmp_dir'``.
+        description (dict): The description of the action. Defaults to ``None``.
+        parser (Type[BaseParser]): The parser class to process the
+            action's inputs and outputs. Defaults to :class:`JsonParser`.
+    """
+
+    _UNBOUND_KERNEL_CLIENTS = asyncio.Queue()
+
+    def __init__(
+        self,
+        timeout: int = 20,
+        user_data_dir: str = 'ENV',
+        work_dir=os.path.join(tempfile.gettempdir(), 'tmp_dir'),
+        max_kernels: Optional[int] = None,
+        reuse_kernel: bool = True,
+        startup_rate: bool = 32,
+        connection_dir: str = tempfile.gettempdir(),
+        description: Optional[dict] = None,
+        parser: Type[BaseParser] = JsonParser,
+    ):
+        super().__init__(timeout, user_data_dir, work_dir, description, parser)
+        from traitlets.config import Config
+
+        c = Config()
+        c.KernelManager.transport = 'ipc'
+        self._amkm = AsyncMultiKernelManager(
+            config=c, connection_dir=connection_dir)
+        self._max_kernels = max_kernels
+        self._reuse_kernel = reuse_kernel
+        self._sem = asyncio.Semaphore(startup_rate)
+        self._lock = asyncio.Lock()
+
+    async def initialize(self, session_id: str):
+        session_id = str(session_id)
+        while True:
+            if session_id in self._KERNEL_CLIENTS:
+                return self._KERNEL_CLIENTS[session_id]
+            if self._reuse_kernel and not self._UNBOUND_KERNEL_CLIENTS.empty():
+                self._KERNEL_CLIENTS[
+                    session_id] = await self._UNBOUND_KERNEL_CLIENTS.get()
+                return self._KERNEL_CLIENTS[session_id]
+            async with self._sem:
+                if self._max_kernels is None or len(
+                        self._KERNEL_CLIENTS
+                ) + self._UNBOUND_KERNEL_CLIENTS.qsize() < self._max_kernels:
+                    kernel_id = None
+                    try:
+                        kernel_id = await self._amkm.start_kernel()
+                        kernel = self._amkm.get_kernel(kernel_id)
+                        client = kernel.client()
+                        _, error_stacktrace, stream_text = await async_run_code(
+                            kernel,
+                            START_CODE.format(self.user_data_dir),
+                            shutdown_kernel=False)
+                        # check if the output of START_CODE meets expectations
+                        if not (error_stacktrace is None
+                                and stream_text == ''):
+                            raise RuntimeError
+                    except Exception as e:
+                        print(f'Starting kernel error: {e}')
+                        if kernel_id:
+                            await self._amkm.shutdown_kernel(kernel_id)
+                            self._amkm.remove_kernel(kernel_id)
+                        await asyncio.sleep(1)
+                        continue
+                    if self._max_kernels is None:
+                        self._KERNEL_CLIENTS[session_id] = (kernel_id, kernel,
+                                                            client)
+                        return kernel_id, kernel, client
+                    async with self._lock:
+                        if len(self._KERNEL_CLIENTS
+                               ) + self._UNBOUND_KERNEL_CLIENTS.qsize(
+                               ) < self._max_kernels:
+                            self._KERNEL_CLIENTS[session_id] = (kernel_id,
+                                                                kernel, client)
+                            return kernel_id, kernel, client
+                    await self._amkm.shutdown_kernel(kernel_id)
+                    self._amkm.remove_kernel(kernel_id)
+            await asyncio.sleep(1)
+
+    async def reset(self, session_id: str):
+        session_id = str(session_id)
+        if session_id not in self._KERNEL_CLIENTS:
+            return
+        _, kernel, _ = self._KERNEL_CLIENTS[session_id]
+        code = "get_ipython().run_line_magic('reset', '-f')\n" + \
+            START_CODE.format(self.user_data_dir)
+        await async_run_code(kernel, code, shutdown_kernel=False)
+
+    async def shutdown(self, session_id: str):
+        session_id = str(session_id)
+        if session_id in self._KERNEL_CLIENTS:
+            kernel_id, _, _ = self._KERNEL_CLIENTS.get(session_id)
+            await self._amkm.shutdown_kernel(kernel_id)
+            self._amkm.remove_kernel(kernel_id)
+            del self._KERNEL_CLIENTS[session_id]
+
+    async def close_session(self, session_id: str):
+        session_id = str(session_id)
+        if self._reuse_kernel:
+            if session_id in self._KERNEL_CLIENTS:
+                await self.reset(session_id)
+                await self._UNBOUND_KERNEL_CLIENTS.put(
+                    self._KERNEL_CLIENTS.pop(session_id))
+        else:
+            await self.shutdown(session_id)
+
+    async def _call(self, command, timeout=None, session_id=None):
+        _, kernel, _ = await self.initialize(str(session_id))
+        result = await async_run_code(
+            kernel,
+            extract_code(command),
+            interrupt_after=timeout or self.timeout,
+            shutdown_kernel=False)
+        execute_result, error_stacktrace, stream_text = result
+        if error_stacktrace is not None:
+            ret = re.sub('^-*\n', '', escape_ansi(error_stacktrace))
+            if ret.endswith('KeyboardInterrupt: '):
+                ret = 'The code interpreter encountered a timeout error.'
+            status, ret = False, ret.strip()
+        elif execute_result is not None:
+            status, ret = True, dict(text=execute_result.get('text/plain', ''))
+        else:
+            status, ret = True, dict(text=stream_text.strip())
+        return status, ret
+
+    @tool_api
+    async def run(self,
+                  command: str,
+                  timeout: Optional[int] = None,
+                  session_id: Optional[str] = None) -> ActionReturn:
+        r"""When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 60.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is disabled. Do not make external web requests or API calls as they will fail.
+
+        Args:
+            command (:class:`str`): Python code
+            timeout (:class:`Optional[int]`): Upper bound of waiting time for Python script execution.
+        """
+        tool_return = ActionReturn(url=None, args=None, type=self.name)
+        tool_return.args = dict(text=command)
+        succeed, result = await self._call(command, timeout, session_id)
+        if succeed:
+            text = result['text']
+            image = result.get('image', [])
+            resp = [dict(type='text', content=text)]
+            if image:
+                resp.extend([dict(type='image', content=im) for im in image])
+            tool_return.result = resp
+            # tool_return.result = dict(
+            #     text=result['text'], image=result.get('image', [])[0])
+            tool_return.state = ActionStatusCode.SUCCESS
+        else:
+            tool_return.errmsg = result.get('text', '') if isinstance(
+                result, dict) else result
+            tool_return.state = ActionStatusCode.API_ERROR
+        return tool_return
+
+
+def extract_code(text):
+    import json5
+
+    # Match triple backtick blocks first
+    triple_match = re.search(r'```[^\n]*\n(.+?)```', text, re.DOTALL)
+    # Match single backtick blocks second
+    single_match = re.search(r'`([^`]*)`', text, re.DOTALL)
+    if triple_match:
+        text = triple_match.group(1)
+    elif single_match:
+        text = single_match.group(1)
+    else:
+        try:
+            text = json5.loads(text)['code']
+        except Exception:
+            pass
+    # If no code blocks found, return original text
+    return text
+
+
+def escape_ansi(line):
+    ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+    return ansi_escape.sub('', line)
+
+
+def publish_image_to_local(image_base64: str, work_dir='./work_dir/tmp_dir'):
+    import PIL.Image
+    image_file = str(uuid.uuid4()) + '.png'
+    local_image_file = os.path.join(work_dir, image_file)
+
+    png_bytes = base64.b64decode(image_base64)
+    assert isinstance(png_bytes, bytes)
+    bytes_io = io.BytesIO(png_bytes)
+    PIL.Image.open(bytes_io).save(local_image_file, 'png')
+
+    return local_image_file
+
+
+# local test for code interpreter
+def get_multiline_input(hint):
+    print(hint)
+    print('// Press ENTER to make a new line. Press CTRL-D to end input.')
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:  # CTRL-D
+            break
+        lines.append(line)
+    print('// Input received.')
+    if lines:
+        return '\n'.join(lines)
+    else:
+        return ''
+
+
+if __name__ == '__main__':
+    code_interpreter = IPythonInterpreter()
+    while True:
+        print(code_interpreter(get_multiline_input('Enter python code:')))
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-12 19:28:56
+Duration: 773.10 seconds
+Verdict: ## 评估摘要
+
+### 1. 差异分析（generate_diff）
+修复只涉及三个文件的“表面”改动：
+
+| 文件 | 变更 |
+|---|---|
+| `lagent/distributed/http_serve/app.py` | 仅删除多余空行 |
+| `lagent/actions/__init__.py` | 仅删除多余空行 |
+| `lagent/actions/ipython_interpreter.py` | **删除 `from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed`**，把 `@retry(...)` 装饰器改写成手写的 `run_once()` + `run(max_attempts=3, wait_time=1)` 重试循环 |
+
+**没有任何 requirements / setup.py / pyproject.toml 的改动**（diff 中完全没有出现依赖声明文件）。
+
+### 2. 结构校验（validate_fixed_code）
+返回 ACCEPT，但附带说明：“no required interface checked, because the issue and its test name none”——即该工具**并没有真正校验与本 issue 相关的行为**，只确认了三个文件结构完整。这不构成通过证据。
+
+### 3. 代码层面的正确性（我的核查）
+手写重试逻辑在语义上与原 tenacity 版本基本等价：
+- `should_retry(ret)` 判断 `ret[-1].strip()` 是否属于 `['KeyboardInterrupt', "Kernel didn't respond in ... seconds"]`，与原 lambda 一致，且补上了 `isinstance(stream_text, str)` 的防御；
+- 最多 3 次尝试、`asyncio.sleep(1)` 间隔、最终返回最后一次结果（对应原 `retry_error_callback=lambda state: state.outcome.result()`）；
+- 调用点 `run()` 无参调用仍可工作；`asyncio.sleep` 用法正确。
+
+所以代码本身不会崩溃，功能上等价。
+
+### 4. 与测试期望的比对（关键问题）
+测试脚本判定“修复成功”的唯一标准是：
+
+```python
+def check_tenacity_installed():
+    import tenacity   # 必须成功
+```
+patched 分支明确写着 “assuming it is already installed”，即**不重新安装任何东西**，直接 `import tenacity`，失败则 `sys.exit(1)` → “❌ PATCH NOT VERIFIED”。
+
+而 buggy 分支要求“安装 buggy 版本后 tenacity 不可导入”才能算复现成功，说明**基础环境里本来就没有 tenacity**（否则 buggy 分支会失败）。因此要让 patched 分支通过，只能是：**修复后安装该包时会自动把 tenacity 拉进来**——也就是把 `tenacity` 写进 `install_requires` / `requirements/runtime.txt`。
+
+本修复走的是相反路线：删掉 `tenacity` 的使用，让代码不再需要它。结果是安装修复后的包时 `tenacity` 依然不存在，`import tenacity` 抛 `ImportError`，测试在 patched 分支直接 `exit(1)`。
+
+也就是说：
+- 修复后行为 ✅ 合理（不再依赖 tenacity）；
+- 但测试断言的是“tenacity 依赖已就绪”，该修复**必然无法通过测试**（除非环境中碰巧由别的包传递引入 tenacity，而这又与 buggy 分支的预期自相矛盾）。
+
+### 结论
+
+**REJECT**
+
+理由：本 issue #279 的验收方式是在 `pip install -e <source>` 之后执行 `import tenacity`，期望其成功。正确修复应是在包的依赖声明中补上 `tenacity`（例如 `requirements/runtime.txt` 与 `setup.py` 的 `install_requires`）。当前修复改为“移除对 tenacity 的使用”，虽然代码等价且能跑，但**没有改变安装后的依赖集合**，`import tenacity` 仍会失败，patched 分支必然 `exit(1)`，测试无法通过。此外该改写属于超出最小修复范围的行为重构（且改变了 retry 的异常/阻塞语义细节），却遗漏了真正需要的那一行依赖声明。
+--------------------------------------------------------------------------------
+### lagent/distributed/http_serve/app.py
+import argparse
+import json
+import logging
+import time
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
+
+from lagent.schema import AgentMessage
+from lagent.utils import load_class_from_string
+
+
+class AgentAPIServer:
+
+    def __init__(self,
+                 config: dict,
+                 host: str = '127.0.0.1',
+                 port: int = 8090):
+        self.app = FastAPI(docs_url='/')
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=['*'],
+            allow_credentials=True,
+            allow_methods=['*'],
+            allow_headers=['*'],
+        )
+        cls_name = config.pop('type')
+        python_path = config.pop('python_path', None)
+        cls_name = load_class_from_string(cls_name, python_path) if isinstance(
+            cls_name, str) else cls_name
+        self.agent = cls_name(**config)
+        self.setup_routes()
+        self.run(host, port)
+
+    def setup_routes(self):
+
+        def heartbeat():
+            return {'status': 'success', 'timestamp': time.time()}
+
+        async def process_message(request: Request):
+            try:
+                body = await request.json()
+                message = [
+                    m if isinstance(m, str) else AgentMessage.model_validate(m)
+                    for m in body.pop('message')
+                ]
+                result = await self.agent(*message, **body)
+                return result
+            except Exception as e:
+                logging.error(f'Error processing message: {str(e)}')
+                raise HTTPException(
+                    status_code=500, detail='Internal Server Error')
+
+        def get_memory(session_id: int = 0):
+            try:
+                result = self.agent.state_dict(session_id)
+                return result
+            except KeyError:
+                raise HTTPException(
+                    status_code=404, detail="Session ID not found")
+            except Exception as e:
+                logging.error(f'Error processing message: {str(e)}')
+                raise HTTPException(
+                    status_code=500, detail='Internal Server Error')
+
+        self.app.add_api_route('/health_check', heartbeat, methods=['GET'])
+        self.app.add_api_route(
+            '/chat_completion', process_message, methods=['POST'])
+        self.app.add_api_route(
+            '/memory/{session_id}', get_memory, methods=['GET'])
+
+    def run(self, host='127.0.0.1', port=8090):
+        logging.info(f'Starting server at {host}:{port}')
+        uvicorn.run(self.app, host=host, port=port)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Async Agent API Server')
+    parser.add_argument('--host', type=str, default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=8090)
+    parser.add_argument(
+        '--config',
+        type=json.loads,
+        required=True,
+        help='JSON configuration for the agent')
+    args = parser.parse_args()
+
+    return args
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    args = parse_args()
+    AgentAPIServer(args.config, host=args.host, port=args.port)
+
+
+### lagent/actions/__init__.py
+from .action_executor import ActionExecutor, AsyncActionExecutor
+from .arxiv_search import ArxivSearch, AsyncArxivSearch
+from .base_action import BaseAction, tool_api
+from .bing_map import AsyncBINGMap, BINGMap
+from .builtin_actions import FinishAction, InvalidAction, NoAction
+from .google_scholar_search import AsyncGoogleScholar, GoogleScholar
+from .google_search import AsyncGoogleSearch, GoogleSearch
+from .ipython_interactive import AsyncIPythonInteractive, IPythonInteractive
+from .ipython_interpreter import AsyncIPythonInterpreter, IPythonInterpreter
+from .ipython_manager import IPythonInteractiveManager
+from .parser import BaseParser, JsonParser, TupleParser
+from .ppt import PPT, AsyncPPT
+from .python_interpreter import AsyncPythonInterpreter, PythonInterpreter
+from .web_browser import AsyncWebBrowser, WebBrowser
+
+__all__ = [
+    'BaseAction', 'ActionExecutor', 'AsyncActionExecutor', 'InvalidAction',
+    'FinishAction', 'NoAction', 'BINGMap', 'AsyncBINGMap', 'ArxivSearch',
+    'AsyncArxivSearch', 'GoogleSearch', 'AsyncGoogleSearch', 'GoogleScholar',
+    'AsyncGoogleScholar', 'IPythonInterpreter', 'AsyncIPythonInterpreter',
+    'IPythonInteractive', 'AsyncIPythonInteractive',
+    'IPythonInteractiveManager', 'PythonInterpreter', 'AsyncPythonInterpreter',
+    'PPT', 'AsyncPPT', 'WebBrowser', 'AsyncWebBrowser', 'BaseParser',
+    'JsonParser', 'TupleParser', 'tool_api'
+]
+
+
+### lagent/actions/ipython_interpreter.py
+# flake8: noqa: E501
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import queue
+import re
+import signal
+import sys
+import tempfile
+import traceback
+import uuid
+from typing import Optional, Tuple, Type
+
+from jupyter_client import AsyncKernelClient, AsyncKernelManager, AsyncMultiKernelManager
+
+from lagent.actions.base_action import AsyncActionMixin, BaseAction, tool_api
+from lagent.actions.parser import BaseParser, JsonParser
+from lagent.schema import ActionReturn, ActionStatusCode
+
+logger = logging.getLogger(__name__)
+
+START_CODE = """
+def input(*args, **kwargs):
+    raise NotImplementedError('Python input() function is disabled.')
+
+get_ipython().system = lambda *args: print('Assume we have this package, ! is disabled!')
+{}
+"""  # noqa
+
+
+class TimeoutError(Exception):
+    pass
+
+
+class KernelDeath(Exception):
+    pass
+
+
+async def async_run_code(
+    km: AsyncKernelManager,
+    code,
+    *,
+    interrupt_after=30,
+    iopub_timeout=40,
+    wait_for_ready_timeout=60,
+    shutdown_kernel=True,
+):
+    assert iopub_timeout > interrupt_after
+    try:
+
+        async def get_iopub_msg_with_death_detection(kc: AsyncKernelClient,
+                                                     *,
+                                                     timeout=None):
+            loop = asyncio.get_running_loop()
+            dead_fut = loop.create_future()
+
+            def restarting():
+                assert (
+                    False
+                ), "Restart shouldn't happen because config.KernelRestarter.restart_limit is expected to be set to 0"
+
+            def dead():
+                logger.info("Kernel has died, will NOT restart")
+                dead_fut.set_result(None)
+
+            msg_task = asyncio.create_task(kc.get_iopub_msg(timeout=timeout))
+            km.add_restart_callback(restarting, "restart")
+            km.add_restart_callback(dead, "dead")
+            try:
+                done, _ = await asyncio.wait(
+                    [dead_fut, msg_task], return_when=asyncio.FIRST_COMPLETED)
+                if dead_fut in done:
+                    raise KernelDeath()
+                assert msg_task in done
+                return await msg_task
+            finally:
+                msg_task.cancel()
+                km.remove_restart_callback(restarting, "restart")
+                km.remove_restart_callback(dead, "dead")
+
+        async def send_interrupt():
+            await asyncio.sleep(interrupt_after)
+            logger.info("Sending interrupt to kernel")
+            await km.interrupt_kernel()
+
+        def should_retry(ret) -> bool:
+            """Whether the execution result requires another attempt."""
+            if not isinstance(ret, tuple):
+                return False
+            stream_text = ret[-1]
+            if not isinstance(stream_text, str):
+                return False
+            return stream_text.strip() in [
+                'KeyboardInterrupt',
+                f"Kernel didn't respond in {wait_for_ready_timeout} seconds",
+            ]
+
+        async def run_once():
+            execute_result = None
+            error_traceback = None
+            stream_text_list = []
+            kc = km.client()
+            assert isinstance(kc, AsyncKernelClient)
+            kc.start_channels()
+            try:
+                await kc.wait_for_ready(timeout=wait_for_ready_timeout)
+                msg_id = kc.execute(code)
+                while True:
+                    message = await get_iopub_msg_with_death_detection(
+                        kc, timeout=iopub_timeout)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            json.dumps(message, indent=2, default=str))
+                    assert message["parent_header"]["msg_id"] == msg_id
+                    msg_type = message["msg_type"]
+                    if msg_type == "status":
+                        if message["content"]["execution_state"] == "idle":
+                            break
+                    elif msg_type == "stream":
+                        stream_name = message["content"]["name"]
+                        stream_text = message["content"]["text"]
+                        stream_text_list.append(stream_text)
+                    elif msg_type == "execute_result":
+                        execute_result = message["content"]["data"]
+                    elif msg_type == "error":
+                        error_traceback_lines = message["content"]["traceback"]
+                        error_traceback = "\n".join(error_traceback_lines)
+                    elif msg_type == "execute_input":
+                        pass
+                    else:
+                        assert False, f"Unknown message_type: {msg_type}"
+            finally:
+                kc.stop_channels()
+            return execute_result, error_traceback, "".join(stream_text_list)
+
+        async def run(max_attempts: int = 3, wait_time: float = 1):
+            """Run the code and retry a limited number of times.
+
+            This replaces the previous ``tenacity`` based implementation so
+            that ``lagent`` does not require ``tenacity`` as a runtime
+            dependency. The last result is returned when all attempts fail.
+            """
+            result = None
+            for attempt in range(max_attempts):
+                result = await run_once()
+                if not should_retry(result) or attempt + 1 >= max_attempts:
+                    break
+                logger.info(
+                    f'Retrying code execution (attempt {attempt + 2}/{max_attempts})'
+                )
+                await asyncio.sleep(wait_time)
+            return result
+
+        if interrupt_after:
+            run_task = asyncio.create_task(run())
+            send_interrupt_task = asyncio.create_task(send_interrupt())
+            done, _ = await asyncio.wait([run_task, send_interrupt_task],
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if run_task in done:
+                send_interrupt_task.cancel()
+            else:
+                assert send_interrupt_task in done
+            result = await run_task
+        else:
+            result = await run()
+        return result
+    finally:
+        if shutdown_kernel:
+            await km.shutdown_kernel()
+
+
+class IPythonInterpreter(BaseAction):
+    """A IPython executor that can execute Python scripts in a jupyter manner.
+
+    Args:
+        timeout (int): Upper bound of waiting time for Python script execution.
+            Defaults to 20.
+        user_data_dir (str, optional): Specified the user data directory for files
+            loading. If set to `ENV`, use `USER_DATA_DIR` environment variable.
+            Defaults to `ENV`.
+        work_dir (str, optional): Specify which directory to save output images to.
+            Defaults to ``'./work_dir/tmp_dir'``.
+        description (dict): The description of the action. Defaults to ``None``.
+        parser (Type[BaseParser]): The parser class to process the
+            action's inputs and outputs. Defaults to :class:`JsonParser`.
+    """
+
+    _KERNEL_CLIENTS = {}
+
+    def __init__(
+        self,
+        timeout: int = 20,
+        user_data_dir: str = 'ENV',
+        work_dir='./work_dir/tmp_dir',
+        description: Optional[dict] = None,
+        parser: Type[BaseParser] = JsonParser,
+    ):
+        super().__init__(description, parser)
+
+        self.timeout = timeout
+        if user_data_dir == 'ENV':
+            user_data_dir = os.environ.get('USER_DATA_DIR', '')
+
+        if user_data_dir:
+            user_data_dir = os.path.dirname(user_data_dir)
+            user_data_dir = f"import os\nos.chdir('{user_data_dir}')"
+        self.user_data_dir = user_data_dir
+        self._initialized = False
+        self.work_dir = work_dir
+        if not os.path.exists(self.work_dir):
+            os.makedirs(self.work_dir, exist_ok=True)
+
+    @staticmethod
+    def start_kernel():
+        from jupyter_client import KernelManager
+
+        # start the kernel and manager
+        km = KernelManager()
+        km.start_kernel()
+        kc = km.client()
+        return km, kc
+
+    def initialize(self):
+        if self._initialized:
+            return
+        pid = os.getpid()
+        if pid not in self._KERNEL_CLIENTS:
+            self._KERNEL_CLIENTS[pid] = self.start_kernel()
+        self.kernel_manager, self.kernel_client = self._KERNEL_CLIENTS[pid]
+        self._initialized = True
+        self._call(START_CODE.format(self.user_data_dir), None)
+
+    def reset(self):
+        if not self._initialized:
+            self.initialize()
+        else:
+            code = "get_ipython().run_line_magic('reset', '-f')\n" + \
+                START_CODE.format(self.user_data_dir)
+            self._call(code, None)
+
+    def _call(self,
+              command: str,
+              timeout: Optional[int] = None) -> Tuple[str, bool]:
+        self.initialize()
+        command = extract_code(command)
+
+        # check previous remaining result
+        while True:
+            try:
+                msg = self.kernel_client.get_iopub_msg(timeout=5)
+                msg_type = msg['msg_type']
+                if msg_type == 'status':
+                    if msg['content'].get('execution_state') == 'idle':
+                        break
+            except queue.Empty:
+                # assume no result
+                break
+
+        self.kernel_client.execute(command)
+
+        def _inner_call():
+            result = ''
+            images = []
+            succeed = True
+            image_idx = 0
+
+            while True:
+                text = ''
+                image = ''
+                finished = False
+                msg_type = 'error'
+                try:
+                    msg = self.kernel_client.get_iopub_msg(timeout=20)
+                    msg_type = msg['msg_type']
+                    if msg_type == 'status':
+                        if msg['content'].get('execution_state') == 'idle':
+                            finished = True
+                    elif msg_type == 'execute_result':
+                        text = msg['content']['data'].get('text/plain', '')
+                        if 'image/png' in msg['content']['data']:
+                            image_b64 = msg['content']['data']['image/png']
+                            image_url = publish_image_to_local(
+                                image_b64, self.work_dir)
+                            image_idx += 1
+                            image = '![fig-%03d](%s)' % (image_idx, image_url)
+
+                    elif msg_type == 'display_data':
+                        if 'image/png' in msg['content']['data']:
+                            image_b64 = msg['content']['data']['image/png']
+                            image_url = publish_image_to_local(
+                                image_b64, self.work_dir)
+                            image_idx += 1
+                            image = '![fig-%03d](%s)' % (image_idx, image_url)
+
+                        else:
+                            text = msg['content']['data'].get('text/plain', '')
+                    elif msg_type == 'stream':
+                        msg_type = msg['content']['name']  # stdout, stderr
+                        text = msg['content']['text']
+                    elif msg_type == 'error':
+                        succeed = False
+                        text = escape_ansi('\n'.join(
+                            msg['content']['traceback']))
+                        if 'M6_CODE_INTERPRETER_TIMEOUT' in text:
+                            text = f'Timeout. No response after {timeout} seconds.'  # noqa
+                except queue.Empty:
+                    # stop current task in case break next input.
+                    self.kernel_manager.interrupt_kernel()
+                    succeed = False
+                    text = f'Timeout. No response after {timeout} seconds.'
+                    finished = True
+                except Exception:
+                    succeed = False
+                    msg = ''.join(traceback.format_exception(*sys.exc_info()))
+                    # text = 'The code interpreter encountered an unexpected error.'  # noqa
+                    text = msg
+                    logging.warning(msg)
+                    finished = True
+                if text:
+                    # result += f'\n\n{msg_type}:\n\n```\n{text}\n```'
+                    result += f'{text}'
+
+                if image:
+                    images.append(image_url)
+                if finished:
+                    return succeed, dict(text=result, image=images)
+
+        try:
+            if timeout:
+
+                def handler(signum, frame):
+                    raise TimeoutError()
+
+                signal.signal(signal.SIGALRM, handler)
+                signal.alarm(timeout)
+            succeed, result = _inner_call()
+        except TimeoutError:
+            succeed = False
+            text = 'The code interpreter encountered an unexpected error.'
+            result = f'\n\nerror:\n\n```\n{text}\n```'
+        finally:
+            if timeout:
+                signal.alarm(0)
+
+        # result = result.strip('\n')
+        return succeed, result
+
+    @tool_api
+    def run(self, command: str, timeout: Optional[int] = None) -> ActionReturn:
+        r"""When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 60.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is disabled. Do not make external web requests or API calls as they will fail.
+
+        Args:
+            command (:class:`str`): Python code
+            timeout (:class:`Optional[int]`): Upper bound of waiting time for Python script execution.
+        """
+        tool_return = ActionReturn(url=None, args=None, type=self.name)
+        tool_return.args = dict(text=command)
+        succeed, result = self._call(command, timeout)
+        if succeed:
+            text = result['text']
+            image = result.get('image', [])
+            resp = [dict(type='text', content=text)]
+            if image:
+                resp.extend([dict(type='image', content=im) for im in image])
+            tool_return.result = resp
+            # tool_return.result = dict(
+            #     text=result['text'], image=result.get('image', [])[0])
+            tool_return.state = ActionStatusCode.SUCCESS
+        else:
+            tool_return.errmsg = result.get('text', '') if isinstance(
+                result, dict) else result
+            tool_return.state = ActionStatusCode.API_ERROR
+        return tool_return
+
+
+class AsyncIPythonInterpreter(AsyncActionMixin, IPythonInterpreter):
+    """A IPython executor that can execute Python scripts in a jupyter manner.
+
+    Args:
+        timeout (int): Upper bound of waiting time for Python script execution.
+            Defaults to 20.
+        user_data_dir (str, optional): Specified the user data directory for files
+            loading. If set to `ENV`, use `USER_DATA_DIR` environment variable.
+            Defaults to `ENV`.
+        work_dir (str, optional): Specify which directory to save output images to.
+            Defaults to ``'./work_dir/tmp_dir'``.
+        description (dict): The description of the action. Defaults to ``None``.
+        parser (Type[BaseParser]): The parser class to process the
+            action's inputs and outputs. Defaults to :class:`JsonParser`.
+    """
+
+    _UNBOUND_KERNEL_CLIENTS = asyncio.Queue()
+
+    def __init__(
+        self,
+        timeout: int = 20,
+        user_data_dir: str = 'ENV',
+        work_dir=os.path.join(tempfile.gettempdir(), 'tmp_dir'),
+        max_kernels: Optional[int] = None,
+        reuse_kernel: bool = True,
+        startup_rate: bool = 32,
+        connection_dir: str = tempfile.gettempdir(),
+        description: Optional[dict] = None,
+        parser: Type[BaseParser] = JsonParser,
+    ):
+        super().__init__(timeout, user_data_dir, work_dir, description, parser)
+        from traitlets.config import Config
+
+        c = Config()
+        c.KernelManager.transport = 'ipc'
+        self._amkm = AsyncMultiKernelManager(
+            config=c, connection_dir=connection_dir)
+        self._max_kernels = max_kernels
+        self._reuse_kernel = reuse_kernel
+        self._sem = asyncio.Semaphore(startup_rate)
+        self._lock = asyncio.Lock()
+
+    async def initialize(self, session_id: str):
+        session_id = str(session_id)
+        while True:
+            if session_id in self._KERNEL_CLIENTS:
+                return self._KERNEL_CLIENTS[session_id]
+            if self._reuse_kernel and not self._UNBOUND_KERNEL_CLIENTS.empty():
+                self._KERNEL_CLIENTS[
+                    session_id] = await self._UNBOUND_KERNEL_CLIENTS.get()
+                return self._KERNEL_CLIENTS[session_id]
+            async with self._sem:
+                if self._max_kernels is None or len(
+                        self._KERNEL_CLIENTS
+                ) + self._UNBOUND_KERNEL_CLIENTS.qsize() < self._max_kernels:
+                    kernel_id = None
+                    try:
+                        kernel_id = await self._amkm.start_kernel()
+                        kernel = self._amkm.get_kernel(kernel_id)
+                        client = kernel.client()
+                        _, error_stacktrace, stream_text = await async_run_code(
+                            kernel,
+                            START_CODE.format(self.user_data_dir),
+                            shutdown_kernel=False)
+                        # check if the output of START_CODE meets expectations
+                        if not (error_stacktrace is None
+                                and stream_text == ''):
+                            raise RuntimeError
+                    except Exception as e:
+                        print(f'Starting kernel error: {e}')
+                        if kernel_id:
+                            await self._amkm.shutdown_kernel(kernel_id)
+                            self._amkm.remove_kernel(kernel_id)
+                        await asyncio.sleep(1)
+                        continue
+                    if self._max_kernels is None:
+                        self._KERNEL_CLIENTS[session_id] = (kernel_id, kernel,
+                                                            client)
+                        return kernel_id, kernel, client
+                    async with self._lock:
+                        if len(self._KERNEL_CLIENTS
+                               ) + self._UNBOUND_KERNEL_CLIENTS.qsize(
+                               ) < self._max_kernels:
+                            self._KERNEL_CLIENTS[session_id] = (kernel_id,
+                                                                kernel, client)
+                            return kernel_id, kernel, client
+                    await self._amkm.shutdown_kernel(kernel_id)
+                    self._amkm.remove_kernel(kernel_id)
+            await asyncio.sleep(1)
+
+    async def reset(self, session_id: str):
+        session_id = str(session_id)
+        if session_id not in self._KERNEL_CLIENTS:
+            return
+        _, kernel, _ = self._KERNEL_CLIENTS[session_id]
+        code = "get_ipython().run_line_magic('reset', '-f')\n" + \
+            START_CODE.format(self.user_data_dir)
+        await async_run_code(kernel, code, shutdown_kernel=False)
+
+    async def shutdown(self, session_id: str):
+        session_id = str(session_id)
+        if session_id in self._KERNEL_CLIENTS:
+            kernel_id, _, _ = self._KERNEL_CLIENTS.get(session_id)
+            await self._amkm.shutdown_kernel(kernel_id)
+            self._amkm.remove_kernel(kernel_id)
+            del self._KERNEL_CLIENTS[session_id]
+
+    async def close_session(self, session_id: str):
+        session_id = str(session_id)
+        if self._reuse_kernel:
+            if session_id in self._KERNEL_CLIENTS:
+                await self.reset(session_id)
+                await self._UNBOUND_KERNEL_CLIENTS.put(
+                    self._KERNEL_CLIENTS.pop(session_id))
+        else:
+            await self.shutdown(session_id)
+
+    async def _call(self, command, timeout=None, session_id=None):
+        _, kernel, _ = await self.initialize(str(session_id))
+        result = await async_run_code(
+            kernel,
+            extract_code(command),
+            interrupt_after=timeout or self.timeout,
+            shutdown_kernel=False)
+        execute_result, error_stacktrace, stream_text = result
+        if error_stacktrace is not None:
+            ret = re.sub('^-*\n', '', escape_ansi(error_stacktrace))
+            if ret.endswith('KeyboardInterrupt: '):
+                ret = 'The code interpreter encountered a timeout error.'
+            status, ret = False, ret.strip()
+        elif execute_result is not None:
+            status, ret = True, dict(text=execute_result.get('text/plain', ''))
+        else:
+            status, ret = True, dict(text=stream_text.strip())
+        return status, ret
+
+    @tool_api
+    async def run(self,
+                  command: str,
+                  timeout: Optional[int] = None,
+                  session_id: Optional[str] = None) -> ActionReturn:
+        r"""When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 60.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is disabled. Do not make external web requests or API calls as they will fail.
+
+        Args:
+            command (:class:`str`): Python code
+            timeout (:class:`Optional[int]`): Upper bound of waiting time for Python script execution.
+        """
+        tool_return = ActionReturn(url=None, args=None, type=self.name)
+        tool_return.args = dict(text=command)
+        succeed, result = await self._call(command, timeout, session_id)
+        if succeed:
+            text = result['text']
+            image = result.get('image', [])
+            resp = [dict(type='text', content=text)]
+            if image:
+                resp.extend([dict(type='image', content=im) for im in image])
+            tool_return.result = resp
+            # tool_return.result = dict(
+            #     text=result['text'], image=result.get('image', [])[0])
+            tool_return.state = ActionStatusCode.SUCCESS
+        else:
+            tool_return.errmsg = result.get('text', '') if isinstance(
+                result, dict) else result
+            tool_return.state = ActionStatusCode.API_ERROR
+        return tool_return
+
+
+def extract_code(text):
+    import json5
+
+    # Match triple backtick blocks first
+    triple_match = re.search(r'```[^\n]*\n(.+?)```', text, re.DOTALL)
+    # Match single backtick blocks second
+    single_match = re.search(r'`([^`]*)`', text, re.DOTALL)
+    if triple_match:
+        text = triple_match.group(1)
+    elif single_match:
+        text = single_match.group(1)
+    else:
+        try:
+            text = json5.loads(text)['code']
+        except Exception:
+            pass
+    # If no code blocks found, return original text
+    return text
+
+
+def escape_ansi(line):
+    ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+    return ansi_escape.sub('', line)
+
+
+def publish_image_to_local(image_base64: str, work_dir='./work_dir/tmp_dir'):
+    import PIL.Image
+    image_file = str(uuid.uuid4()) + '.png'
+    local_image_file = os.path.join(work_dir, image_file)
+
+    png_bytes = base64.b64decode(image_base64)
+    assert isinstance(png_bytes, bytes)
+    bytes_io = io.BytesIO(png_bytes)
+    PIL.Image.open(bytes_io).save(local_image_file, 'png')
+
+    return local_image_file
+
+
+# local test for code interpreter
+def get_multiline_input(hint):
+    print(hint)
+    print('// Press ENTER to make a new line. Press CTRL-D to end input.')
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:  # CTRL-D
+            break
+        lines.append(line)
+    print('// Input received.')
+    if lines:
+        return '\n'.join(lines)
+    else:
+        return ''
+
+
+if __name__ == '__main__':
+    code_interpreter = IPythonInterpreter()
+    while True:
+        print(code_interpreter(get_multiline_input('Enter python code:')))
+
+--------------------------------------------------------------------------------

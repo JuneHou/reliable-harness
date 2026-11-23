@@ -1,0 +1,643 @@
+Case ID: 77178370
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 17:50:01
+End Time: 2026-11-05 17:54:11
+Total Duration: 250.20 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Fixed version of the LangChain example.
+
+What was wrong in the original code
+-----------------------------------
+1. `retriever = vectorstore.as_retriever()` used the DEFAULT search type
+   ("similarity") with no score cut-off, so `get_relevant_documents()` ALWAYS
+   returned the top-k chunks - a greeting, a general question, or anything
+   off-topic still produced documents.
+2. The hard-coded `query = "what are cars made of?"` was used instead of the
+   user's input, and `result` (the chain answer) was thrown away and replaced
+   by the retriever output, so the printed result never matched the question.
+3. Even with `search_type="similarity_score_threshold"` an embedding-only
+   threshold is unreliable: modern OpenAI embeddings give *unrelated* text
+   surprisingly high cosine similarity (often 0.7 - 0.8), so greetings pass
+   almost any reasonable threshold.  A cheap similarity pre-filter is kept,
+   but the final decision is made by an LLM "does the context actually answer
+   the question?" grader, and the custom prompt was made explicit so the model
+   is allowed to answer only from the retrieved knowledge base.
+"""
+
+import os
+import re
+from typing import Any, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks.manager import CallbackManagerForRetrieverRun
+from langchain.chains import ConversationalRetrievalChain
+from langchain.chat_models import ChatOpenAI
+from langchain.docstore.document import Document
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
+from langchain.schema.retriever import BaseRetriever
+from langchain.vectorstores import FAISS
+
+# --------------------------------------------------------------------------- #
+# Environment
+# --------------------------------------------------------------------------- #
+_ = load_dotenv(find_dotenv())
+if os.getenv("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# --------------------------------------------------------------------------- #
+# Custom knowledge base
+# --------------------------------------------------------------------------- #
+KNOWLEDGE_BASE = [
+    "Buildings are made out of brick",
+    "Buildings are made out of wood",
+    "Buildings are made out of stone",
+    "Buildings are made out of atoms",
+    "Buildings are made out of building materials",
+    "Cars are made out of metal",
+    "Cars are made out of plastic",
+]
+
+DEFAULT_K = 4
+DEFAULT_SCORE_THRESHOLD = 0.5  # cheap pre-filter only
+NO_ANSWER = "NO_ANSWER"
+
+# Cheap guard for greetings / small talk (no embedding / LLM call needed).
+GREETING_PATTERN = re.compile(
+    r"^\s*(hi+|hello+|hey+|yo|sup|good\s+(morning|afternoon|evening|day)|"
+    r"greetings|how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|"
+    r"thanks?|thank\s+you|bye+|goodbye|see\s+you|nice\s+to\s+meet\s+you)"
+    r"[\s!.,?]*$",
+    re.IGNORECASE,
+)
+
+# --------------------------------------------------------------------------- #
+# Prompts (explicit, correctly formatted placeholders)
+# --------------------------------------------------------------------------- #
+RELEVANCE_GRADER_PROMPT = PromptTemplate.from_template(
+    """You are a strict relevance grader for a retrieval system backed by a
+custom knowledge base about what things are made of.
+
+Decide whether the CONTEXT actually contains information that answers the
+QUESTION. A topic that merely looks similar is NOT enough - the context must
+answer it.
+
+QUESTION:
+{question}
+
+CONTEXT:
+{context}
+
+Reply with exactly one word:
+YES - the context answers the question.
+NO  - the context does not answer the question (greeting, small talk,
+      general knowledge, or unrelated topic).
+"""
+)
+
+CONDENSE_QUESTION_PROMPT = PromptTemplate.from_template(
+    """Given the chat history and the follow-up question, rewrite the follow-up
+question as a standalone question. Return ONLY the standalone question.
+
+Chat History:
+{chat_history}
+
+Follow Up Input: {question}
+
+Standalone question:"""
+)
+
+QA_PROMPT = PromptTemplate.from_template(
+    """You are an assistant that answers questions using ONLY the provided
+excerpts from the custom knowledge base.
+
+Rules:
+- Use only the context below.
+- If the context does not contain the answer, reply exactly: {no_answer}
+- Never use outside knowledge and never make anything up.
+- Keep the answer short and factual.
+
+Context:
+{context}
+
+Chat History:
+{chat_history}
+
+Question: {question}
+
+Answer:"""
+)
+
+
+# --------------------------------------------------------------------------- #
+# Retriever that returns [] for anything not answered by the knowledge base
+# --------------------------------------------------------------------------- #
+class KnowledgeBaseRetriever(BaseRetriever):
+    """Similarity filtering + LLM answerability check.
+
+    Documents are returned ONLY when the query is answered by the knowledge
+    base; otherwise an empty list is returned.
+    """
+
+    vectorstore: Any
+    llm: Any = None
+    k: int = DEFAULT_K
+    score_threshold: float = DEFAULT_SCORE_THRESHOLD
+    use_llm_relevance_check: bool = True
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: Optional[CallbackManagerForRetrieverRun] = None,
+    ) -> List[Document]:
+        # 0) sanity check on the input
+        if not query or not query.strip():
+            return []
+
+        # 1) greetings / small talk -> nothing
+        if GREETING_PATTERN.match(query.strip()):
+            return []
+
+        # 2) embedding similarity with an explicit relevance score
+        #    (score is normalised to [0, 1] by FAISS)
+        scored = self.vectorstore.similarity_search_with_relevance_scores(
+            query, k=self.k
+        )
+        docs = [doc for doc, score in scored if score >= self.score_threshold]
+        if not docs:
+            return []
+
+        # 3) let the LLM decide whether the retrieved context really answers
+        #    the question (embedding scores alone are not discriminative)
+        if self.use_llm_relevance_check and self.llm is not None:
+            context = "\n".join(f"- {doc.page_content}" for doc in docs)
+            verdict = self.llm.predict(
+                RELEVANCE_GRADER_PROMPT.format(question=query, context=context)
+            )
+            if not verdict.strip().upper().startswith("YES"):
+                return []
+
+        # 4) de-duplicate while preserving order
+        unique: List[Document] = []
+        seen = set()
+        for doc in docs:
+            if doc.page_content not in seen:
+                seen.add(doc.page_content)
+                unique.append(doc)
+        return unique
+
+
+# --------------------------------------------------------------------------- #
+# Builders
+# --------------------------------------------------------------------------- #
+def build_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model_name="gpt-3.5-turbo",
+        temperature=0,  # deterministic output
+    )
+
+
+def build_retriever(llm: ChatOpenAI) -> KnowledgeBaseRetriever:
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_texts(KNOWLEDGE_BASE, embeddings, normalize_L2=True)
+
+    # NOTE: the built-in equivalent of the filtering above is
+    #   vectorstore.as_retriever(
+    #       search_type="similarity_score_threshold",
+    #       search_kwargs={"score_threshold": 0.5, "k": 4},
+    #   )
+    # but it raises/returns top-k when scores are all high, which is why the
+    # extra LLM answerability check is added here.
+    return KnowledgeBaseRetriever(
+        vectorstore=vectorstore,
+        llm=llm,
+        k=DEFAULT_K,
+        score_threshold=DEFAULT_SCORE_THRESHOLD,
+        use_llm_relevance_check=True,
+    )
+
+
+def build_qa_chain(
+    llm: ChatOpenAI,
+    retriever: KnowledgeBaseRetriever,
+    memory: ConversationBufferMemory,
+) -> ConversationalRetrievalChain:
+    return ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        condense_question_prompt=CONDENSE_QUESTION_PROMPT,
+        combine_docs_chain_kwargs={
+            "prompt": QA_PROMPT.partial(no_answer=NO_ANSWER),
+        },
+        memory=memory,
+        return_source_documents=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Main entry point
+# --------------------------------------------------------------------------- #
+def run_agent(user_input: str):
+    """Return the relevant knowledge-base documents for `user_input`.
+
+    An empty list is returned for greetings, general questions and any other
+    input that the custom knowledge base does not answer.
+    """
+    llm = build_llm()
+    retriever = build_retriever(llm)
+
+    # The answer, generated strictly from the retrieved context (or NO_ANSWER)
+    memory = ConversationBufferMemory(
+        memory_key="chat_history", return_messages=True, output_key="answer"
+    )
+    qa = build_qa_chain(llm, retriever, memory)
+    answer = qa({"question": user_input})["answer"]
+
+    # Documents only when the knowledge base actually answered the question
+    if str(answer).strip().upper().startswith(NO_ANSWER):
+        return []
+
+    return retriever.get_relevant_documents(user_input)
+
+
+if __name__ == "__main__":
+    test_queries = [
+        "What are buildings made of?",
+        "what are cars made of?",
+        "Hello, how are you?",
+        "What is the capital of France?",
+        "Tell me a joke",
+    ]
+
+    for user_input in test_queries:
+        result = run_agent(user_input)
+        print("\n=== User Query Result ===")
+        print(f"Question: {user_input}")
+        if result:
+            print("Answer (knowledge base documents):")
+            for doc in result:
+                print(f"  - {doc.page_content}")
+        else:
+            print("Answer: [] (not answered by the custom knowledge base)")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 17:54:11
+Duration: 250.20 seconds
+Verdict: I have enough information. Let me summarize my findings.
+
+## Verdict: **REJECT**
+
+### 1. Diff review
+The fixed version is a substantial rewrite. Its *reported* intent, per its own docstring, is:
+
+> `"""Return the relevant knowledge-base documents for `user_input`."""
+
+i.e. it deliberately returns **a list of `Document` objects** (or `[]`).
+
+```python
+    if str(answer).strip().upper().startswith(NO_ANSWER):
+        return []
+
+    return retriever.get_relevant_documents(user_input)   # -> List[Document]
+```
+
+### 2. Contract mismatch with the test — fatal
+The supplied test is unambiguous about the required return contract:
+
+```python
+result = run_agent(query)
+self.assertIsInstance(result, dict)      # <-- fails: result is a list
+self.assertIn('output', result)          # <-- fails: list has no 'output' key
+answer = result['output'].lower()        # <-- TypeError: list indices must be integers
+self.assertTrue("brick" in answer)
+```
+
+`run_agent` returns `List[Document]`, so the **very first assertion fails**. Even if the type assertion were relaxed, `list_of_documents['output']` raises `TypeError`, and `"brick" in answer` can never be evaluated on a string answer. The correct fix must return something like `{"input": user_input, "output": <chain answer>}`. The fix went the opposite direction and *removed* the dict-shaped answer entirely.
+
+Note also that the LLM answer that (often) contains "brick" is computed and then **thrown away** — `answer` is only used for the `NO_ANSWER` sentinel check, so the one value the test cares about is discarded.
+
+### 3. `validate_fixed_code` result is misleading
+It returned `ACCEPT ... matches expected structure and output format`, but that is a *structural/format* check (file present, importable, style), not an execution of the test. It plainly contradicts the test contract above, so I weight the explicit test assertions over this signal.
+
+### 4. API-usage concerns (verified, but docs lookups were unhelpful)
+The `verify_api_usage` searches returned only generic LangChain marketing pages, no parameter-level docs. From first principles:
+
+- `FAISS.from_texts(..., normalize_L2=True)` — acceptable: `normalize_L2` is forwarded to the internal `__from(...)`, and it is required for `similarity_search_with_relevance_scores()` to produce `1 - d/√2` scores with Euclidean distance. This part is at least coherent.
+- `BaseRetriever._get_relevant_documents(query, *, run_manager=...)` — signature is correct.
+- `self.llm.predict(prompt_string)` — `BaseLanguageModel.predict` is deprecated in recent `langchain-core` releases and its removal/behavior change is a live breakage risk; `llm.invoke(...)` is the supported path.
+- Declaring `vectorstore: Any` / `llm: Any` as Pydantic fields on a `BaseRetriever` subclass is legal, but the retriever now makes a **second LLM grading call per retrieval**, and `run_agent` performs *two* retrievals (one inside the chain, one at the end) → 3+ network round-trips per unit test invocation. That makes the test slow, cost-bearing, quota-dependent, and non-deterministic — a poor fit for a unit test.
+
+### 5. Correctness of the intended semantic improvement is not in question
+The diagnosis of the original bugs is accurate and valuable:
+- `vectorstore.as_retriever()` with default `similarity` returns top-k unconditionally;
+- the hard-coded `query = "what are cars made of?"` ignored `user_input`;
+- `result = retriever.get_relevant_documents(query)` overwrote the chain answer.
+
+The fixed code even reports `similarity_score_threshold` plus an LLM answerability grader, which is a reasonable design for "return `[]` for off-topic/greeting inputs." **However**, the original `run_agent` never returned a dict either, so the fix was obligated to reconcile with the *test's* expected `{"output": ...}` shape — which the reference tests clearly define — and it did not.
+
+### Summary of blocking defects
+| # | Issue | Severity |
+|---|---|---|
+| 1 | Returns `List[Document]` instead of `dict` with `'output'` key → `assertIsInstance(result, dict)` fails | **Blocking** |
+| 2 | `result['output']` would raise `TypeError` on a list | **Blocking** |
+| 3 | The chain answer containing "brick" is computed then discarded | **Blocking** |
+| 4 | `llm.predict()` deprecated / at risk across `langchain-core` versions | Major |
+| 5 | 3+ LLM calls per `run_agent` call — slow, costly, nondeterministic unit test | Major |
+| 6 | Duplicate retrieval (chain + explicit call at the end) | Minor |
+
+The fix improves retrieval quality but **breaks the required return contract**, so it cannot be accepted. It needs `run_agent` to return `{"input": user_input, "output": answer}` (with `answer` being the chain's `answer` string, which does contain "brick" for the buildings query), and should use `llm.invoke(...)` instead of `llm.predict(...)`.
+--------------------------------------------------------------------------------
+"""
+Fixed version of the LangChain example.
+
+What was wrong in the original code
+-----------------------------------
+1. `retriever = vectorstore.as_retriever()` used the DEFAULT search type
+   ("similarity") with no score cut-off, so `get_relevant_documents()` ALWAYS
+   returned the top-k chunks - a greeting, a general question, or anything
+   off-topic still produced documents.
+2. The hard-coded `query = "what are cars made of?"` was used instead of the
+   user's input, and `result` (the chain answer) was thrown away and replaced
+   by the retriever output, so the printed result never matched the question.
+3. Even with `search_type="similarity_score_threshold"` an embedding-only
+   threshold is unreliable: modern OpenAI embeddings give *unrelated* text
+   surprisingly high cosine similarity (often 0.7 - 0.8), so greetings pass
+   almost any reasonable threshold.  A cheap similarity pre-filter is kept,
+   but the final decision is made by an LLM "does the context actually answer
+   the question?" grader, and the custom prompt was made explicit so the model
+   is allowed to answer only from the retrieved knowledge base.
+"""
+
+import os
+import re
+from typing import Any, List, Optional
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks.manager import CallbackManagerForRetrieverRun
+from langchain.chains import ConversationalRetrievalChain
+from langchain.chat_models import ChatOpenAI
+from langchain.docstore.document import Document
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
+from langchain.schema.retriever import BaseRetriever
+from langchain.vectorstores import FAISS
+
+# --------------------------------------------------------------------------- #
+# Environment
+# --------------------------------------------------------------------------- #
+_ = load_dotenv(find_dotenv())
+if os.getenv("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# --------------------------------------------------------------------------- #
+# Custom knowledge base
+# --------------------------------------------------------------------------- #
+KNOWLEDGE_BASE = [
+    "Buildings are made out of brick",
+    "Buildings are made out of wood",
+    "Buildings are made out of stone",
+    "Buildings are made out of atoms",
+    "Buildings are made out of building materials",
+    "Cars are made out of metal",
+    "Cars are made out of plastic",
+]
+
+DEFAULT_K = 4
+DEFAULT_SCORE_THRESHOLD = 0.5  # cheap pre-filter only
+NO_ANSWER = "NO_ANSWER"
+
+# Cheap guard for greetings / small talk (no embedding / LLM call needed).
+GREETING_PATTERN = re.compile(
+    r"^\s*(hi+|hello+|hey+|yo|sup|good\s+(morning|afternoon|evening|day)|"
+    r"greetings|how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|"
+    r"thanks?|thank\s+you|bye+|goodbye|see\s+you|nice\s+to\s+meet\s+you)"
+    r"[\s!.,?]*$",
+    re.IGNORECASE,
+)
+
+# --------------------------------------------------------------------------- #
+# Prompts (explicit, correctly formatted placeholders)
+# --------------------------------------------------------------------------- #
+RELEVANCE_GRADER_PROMPT = PromptTemplate.from_template(
+    """You are a strict relevance grader for a retrieval system backed by a
+custom knowledge base about what things are made of.
+
+Decide whether the CONTEXT actually contains information that answers the
+QUESTION. A topic that merely looks similar is NOT enough - the context must
+answer it.
+
+QUESTION:
+{question}
+
+CONTEXT:
+{context}
+
+Reply with exactly one word:
+YES - the context answers the question.
+NO  - the context does not answer the question (greeting, small talk,
+      general knowledge, or unrelated topic).
+"""
+)
+
+CONDENSE_QUESTION_PROMPT = PromptTemplate.from_template(
+    """Given the chat history and the follow-up question, rewrite the follow-up
+question as a standalone question. Return ONLY the standalone question.
+
+Chat History:
+{chat_history}
+
+Follow Up Input: {question}
+
+Standalone question:"""
+)
+
+QA_PROMPT = PromptTemplate.from_template(
+    """You are an assistant that answers questions using ONLY the provided
+excerpts from the custom knowledge base.
+
+Rules:
+- Use only the context below.
+- If the context does not contain the answer, reply exactly: {no_answer}
+- Never use outside knowledge and never make anything up.
+- Keep the answer short and factual.
+
+Context:
+{context}
+
+Chat History:
+{chat_history}
+
+Question: {question}
+
+Answer:"""
+)
+
+
+# --------------------------------------------------------------------------- #
+# Retriever that returns [] for anything not answered by the knowledge base
+# --------------------------------------------------------------------------- #
+class KnowledgeBaseRetriever(BaseRetriever):
+    """Similarity filtering + LLM answerability check.
+
+    Documents are returned ONLY when the query is answered by the knowledge
+    base; otherwise an empty list is returned.
+    """
+
+    vectorstore: Any
+    llm: Any = None
+    k: int = DEFAULT_K
+    score_threshold: float = DEFAULT_SCORE_THRESHOLD
+    use_llm_relevance_check: bool = True
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: Optional[CallbackManagerForRetrieverRun] = None,
+    ) -> List[Document]:
+        # 0) sanity check on the input
+        if not query or not query.strip():
+            return []
+
+        # 1) greetings / small talk -> nothing
+        if GREETING_PATTERN.match(query.strip()):
+            return []
+
+        # 2) embedding similarity with an explicit relevance score
+        #    (score is normalised to [0, 1] by FAISS)
+        scored = self.vectorstore.similarity_search_with_relevance_scores(
+            query, k=self.k
+        )
+        docs = [doc for doc, score in scored if score >= self.score_threshold]
+        if not docs:
+            return []
+
+        # 3) let the LLM decide whether the retrieved context really answers
+        #    the question (embedding scores alone are not discriminative)
+        if self.use_llm_relevance_check and self.llm is not None:
+            context = "\n".join(f"- {doc.page_content}" for doc in docs)
+            verdict = self.llm.predict(
+                RELEVANCE_GRADER_PROMPT.format(question=query, context=context)
+            )
+            if not verdict.strip().upper().startswith("YES"):
+                return []
+
+        # 4) de-duplicate while preserving order
+        unique: List[Document] = []
+        seen = set()
+        for doc in docs:
+            if doc.page_content not in seen:
+                seen.add(doc.page_content)
+                unique.append(doc)
+        return unique
+
+
+# --------------------------------------------------------------------------- #
+# Builders
+# --------------------------------------------------------------------------- #
+def build_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model_name="gpt-3.5-turbo",
+        temperature=0,  # deterministic output
+    )
+
+
+def build_retriever(llm: ChatOpenAI) -> KnowledgeBaseRetriever:
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_texts(KNOWLEDGE_BASE, embeddings, normalize_L2=True)
+
+    # NOTE: the built-in equivalent of the filtering above is
+    #   vectorstore.as_retriever(
+    #       search_type="similarity_score_threshold",
+    #       search_kwargs={"score_threshold": 0.5, "k": 4},
+    #   )
+    # but it raises/returns top-k when scores are all high, which is why the
+    # extra LLM answerability check is added here.
+    return KnowledgeBaseRetriever(
+        vectorstore=vectorstore,
+        llm=llm,
+        k=DEFAULT_K,
+        score_threshold=DEFAULT_SCORE_THRESHOLD,
+        use_llm_relevance_check=True,
+    )
+
+
+def build_qa_chain(
+    llm: ChatOpenAI,
+    retriever: KnowledgeBaseRetriever,
+    memory: ConversationBufferMemory,
+) -> ConversationalRetrievalChain:
+    return ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        condense_question_prompt=CONDENSE_QUESTION_PROMPT,
+        combine_docs_chain_kwargs={
+            "prompt": QA_PROMPT.partial(no_answer=NO_ANSWER),
+        },
+        memory=memory,
+        return_source_documents=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Main entry point
+# --------------------------------------------------------------------------- #
+def run_agent(user_input: str):
+    """Return the relevant knowledge-base documents for `user_input`.
+
+    An empty list is returned for greetings, general questions and any other
+    input that the custom knowledge base does not answer.
+    """
+    llm = build_llm()
+    retriever = build_retriever(llm)
+
+    # The answer, generated strictly from the retrieved context (or NO_ANSWER)
+    memory = ConversationBufferMemory(
+        memory_key="chat_history", return_messages=True, output_key="answer"
+    )
+    qa = build_qa_chain(llm, retriever, memory)
+    answer = qa({"question": user_input})["answer"]
+
+    # Documents only when the knowledge base actually answered the question
+    if str(answer).strip().upper().startswith(NO_ANSWER):
+        return []
+
+    return retriever.get_relevant_documents(user_input)
+
+
+if __name__ == "__main__":
+    test_queries = [
+        "What are buildings made of?",
+        "what are cars made of?",
+        "Hello, how are you?",
+        "What is the capital of France?",
+        "Tell me a joke",
+    ]
+
+    for user_input in test_queries:
+        result = run_agent(user_input)
+        print("\n=== User Query Result ===")
+        print(f"Question: {user_input}")
+        if result:
+            print("Answer (knowledge base documents):")
+            for doc in result:
+                print(f"  - {doc.page_content}")
+        else:
+            print("Answer: [] (not answered by the custom knowledge base)")
+
+--------------------------------------------------------------------------------

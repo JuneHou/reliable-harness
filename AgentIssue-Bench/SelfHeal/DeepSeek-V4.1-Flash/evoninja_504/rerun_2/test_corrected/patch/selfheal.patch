@@ -1,0 +1,270 @@
+diff --git a/apps/browser/pages/api/proxy/embeddings.ts b/apps/browser/pages/api/proxy/embeddings.ts
+index 29affd6..4cd292a 100644
+--- a/apps/browser/pages/api/proxy/embeddings.ts
++++ b/apps/browser/pages/api/proxy/embeddings.ts
+@@ -7,6 +7,207 @@ import { canUseSubsidy } from "../../../api-utils/subsidy";
+ import { createSupabaseClient } from "../../../api-utils/supabase";
+ import { createOpenAIApiClient } from "../../../api-utils/openai";
+ 
++// Requests coming from the browser contain every chunk of every scraped page,
++// so a single goal easily produces several megabytes of text. Next.js only
++// accepts 1MB per API route by default and rejects anything bigger with a
++// "Body exceeds maximum size" (413) error, so raise the limit for this route.
++export const config = {
++  api: {
++    bodyParser: {
++      sizeLimit: "25mb",
++    },
++  },
++};
++
++// The embeddings endpoint accepts at most 2048 inputs and ~300k tokens per
++// request, and it rejects request bodies that are over the maximum size. Since
++// web scraping + chunking regularly produces more than that, the inputs are
++// batched (and oversized chunks are split) before they are forwarded to OpenAI.
++const MAX_INPUTS_PER_REQUEST = 256;
++const MAX_CHARS_PER_REQUEST = 100_000;
++const MAX_CHARS_PER_INPUT = 20_000;
++const MAX_CONCURRENT_REQUESTS = 4;
++
++type EmbeddingResult = { embedding: number[]; input: string };
++
++type Job = { groupIndex: number; pieceIndex: number; text: string };
++
++// The proxy accepts a list of chunk groups (`string[][]`), but it also tolerates
++// a flat list of strings, so both shapes end up as a flat list of chunks.
++function normalizeInput(rawInput: unknown): string[] {
++  if (!Array.isArray(rawInput)) {
++    return [];
++  }
++  return rawInput
++    .flatMap((entry) => (Array.isArray(entry) ? entry : [entry]))
++    .map((entry) => (typeof entry === "string" ? entry : String(entry ?? "")));
++}
++
++// A single chunk that is bigger than the per-input limit is embedded in pieces
++// and the resulting embeddings are averaged back together.
++function splitText(text: string): string[] {
++  const value = text.length > 0 ? text : " ";
++  if (value.length <= MAX_CHARS_PER_INPUT) {
++    return [value];
++  }
++  const pieces: string[] = [];
++  for (let i = 0; i < value.length; i += MAX_CHARS_PER_INPUT) {
++    pieces.push(value.slice(i, i + MAX_CHARS_PER_INPUT));
++  }
++  return pieces;
++}
++
++function averageEmbeddings(embeddings: number[][]): number[] {
++  const dimensions = embeddings[0].length;
++  const summed = new Array<number>(dimensions).fill(0);
++  for (const embedding of embeddings) {
++    for (let i = 0; i < dimensions; i++) {
++      summed[i] += embedding[i];
++    }
++  }
++  return summed.map((value) => value / embeddings.length);
++}
++
++function isBodyTooLargeError(e: any): boolean {
++  if (!(e instanceof OpenAIApi.APIError)) {
++    return false;
++  }
++  if (e.status === 413) {
++    return true;
++  }
++  if (e.status !== 400 && e.status !== 422) {
++    return false;
++  }
++  const message = String(e.message ?? "").toLowerCase();
++  return (
++    message.includes("maximum size") ||
++    message.includes("too large") ||
++    message.includes("too many tokens") ||
++    message.includes("exceeds")
++  );
++}
++
++// Sends `texts` to the embeddings endpoint and returns the embeddings in the
++// same order as the given texts. If the request is still too big for the API
++// (too many inputs/tokens or a body that exceeds the maximum size), the work is
++// split up and retried instead of failing the whole goal.
++async function createBatchEmbeddings(
++  openai: OpenAIApi,
++  model: string,
++  texts: string[]
++): Promise<number[][]> {
++  if (texts.length === 0) {
++    return [];
++  }
++
++  try {
++    const { data } = await openai.embeddings.create({
++      model,
++      input: texts,
++    });
++
++    const embeddings = new Array<number[]>(texts.length);
++    data.forEach((innerData) => {
++      embeddings[innerData.index] = innerData.embedding;
++    });
++    return embeddings;
++  } catch (e: any) {
++    if (isBodyTooLargeError(e) && texts.length > 1) {
++      const middle = Math.ceil(texts.length / 2);
++      const [left, right] = await Promise.all([
++        createBatchEmbeddings(openai, model, texts.slice(0, middle)),
++        createBatchEmbeddings(openai, model, texts.slice(middle)),
++      ]);
++      return [...left, ...right];
++    }
++    if (isBodyTooLargeError(e) && texts.length === 1 && texts[0].length > 1) {
++      const text = texts[0];
++      const middle = Math.ceil(text.length / 2);
++      const [left, right] = await Promise.all([
++        createBatchEmbeddings(openai, model, [text.slice(0, middle)]),
++        createBatchEmbeddings(openai, model, [text.slice(middle)]),
++      ]);
++      return [averageEmbeddings([left[0], right[0]])];
++    }
++    throw e;
++  }
++}
++
++async function createEmbeddings(
++  openai: OpenAIApi,
++  model: string,
++  inputs: string[]
++): Promise<EmbeddingResult[]> {
++  // Split every input into the pieces that actually get embedded. Usually there
++  // is exactly one piece per input; only oversized chunks are split up.
++  const groups = inputs.map((input) => ({
++    input,
++    pieces: splitText(input),
++  }));
++
++  const jobs: Job[] = [];
++  groups.forEach((group, groupIndex) => {
++    group.pieces.forEach((text, pieceIndex) => {
++      jobs.push({ groupIndex, pieceIndex, text });
++    });
++  });
++
++  // Batch the work so that every call to OpenAI stays within its limits.
++  const requests: Job[][] = [];
++  let currentRequest: Job[] = [];
++  let currentChars = 0;
++  for (const job of jobs) {
++    if (
++      currentRequest.length > 0 &&
++      (currentRequest.length >= MAX_INPUTS_PER_REQUEST ||
++        currentChars + job.text.length > MAX_CHARS_PER_REQUEST)
++    ) {
++      requests.push(currentRequest);
++      currentRequest = [];
++      currentChars = 0;
++    }
++    currentRequest.push(job);
++    currentChars += job.text.length;
++  }
++  if (currentRequest.length > 0) {
++    requests.push(currentRequest);
++  }
++
++  const embeddingsByGroup: number[][][] = groups.map((group) =>
++    new Array<number[]>(group.pieces.length).fill([])
++  );
++
++  let nextRequest = 0;
++  const worker = async (): Promise<void> => {
++    while (nextRequest < requests.length) {
++      const request = requests[nextRequest++];
++      const embeddings = await createBatchEmbeddings(
++        openai,
++        model,
++        request.map((job) => job.text)
++      );
++      request.forEach((job, index) => {
++        embeddingsByGroup[job.groupIndex][job.pieceIndex] = embeddings[index];
++      });
++    }
++  };
++
++  const workers = Array.from(
++    { length: Math.min(MAX_CONCURRENT_REQUESTS, requests.length) },
++    () => worker()
++  );
++  await Promise.all(workers);
++
++  return groups.map((group, groupIndex): EmbeddingResult => {
++    const embeddings = embeddingsByGroup[groupIndex];
++    return {
++      embedding:
++        embeddings.length === 1 ? embeddings[0] : averageEmbeddings(embeddings),
++      input: group.input,
++    };
++  });
++}
++
+ export default async function handler(
+   req: NextApiRequest,
+   res: NextApiResponse
+@@ -14,7 +215,9 @@ export default async function handler(
+   if (!(req.method === "POST")) {
+     return res.status(404).send({});
+   }
+-  const goalId = req.body.goalId;
++  const goalId = req.body?.goalId;
++  const model = req.body?.model;
++  const input = normalizeInput(req.body?.input);
+ 
+   // Ensure the user is logged in
+   const session = await getServerSession(req, res, authOptions);
+@@ -23,6 +226,10 @@ export default async function handler(
+     return res.status(401).send({});
+   }
+ 
++  if (!model || typeof model !== "string" || input.length === 0) {
++    return res.status(400).send({});
++  }
++
+   const supabase = createSupabaseClient();
+   const openai = createOpenAIApiClient();
+ 
+@@ -37,29 +244,18 @@ export default async function handler(
+     return res.status(403).send({});
+   }
+ 
+-  const input: string[][] = req.body.input;
+   try {
+-    const embeddings = await Promise.all(
+-      input.map(async (inputs) => {
+-        const { data } = await openai.embeddings.create({
+-          model: req.body.model,
+-          input: inputs,
+-        });
+-
+-        return data.map((innerData) => {
+-          return {
+-            embedding: innerData.embedding,
+-            input: inputs[innerData.index],
+-          };
+-        });
+-      })
+-    );
+-    return res.status(200).json({ embeddings: embeddings.flat() });
++    const embeddings = await createEmbeddings(openai, model, input);
++    return res.status(200).json({ embeddings });
+   } catch (e: any) {
+     // Rate limit error
+     if (e instanceof OpenAIApi.APIError && e.status === 429) {
+       return res.status(429).send({});
+     }
++    // The inputs are still too big to be embedded, even after batching
++    if (e instanceof OpenAIApi.APIError && isBodyTooLargeError(e)) {
++      return res.status(413).send({});
++    }
+     return res.status(500).send({});
+   }
+ }

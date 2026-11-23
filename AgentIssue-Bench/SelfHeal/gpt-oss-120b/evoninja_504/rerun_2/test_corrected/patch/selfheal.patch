@@ -1,0 +1,360 @@
+diff --git a/apps/browser/pages/api/proxy/embeddings.ts b/apps/browser/pages/api/proxy/embeddings.ts
+index 29affd6..4a1b124 100644
+--- a/apps/browser/pages/api/proxy/embeddings.ts
++++ b/apps/browser/pages/api/proxy/embeddings.ts
+@@ -37,24 +37,21 @@ export default async function handler(
+     return res.status(403).send({});
+   }
+ 
+-  const input: string[][] = req.body.input;
++  // The client now sends a single batch of inputs (maxInputsPerRequest sized array)
++  const inputs: string[] = req.body.input;
+   try {
+-    const embeddings = await Promise.all(
+-      input.map(async (inputs) => {
+-        const { data } = await openai.embeddings.create({
+-          model: req.body.model,
+-          input: inputs,
+-        });
++    const { data } = await openai.embeddings.create({
++      model: req.body.model,
++      input: inputs,
++    });
+ 
+-        return data.map((innerData) => {
+-          return {
+-            embedding: innerData.embedding,
+-            input: inputs[innerData.index],
+-          };
+-        });
+-      })
+-    );
+-    return res.status(200).json({ embeddings: embeddings.flat() });
++    const embeddings = data.map((innerData) => {
++      return {
++        embedding: innerData.embedding,
++        input: inputs[innerData.index],
++      };
++    });
++    return res.status(200).json({ embeddings });
+   } catch (e: any) {
+     // Rate limit error
+     if (e instanceof OpenAIApi.APIError && e.status === 429) {
+diff --git a/apps/browser/src/api/ProxyEmbeddingApi.ts b/apps/browser/src/api/ProxyEmbeddingApi.ts
+index 14a4f98..bee713c 100644
+--- a/apps/browser/src/api/ProxyEmbeddingApi.ts
++++ b/apps/browser/src/api/ProxyEmbeddingApi.ts
+@@ -43,36 +43,46 @@ export class ProxyEmbeddingApi implements EmbeddingApi {
+       throw Error("GoalID is not set");
+     }
+ 
+-    const embeddingResponse = await fetch("/api/proxy/embeddings", {
+-      method: "POST",
+-      body: JSON.stringify({
+-        input: batchedInputs,
+-        model: config.model,
+-        goalId
+-      }),
+-      headers: {
+-        "Content-Type": "application/json",
+-      },
+-    });
++    const allEmbeddings: EmbeddingCreationResult[] = [];
++    for (const batch of batchedInputs) {
++      const fetchBatch = async (retryCount?: number): Promise<EmbeddingCreationResult[]> => {
++        const embeddingResponse = await fetch("/api/proxy/embeddings", {
++          method: "POST",
++          body: JSON.stringify({
++            input: batch,
++            model: config.model,
++            goalId,
++          }),
++          headers: {
++            "Content-Type": "application/json",
++          },
++        });
+ 
+-    if (!embeddingResponse.ok) {
+-      const error = await embeddingResponse.json();
+-      if (embeddingResponse.status === 400) {
+-        throw Error("Error from OpenAI Embeddings: " + error.error);
+-      }
+-      if (embeddingResponse.status === 429) {
+-        await new Promise((resolve) => setTimeout(resolve, 15000));
+-        if (!tries || tries < MAX_RATE_LIMIT_RETRIES) {
+-          return this.createEmbeddings(input, tries == undefined ? 0 : ++tries);
++        if (!embeddingResponse.ok) {
++          const errorBody = await embeddingResponse.json().catch(() => ({}));
++          if (embeddingResponse.status === 400) {
++            throw Error("Error from OpenAI Embeddings: " + (errorBody.error ?? ""));
++          }
++          if (embeddingResponse.status === 429) {
++            await new Promise((resolve) => setTimeout(resolve, 15000));
++            if (retryCount === undefined || retryCount < MAX_RATE_LIMIT_RETRIES) {
++              return fetchBatch(retryCount === undefined ? 0 : retryCount + 1);
++            }
++          }
++          if (embeddingResponse.status === 403) {
++            this._setCapReached();
++            throw Error(ERROR_SUBSIDY_MAX);
++          }
++          throw Error("Error trying to get response from embeddings proxy.");
+         }
+-      }
+-      if (embeddingResponse.status === 403) {
+-        this._setCapReached();
+-        throw Error(ERROR_SUBSIDY_MAX);
+-      }
+-      throw Error("Error trying to get response from embeddings proxy.", error);
++        const { embeddings } = await embeddingResponse.json();
++        return embeddings as EmbeddingCreationResult[];
++      };
++
++      const batchEmbeddings = await fetchBatch(tries);
++      allEmbeddings.push(...batchEmbeddings);
+     }
+-    const { embeddings } = await embeddingResponse.json();
+-    return embeddings;
++
++    return allEmbeddings;
+   }
+ }
+diff --git a/packages/agents/src/agent-core/chunking/TextChunker.ts b/packages/agents/src/agent-core/chunking/TextChunker.ts
+index 278dde3..2eb7f2d 100644
+--- a/packages/agents/src/agent-core/chunking/TextChunker.ts
++++ b/packages/agents/src/agent-core/chunking/TextChunker.ts
+@@ -1,8 +1,8 @@
+ import { cleanWhitespace } from "./cleanWhitespace";
+ 
+ export class TextChunker {
+-  static fixedCharacterLength(text: string, opts: { chunkLength: number, overlap: number }): string[] {
+-    const { chunkLength, overlap } = opts
++  static fixedCharacterLength(text: string, opts: { chunkLength: number; overlap: number }): string[] {
++    const { chunkLength, overlap } = opts;
+ 
+     if (chunkLength <= overlap) {
+       throw new Error("Chunk length must be greater than overlap length.");
+@@ -24,37 +24,39 @@ export class TextChunker {
+   }
+ 
+   static parentDocRetrieval(text: string, opts: {
+-    parentChunker: (text: string) => string[],
+-    childChunker: (parentText: string) => string[],
++    parentChunker: (text: string) => string[];
++    childChunker: (parentText: string) => string[];
+   }): {
+     doc: string;
+     metadata: {
+       parent: string;
+-    }
++    };
+   }[] {
+-    const { parentChunker, childChunker } = opts
+-
+-    const parentChunks = parentChunker(text)
+-    const parentAndChildDocs = parentChunks.map(parentChunk => {
+-      return {
+-        parent: parentChunk,
+-        children: childChunker(parentChunk)
+-      }
+-    }).map(parentAndChildDoc => {
+-      return {
+-        metadatas: parentAndChildDoc.children.map(() => ({ parent: parentAndChildDoc.parent })),
+-        documents: parentAndChildDoc.children
+-      }
+-    })
+-
+-    const docs = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.documents)
+-    const metadatas = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.metadatas)
++    const { parentChunker, childChunker } = opts;
++
++    const parentChunks = parentChunker(text);
++    const parentAndChildDocs = parentChunks
++      .map((parentChunk) => {
++        return {
++          parent: parentChunk,
++          children: childChunker(parentChunk),
++        };
++      })
++      .map((parentAndChildDoc) => {
++        return {
++          metadatas: parentAndChildDoc.children.map(() => ({ parent: parentAndChildDoc.parent })),
++          documents: parentAndChildDoc.children,
++        };
++      });
++
++    const docs = parentAndChildDocs.flatMap((parentAndChildDoc) => parentAndChildDoc.documents);
++    const metadatas = parentAndChildDocs.flatMap((parentAndChildDoc) => parentAndChildDoc.metadatas);
+ 
+     const chunks = docs.map((doc, index) => {
+       return {
+         doc,
+-        metadata: metadatas[index]
+-      }
++        metadata: metadatas[index],
++      };
+     });
+ 
+     return chunks;
+@@ -70,31 +72,31 @@ export class TextChunker {
+     const digits = "([0-9])";
+     const multipleDots = /\\.{2,}/g;
+ 
+-      text = " " + text + "  ";
+-      text = text.replaceAll("\n", " ");
+-      text = text.replaceAll(new RegExp(prefixes, 'g'), "$1<prd>");
+-      text = text.replaceAll(new RegExp(websites, 'g'), "<prd>$1");
+-      text = text.replaceAll(new RegExp(digits + "[.]" + digits, 'g'), "$1<prd>$2");
+-      text = text.replaceAll(multipleDots, match => "<prd>".repeat(match.length) + "<stop>");
+-      if (text.includes("Ph.D")) text = text.replaceAll("Ph.D.", "Ph<prd>D<prd>");
+-      text = text.replaceAll(new RegExp("\\s" + alphabets + "[.] ", 'g'), " $1<prd> ");
+-      text = text.replaceAll(new RegExp(acronyms + " " + starters, 'g'), "$1<stop> $2");
+-      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>$3<prd>");
+-      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>");
+-      text = text.replaceAll(new RegExp(" " + suffixes + "[.] " + starters, 'g'), " $1<stop> $2");
+-      text = text.replaceAll(new RegExp(" " + suffixes + "[.]", 'g'), " $1<prd>");
+-      text = text.replaceAll(new RegExp(" " + alphabets + "[.]", 'g'), " $1<prd>");
+-      if (text.includes("”")) text = text.replaceAll(".”", "”.");
+-      if (text.includes("\"")) text = text.replaceAll(".\"", "\".");
+-      if (text.includes("!")) text = text.replaceAll("!\"", "\"!");
+-      if (text.includes("?")) text = text.replaceAll("?\"", "\"?");
+-      text = text.replaceAll(".", ".<stop>");
+-      text = text.replaceAll("?", "?<stop>");
+-      text = text.replaceAll("!", "!<stop>");
+-      text = text.replaceAll("<prd>", ".");
+-      const sentences = text.split("<stop>").map(s => s.trim());
+-      if (sentences && !sentences[sentences.length - 1]) sentences.pop();
+-      return sentences;
++    text = " " + text + "  ";
++    text = text.replaceAll("\n", " ");
++    text = text.replaceAll(new RegExp(prefixes, "g"), "$1<prd>");
++    text = text.replaceAll(new RegExp(websites, "g"), "<prd>$1");
++    text = text.replaceAll(new RegExp(digits + "[.]" + digits, "g"), "$1<prd>$2");
++    text = text.replaceAll(multipleDots, (match) => "<prd>".repeat(match.length) + "<stop>");
++    if (text.includes("Ph.D")) text = text.replaceAll("Ph.D.", "Ph<prd>D<prd>");
++    text = text.replaceAll(new RegExp("\\s" + alphabets + "[.] ", "g"), " $1<prd> ");
++    text = text.replaceAll(new RegExp(acronyms + " " + starters, "g"), "$1<stop> $2");
++    text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]", "g"), "$1<prd>$2<prd>$3<prd>");
++    text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]", "g"), "$1<prd>$2<prd>");
++    text = text.replaceAll(new RegExp(" " + suffixes + "[.] " + starters, "g"), " $1<stop> $2");
++    text = text.replaceAll(new RegExp(" " + suffixes + "[.]", "g"), " $1<prd>");
++    text = text.replaceAll(new RegExp(" " + alphabets + "[.]", "g"), " $1<prd>");
++    if (text.includes("\u201d")) text = text.replaceAll(".”", "”.");
++    if (text.includes('"')) text = text.replaceAll('."', '".');
++    if (text.includes('!')) text = text.replaceAll('!"', '"!');
++    if (text.includes('?')) text = text.replaceAll('?"', '"?');
++    text = text.replaceAll(".", ".<stop>");
++    text = text.replaceAll("?", "?<stop>");
++    text = text.replaceAll("!", "!<stop>");
++    text = text.replaceAll("<prd>", ".");
++    const sentences = text.split("<stop>").map((s) => s.trim());
++    if (sentences && !sentences[sentences.length - 1]) sentences.pop();
++    return sentences;
+   }
+ 
+   static singleLine(content: string): string[] {
+@@ -122,6 +124,7 @@ export class TextChunker {
+       }
+       currentChunk += char;
+     }
++    if (currentChunk) chunks.push(currentChunk);
+     return chunks;
+   }
+ 
+@@ -131,12 +134,13 @@ export class TextChunker {
+     let currentChunk = "";
+     for (const word of trimmedContent.split(" ")) {
+       if (currentChunk.length + word.length > characterLimit) {
+-        chunks.push(currentChunk);
++        if (currentChunk) chunks.push(currentChunk);
+         currentChunk = "";
+       }
+-      currentChunk += word;
++      currentChunk += (currentChunk ? " " : "") + word;
+     }
++    if (currentChunk) chunks.push(currentChunk);
+     // TODO: temp fix. Do more general solution
+-    return chunks.filter(x => x.length > 0);
++    return chunks.filter((x) => x.length > 0);
+   }
+ }
+diff --git a/packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts b/packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
+index 5293579..5f61e5c 100644
+--- a/packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
++++ b/packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
+@@ -9,26 +9,26 @@ import { ILogger } from "@evo-ninja/agent-utils";
+ export const DEFAULT_ADA_CONFIG = {
+   model: "text-embedding-ada-002",
+   maxTokensPerInput: 8191,
+-  maxInputsPerRequest: 2048
+-}
++  maxInputsPerRequest: 2048,
++};
+ 
+ export class OpenAIEmbeddingAPI implements EmbeddingApi {
+   private api: OpenAIApi;
+-  
++
+   constructor(
+     private apiKey: string,
+     private logger: ILogger,
+     private tokenizer: Tokenizer,
+     private modelConfig: {
+-      model: string,
+-      maxTokensPerInput: number,
+-      maxInputsPerRequest: number
++      model: string;
++      maxTokensPerInput: number;
++      maxInputsPerRequest: number;
+     } = DEFAULT_ADA_CONFIG,
+     private _maxRateLimitRetries: number = 5
+   ) {
+     this.api = new OpenAIApi({
+       apiKey: this.apiKey,
+-      dangerouslyAllowBrowser: true
++      dangerouslyAllowBrowser: true,
+     });
+   }
+ 
+@@ -39,20 +39,22 @@ export class OpenAIEmbeddingAPI implements EmbeddingApi {
+ 
+       const batchedInputs = splitArray(inputs, this.modelConfig.maxInputsPerRequest);
+ 
+-      const results = await Promise.all(batchedInputs.map(async (inputs) => {
+-        const { data } = await this.api.embeddings.create({
+-          model: this.modelConfig.model,
+-          input: inputs,
++      const results = await Promise.all(
++        batchedInputs.map(async (batch) => {
++          const { data } = await this.api.embeddings.create({
++            model: this.modelConfig.model,
++            input: batch,
++          });
++
++          return data.map((innerData) => {
++            return {
++              embedding: innerData.embedding,
++              input: batch[innerData.index],
++            };
++          });
+         })
++      );
+ 
+-        return data.map((innerData) => {
+-          return {
+-            embedding: innerData.embedding,
+-            input: inputs[innerData.index]
+-          }
+-        });
+-      }))
+-  
+       return results.flat();
+     } catch (err) {
+       const error = cleanOpenAIError(err);
+@@ -85,4 +87,4 @@ export class OpenAIEmbeddingAPI implements EmbeddingApi {
+       }
+     }
+   }
+-}
+\ No newline at end of file
++}

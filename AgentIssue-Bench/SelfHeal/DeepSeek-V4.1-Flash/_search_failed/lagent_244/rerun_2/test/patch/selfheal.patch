@@ -1,0 +1,146 @@
+diff --git a/lagent/llms/huggingface.py b/lagent/llms/huggingface.py
+index ce4982f..48612c1 100644
+--- a/lagent/llms/huggingface.py
++++ b/lagent/llms/huggingface.py
+@@ -8,8 +8,6 @@ from .base_llm import BaseModel
+ 
+ logger = logging.getLogger(__name__)
+ 
+-logger = logging.getLogger(__name__)
+-
+ 
+ class HFTransformer(BaseModel):
+     """Model wrapper around HuggingFace general models.
+@@ -53,6 +51,9 @@ class HFTransformer(BaseModel):
+             logger.warning('Both stop_words and stop_words_id are specified,'
+                            'only stop_words_id will be used.')
+ 
++        # `GenerationConfig` of the model, only initialized when the pad token
++        # has to be taken from the model's generation config.
++        self.gcfg = None
+         self._load_tokenizer(
+             path=path,
+             tokenizer_path=tokenizer_path,
+@@ -160,36 +161,68 @@ class HFTransformer(BaseModel):
+             inputs = self.tokenizer(
+                 inputs, padding=True, return_tensors='pt', return_length=True)
+             input_length = inputs['length']
++            device = getattr(self.model, 'device', None)
++            if device is None:
++                device = torch.device('cuda'
++                                      if torch.cuda.is_available() else 'cpu')
+             for k, v in inputs.items():
+-                inputs[k] = v.cuda()
++                inputs[k] = v.to(device)
+             input_ids = inputs['input_ids']
+             attention_mask = inputs['attention_mask']
+             batch_size = input_ids.shape[0]
+             input_ids_seq_length = input_ids.shape[-1]
+-            generation_config = self.model.generation_config
+-            generation_config = copy.deepcopy(generation_config)
++            generation_config = copy.deepcopy(self.model.generation_config)
+             new_gen_params = self.update_gen_params(**kwargs)
++            new_gen_params.update(kwargs)
++            # `stop_words` and `stop_words_id` are lagent specific generation
++            # parameters which are not attributes of `GenerationConfig`
++            # (e.g. `stop_words` is expected to be a list of str), so they
++            # are filtered out before updating the generation config.
++            new_gen_params.pop('stop_words', None)
++            new_gen_params.pop('stop_words_id', None)
+             generation_config.update(**new_gen_params)
+-            generation_config.update(**kwargs)
+-            model_kwargs = generation_config.to_dict()
+-            model_kwargs['attention_mask'] = attention_mask
+-            _, eos_token_id = (  # noqa: F841  # pylint: disable=W0612
+-                generation_config.bos_token_id,
+-                generation_config.eos_token_id,
+-            )
++            eos_token_id = generation_config.eos_token_id
+             if eos_token_id is None:
+-                if self.gcfg.eos_token_id is not None:
+-                    eos_token_id = self.gcfg.eos_token_id
+-                else:
+-                    eos_token_id = []
++                gcfg = getattr(self, 'gcfg', None)
++                eos_token_id = getattr(gcfg, 'eos_token_id', None)
+             if isinstance(eos_token_id, int):
+                 eos_token_id = [eos_token_id]
+-            if self.additional_eos_token_id is not None:
++            eos_token_id = list(eos_token_id) if eos_token_id else []
++            if self.additional_eos_token_id:
++                # keep the original eos token ids untouched
+                 eos_token_id.extend(self.additional_eos_token_id)
+-            eos_token_id_tensor = torch.tensor(eos_token_id).to(
+-                input_ids.device) if eos_token_id is not None else None
++            if eos_token_id:
++                generation_config.eos_token_id = eos_token_id
++            eos_token_id_tensor = (torch.tensor(
++                eos_token_id, dtype=torch.long, device=device)
++                                   if eos_token_id else None)
+             generation_config.max_length = (
+                 generation_config.max_new_tokens + input_ids_seq_length)
++            model_kwargs = generation_config.to_dict()
++            model_kwargs['attention_mask'] = attention_mask
++
++            # `_prepare_special_tokens` (transformers>=4.45) fills in the
++            # private special token tensors, e.g.
++            # `generation_config._eos_token_tensor`, which are consumed by the
++            # logits processors and the stopping criteria created below.
++            # `generate` invokes it automatically, but since the decoding loop
++            # is implemented manually here it has to be called explicitly,
++            # otherwise `AttributeError: 'GenerationConfig' object has no
++            # attribute '_eos_token_tensor'` is raised.
++            prepare_special_tokens = getattr(
++                self.model, '_prepare_special_tokens', None)
++            if prepare_special_tokens is not None:
++                try:
++                    prepare_special_tokens(
++                        generation_config,
++                        kwargs_has_attention_mask=True,
++                        device=device)
++                except TypeError:  # pragma: no cover
++                    # fall back to the manual initialization below
++                    pass
++            if not hasattr(generation_config, '_eos_token_tensor'):
++                generation_config._eos_token_tensor = eos_token_id_tensor
++
+             # Set generation parameters if not already defined
+             logits_processor = self.logits_processor
+             stopping_criteria = self.stopping_criteria
+@@ -209,6 +242,7 @@ class HFTransformer(BaseModel):
+ 
+             unfinished_sequences = input_ids.new(batch_size).fill_(1)
+             scores = None
++            response = ''
+             while True:
+                 model_inputs = self.model.prepare_inputs_for_generation(
+                     input_ids, **model_kwargs)
+@@ -243,9 +277,11 @@ class HFTransformer(BaseModel):
+                     outputs,
+                     model_kwargs,
+                     is_encoder_decoder=False)
+-                unfinished_sequences = unfinished_sequences.mul(
+-                    next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(
+-                        eos_token_id_tensor.unsqueeze(1)).prod(dim=0))
++                if eos_token_id_tensor is not None and \
++                        eos_token_id_tensor.numel() > 0:
++                    unfinished_sequences = unfinished_sequences.mul(
++                        next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(
++                            eos_token_id_tensor.unsqueeze(1)).prod(dim=0))
+                 output_token_ids = input_ids.cpu().tolist()
+                 for i in range(len(output_token_ids)):
+                     output_token_ids[i] = output_token_ids[i][:][
+@@ -259,11 +295,10 @@ class HFTransformer(BaseModel):
+                     # If an EOS token is found, only the previous
+                     # part of it is retained
+                     if first_eos_idx is not None:
+-                        output_token_ids[i] = output_token_ids[
+-                            i][:first_eos_idx]
++                        output_token_ids[i] = output_token_ids[i][:
++                                                                first_eos_idx]
+ 
+                 response = self.tokenizer.batch_decode(output_token_ids)
+-                # print(response)
+                 if not batched:
+                     response = response[0]
+                 yield ModelStatusCode.STREAM_ING, response, None

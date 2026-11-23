@@ -1,0 +1,584 @@
+Case ID: 79497660
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 20:13:48
+End Time: 2026-11-05 20:29:42
+Total Duration: 953.64 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Fix: how to get *real* custom columns (e.g. `external_id`) in the Postgres /
+pgvector table that LlamaIndex's `PGVectorStore` creates, instead of having
+those values buried inside the `metadata_` JSON(B) column.
+
+Why the original output does not match the expectation
+------------------------------------------------------
+`PGVectorStore` builds its SQLAlchemy table model dynamically in
+`get_data_model()` -> `self._table_class`, and it only ever writes:
+
+    node_id, text, metadata_ (JSON/JSONB), embedding
+
+The row payload is built in `PGVectorStore._node_to_table_row()`, which takes
+`node.metadata` and dumps *everything* into `metadata_`. There is no
+`custom_columns=` parameter anywhere in `from_params`/`__init__`, so any field
+you put on a `Document(metadata=...)` can only ever land in the JSON blob.
+
+The fix
+-------
+Subclass `PGVectorStore` and:
+
+1. after the base table exists, run `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+   and append the same `Column` to the dynamically generated model
+   (`self._table_class.__table__`) so that SQLAlchemy's INSERT/SELECT include it;
+2. override `_node_to_table_row()` so the value is written into the new column
+   (and, optionally, popped out of the metadata JSON so it is *not* duplicated);
+3. override `_db_record_to_node()` so the column value is put back on the node's
+   metadata when rows are read/queried again.
+
+Result: the table has a first-class `external_id TEXT` column, indexable and
+queryable with plain SQL (`WHERE external_id = ...`), and `metadata_` no longer
+contains it.
+"""
+
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+from pydantic import PrivateAttr
+from sqlalchemy import Column, Text
+from sqlalchemy import text as sql_text
+
+from llama_index.core import Document, VectorStoreIndex
+from llama_index.core.schema import BaseNode
+from llama_index.vector_stores.postgres import PGVectorStore
+
+load_dotenv()
+
+# promoted metadata key -> SQLAlchemy type used to create the column
+CUSTOM_COLUMNS: Dict[str, Any] = {"external_id": Text}
+
+
+def _as_column(name: str, type_or_column: Any) -> Column:
+    """Accept a Column, a type instance or a callable and return a Column."""
+    candidate = type_or_column() if callable(type_or_column) else type_or_column
+    if isinstance(candidate, Column):
+        candidate.name = name
+        return candidate
+    return Column(name, candidate)
+
+
+class CustomColumnsPGVectorStore(PGVectorStore):
+    """PGVectorStore that promotes selected metadata keys to real columns."""
+
+    _custom_columns: Dict[str, Column] = PrivateAttr(default_factory=dict)
+    _keep_metadata_copy: bool = PrivateAttr(default=False)
+
+    def __init__(
+        self,
+        custom_columns: Optional[Dict[str, Any]] = None,
+        keep_metadata_copy: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        # super().__init__ creates the default table
+        # (node_id, text, metadata_, embedding) exactly as before
+        super().__init__(**kwargs)
+        self._custom_columns = {
+            name: _as_column(name, column_type)
+            for name, column_type in (custom_columns or {}).items()
+        }
+        self._keep_metadata_copy = keep_metadata_copy
+        self._create_custom_columns()
+
+    # ---------------------------------------------------------------- schema
+    @property
+    def _sql_table(self) -> str:
+        """Fully qualified, quoted name of the table the store actually uses."""
+        table_class = getattr(self, "_table_class", None)
+        table_name = getattr(table_class, "__tablename__", None) or getattr(
+            self, "table_name", "llama"
+        )
+        return f'"{self.schema_name}"."{table_name}"'
+
+    def _create_custom_columns(self) -> None:
+        """Add the custom columns to both the DB table and the SQLAlchemy model."""
+        if not self._custom_columns:
+            return
+
+        model_table = getattr(getattr(self, "_table_class", None), "__table__", None)
+        with self._engine.begin() as conn:
+            for name, column in self._custom_columns.items():
+                ddl_type = column.type.compile(dialect=conn.dialect)
+                conn.execute(
+                    sql_text(
+                        f"ALTER TABLE {self._sql_table} "
+                        f"ADD COLUMN IF NOT EXISTS {name} {ddl_type}"
+                    )
+                )
+                # make the ORM model aware of the column so INSERT/SELECT include it
+                if model_table is not None and name not in model_table.columns:
+                    model_table.append_column(column)
+
+    # --------------------------------------------------------------- writing
+    @staticmethod
+    def _find_node(args: tuple, kwargs: dict) -> Optional[BaseNode]:
+        node = kwargs.get("node")
+        if isinstance(node, BaseNode):
+            return node
+        for arg in args:
+            if isinstance(arg, BaseNode):
+                return arg
+        return None
+
+    def _node_to_table_row(self, *args: Any, **kwargs: Any) -> Any:
+        node = self._find_node(args, kwargs)
+        promoted = (
+            {name: (node.metadata or {}).get(name) for name in self._custom_columns}
+            if node is not None
+            else {}
+        )
+
+        if node is not None and promoted and not self._keep_metadata_copy:
+            # keep the metadata JSON free of the promoted keys
+            original_metadata = node.metadata
+            node.metadata = {
+                key: value
+                for key, value in original_metadata.items()
+                if key not in self._custom_columns
+            }
+            try:
+                row = super()._node_to_table_row(*args, **kwargs)
+            finally:
+                node.metadata = original_metadata
+        else:
+            row = super()._node_to_table_row(*args, **kwargs)
+
+        for name, value in promoted.items():
+            setattr(row, name, value)
+        return row
+
+    # --------------------------------------------------------------- reading
+    def _db_record_to_node(self, record: Any, *args: Any, **kwargs: Any) -> Any:
+        node = super()._db_record_to_node(record, *args, **kwargs)
+        if node is not None:
+            for name in self._custom_columns:
+                value = getattr(record, name, None)
+                if value is not None:
+                    node.metadata[name] = value
+        return node
+
+
+def create_vector_store(request) -> CustomColumnsPGVectorStore:
+    host = "localhost"
+    password = "password"
+    port = 5432
+    user = "postgres"
+
+    vector_store = CustomColumnsPGVectorStore(
+        database=request.tenant,
+        host=host,
+        password=password,
+        port=port,
+        user=user,
+        table_name="vectorstore",
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+        # <- the actual fix: first-class columns instead of metadata JSON
+        custom_columns=CUSTOM_COLUMNS,
+        keep_metadata_copy=False,
+    )
+
+    return vector_store
+
+
+def describe_table(vector_store: CustomColumnsPGVectorStore) -> None:
+    """Show that external_id really is its own column now."""
+    table_class = vector_store._table_class
+    table_name = table_class.__tablename__
+    extra = ", ".join(vector_store._custom_columns)
+    select_columns = f"node_id, {extra}, metadata_" if extra else "node_id, metadata_"
+
+    with vector_store._engine.connect() as conn:
+        columns = conn.execute(
+            sql_text(
+                "SELECT column_name, data_type "
+                "FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table_name "
+                "ORDER BY ordinal_position"
+            ),
+            {"schema": vector_store.schema_name, "table_name": table_name},
+        ).fetchall()
+        rows = conn.execute(
+            sql_text(
+                f'SELECT {select_columns} FROM "{vector_store.schema_name}"."{table_name}"'
+            )
+        ).fetchall()
+
+    print("Table columns:")
+    for column_name, data_type in columns:
+        print(f"  - {column_name} ({data_type})")
+    print("Rows (custom column + metadata JSON):")
+    for row in rows:
+        print(" ", dict(row._mapping))
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store,
+    )
+
+    return index
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index = run_agent(request)
+
+    vector_store = index.vector_store
+    print("Vector store created and documents indexed")
+    describe_table(vector_store)
+
+    # nodes read back through the store still expose external_id in metadata
+    nodes = vector_store.get_nodes(node_ids=None) if hasattr(vector_store, "get_nodes") else []
+    for node in nodes:
+        print("node.metadata:", node.metadata)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 20:29:42
+Duration: 953.64 seconds
+Verdict: ## Evaluation
+
+### 1. What the diff does
+The fix replaces `PGVectorStore.from_params(...)` with a direct call to a new subclass constructor:
+
+```python
+class CustomColumnsPGVectorStore(PGVectorStore):
+    def __init__(self, custom_columns=None, keep_metadata_copy=False, **kwargs):
+        super().__init__(**kwargs)   # <-- receives host/port/database/user/password
+```
+
+and `create_vector_store` passes `database=…, host=…, password=…, port=…, user=…, table_name=…, embed_dim=…, hnsw_kwargs=…, custom_columns=…`.
+
+So `**kwargs` forwards `host`, `port`, `database`, `user`, `password` into `PGVectorStore.__init__`.
+
+### 2. Fatal API misuse — the constructor is not the `from_params` signature
+`PGVectorStore.__init__` is **not** the host/port-based API. Its required signature is:
+
+```python
+def __init__(
+    self,
+    connection_string: str,
+    async_connection_string: str,
+    table_name: str,
+    schema_name: str,
+    embed_dim: int = 1536,
+    hnsw_kwargs: Optional[dict] = None,
+    ...
+) -> None:
+```
+
+The `host/port/database/user/password` convenience arguments belong **only** to the `@classmethod from_params`, which internally assembles `connection_string` / `async_connection_string` and then calls `cls(...)`.
+
+Consequences:
+- `connection_string` and `async_connection_string` are missing → `TypeError: __init__() missing 2 required positional arguments`.
+- Even if they were supplied, `host=`, `port=`, `database=`, `user=`, `password=` are unexpected keywords → `TypeError: unexpected keyword argument 'host'` (pydantic `BasePydanticVectorStore` would raise a validation error instead).
+
+The fix even documents this itself ("There is no `custom_columns=` parameter in `from_params`/`__init__`") yet then throws away `from_params` and calls the raw constructor with `from_params`-only arguments. That is self-contradictory and guarantees a crash at `create_vector_store()` — i.e. inside `run_agent()`, which both tests call. **Both `test_external_id_saved_in_column` and `test_expected_external_ids` would ERROR, not pass.**
+
+The correct approach would have been either
+```python
+@classmethod
+def from_params(cls, **kwargs):
+    base = PGVectorStore.from_params(**kwargs)   # builds connection strings
+    ...
+```
+or keeping `PGVectorStore.from_params(...)` and then performing the `ALTER TABLE` / `append_column` / `_node_to_table_row` patching on the resulting instance.
+
+### 3. Secondary problems (would surface even after fixing #2)
+- `_sql_table` relies on `self.schema_name` from `getattr(self, "table_name", ...)`; `PGVectorStore` stores the schema on the dynamically built model, and `self.table_name` is a *base* table name — relying on this mixed lookup is fragile.
+- `_db_record_to_node(self, record, *args, **kwargs)` assumes the base signature is `(record, …)`; the real signature is `(record, embedding=None)`, so mutation of `node.metadata` is fine but the override depends on `super()` returning a node built from the *same* `node_to_metadata_dict` path — untested here.
+- Appending a `Column` to `_table_class.__table__` works for SQLAlchemy declarative, but the store may not `perform_setup` differently; no verification that the INSERT statement actually includes the column before the store's insert path is built.
+
+### 4. Tooling caveats
+- `validate_fixed_code` returned **ACCEPT**, but that check is structural/format-only and does not exercise the constructor.
+- `verify_api_usage` returned only unrelated web noise (llama the animal, "From" the TV series) for every probe, so it offered no confirmation either way. My analysis above is based on the known `PGVectorStore` constructor/`from_params` split.
+
+## Verdict
+
+**REJECT**
+
+The intent (promoting `external_id` to a real column, stripping it from `metadata_`) is right, and the DDL/row-mapping strategy is plausible. But the implementation swaps `PGVectorStore.from_params(...)` for a direct subclass constructor while still passing `from_params`-style arguments (`host`, `port`, `database`, `user`, `password`) instead of the required `connection_string` / `async_connection_string`. This raises `TypeError` before any document is indexed, so `run_agent()` fails and both test cases error out. The fix must retain `from_params` (or override it in the subclass) and apply the custom-column logic to the returned instance.
+--------------------------------------------------------------------------------
+"""
+Fix: how to get *real* custom columns (e.g. `external_id`) in the Postgres /
+pgvector table that LlamaIndex's `PGVectorStore` creates, instead of having
+those values buried inside the `metadata_` JSON(B) column.
+
+Why the original output does not match the expectation
+------------------------------------------------------
+`PGVectorStore` builds its SQLAlchemy table model dynamically in
+`get_data_model()` -> `self._table_class`, and it only ever writes:
+
+    node_id, text, metadata_ (JSON/JSONB), embedding
+
+The row payload is built in `PGVectorStore._node_to_table_row()`, which takes
+`node.metadata` and dumps *everything* into `metadata_`. There is no
+`custom_columns=` parameter anywhere in `from_params`/`__init__`, so any field
+you put on a `Document(metadata=...)` can only ever land in the JSON blob.
+
+The fix
+-------
+Subclass `PGVectorStore` and:
+
+1. after the base table exists, run `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+   and append the same `Column` to the dynamically generated model
+   (`self._table_class.__table__`) so that SQLAlchemy's INSERT/SELECT include it;
+2. override `_node_to_table_row()` so the value is written into the new column
+   (and, optionally, popped out of the metadata JSON so it is *not* duplicated);
+3. override `_db_record_to_node()` so the column value is put back on the node's
+   metadata when rows are read/queried again.
+
+Result: the table has a first-class `external_id TEXT` column, indexable and
+queryable with plain SQL (`WHERE external_id = ...`), and `metadata_` no longer
+contains it.
+"""
+
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+from pydantic import PrivateAttr
+from sqlalchemy import Column, Text
+from sqlalchemy import text as sql_text
+
+from llama_index.core import Document, VectorStoreIndex
+from llama_index.core.schema import BaseNode
+from llama_index.vector_stores.postgres import PGVectorStore
+
+load_dotenv()
+
+# promoted metadata key -> SQLAlchemy type used to create the column
+CUSTOM_COLUMNS: Dict[str, Any] = {"external_id": Text}
+
+
+def _as_column(name: str, type_or_column: Any) -> Column:
+    """Accept a Column, a type instance or a callable and return a Column."""
+    candidate = type_or_column() if callable(type_or_column) else type_or_column
+    if isinstance(candidate, Column):
+        candidate.name = name
+        return candidate
+    return Column(name, candidate)
+
+
+class CustomColumnsPGVectorStore(PGVectorStore):
+    """PGVectorStore that promotes selected metadata keys to real columns."""
+
+    _custom_columns: Dict[str, Column] = PrivateAttr(default_factory=dict)
+    _keep_metadata_copy: bool = PrivateAttr(default=False)
+
+    def __init__(
+        self,
+        custom_columns: Optional[Dict[str, Any]] = None,
+        keep_metadata_copy: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        # super().__init__ creates the default table
+        # (node_id, text, metadata_, embedding) exactly as before
+        super().__init__(**kwargs)
+        self._custom_columns = {
+            name: _as_column(name, column_type)
+            for name, column_type in (custom_columns or {}).items()
+        }
+        self._keep_metadata_copy = keep_metadata_copy
+        self._create_custom_columns()
+
+    # ---------------------------------------------------------------- schema
+    @property
+    def _sql_table(self) -> str:
+        """Fully qualified, quoted name of the table the store actually uses."""
+        table_class = getattr(self, "_table_class", None)
+        table_name = getattr(table_class, "__tablename__", None) or getattr(
+            self, "table_name", "llama"
+        )
+        return f'"{self.schema_name}"."{table_name}"'
+
+    def _create_custom_columns(self) -> None:
+        """Add the custom columns to both the DB table and the SQLAlchemy model."""
+        if not self._custom_columns:
+            return
+
+        model_table = getattr(getattr(self, "_table_class", None), "__table__", None)
+        with self._engine.begin() as conn:
+            for name, column in self._custom_columns.items():
+                ddl_type = column.type.compile(dialect=conn.dialect)
+                conn.execute(
+                    sql_text(
+                        f"ALTER TABLE {self._sql_table} "
+                        f"ADD COLUMN IF NOT EXISTS {name} {ddl_type}"
+                    )
+                )
+                # make the ORM model aware of the column so INSERT/SELECT include it
+                if model_table is not None and name not in model_table.columns:
+                    model_table.append_column(column)
+
+    # --------------------------------------------------------------- writing
+    @staticmethod
+    def _find_node(args: tuple, kwargs: dict) -> Optional[BaseNode]:
+        node = kwargs.get("node")
+        if isinstance(node, BaseNode):
+            return node
+        for arg in args:
+            if isinstance(arg, BaseNode):
+                return arg
+        return None
+
+    def _node_to_table_row(self, *args: Any, **kwargs: Any) -> Any:
+        node = self._find_node(args, kwargs)
+        promoted = (
+            {name: (node.metadata or {}).get(name) for name in self._custom_columns}
+            if node is not None
+            else {}
+        )
+
+        if node is not None and promoted and not self._keep_metadata_copy:
+            # keep the metadata JSON free of the promoted keys
+            original_metadata = node.metadata
+            node.metadata = {
+                key: value
+                for key, value in original_metadata.items()
+                if key not in self._custom_columns
+            }
+            try:
+                row = super()._node_to_table_row(*args, **kwargs)
+            finally:
+                node.metadata = original_metadata
+        else:
+            row = super()._node_to_table_row(*args, **kwargs)
+
+        for name, value in promoted.items():
+            setattr(row, name, value)
+        return row
+
+    # --------------------------------------------------------------- reading
+    def _db_record_to_node(self, record: Any, *args: Any, **kwargs: Any) -> Any:
+        node = super()._db_record_to_node(record, *args, **kwargs)
+        if node is not None:
+            for name in self._custom_columns:
+                value = getattr(record, name, None)
+                if value is not None:
+                    node.metadata[name] = value
+        return node
+
+
+def create_vector_store(request) -> CustomColumnsPGVectorStore:
+    host = "localhost"
+    password = "password"
+    port = 5432
+    user = "postgres"
+
+    vector_store = CustomColumnsPGVectorStore(
+        database=request.tenant,
+        host=host,
+        password=password,
+        port=port,
+        user=user,
+        table_name="vectorstore",
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+        # <- the actual fix: first-class columns instead of metadata JSON
+        custom_columns=CUSTOM_COLUMNS,
+        keep_metadata_copy=False,
+    )
+
+    return vector_store
+
+
+def describe_table(vector_store: CustomColumnsPGVectorStore) -> None:
+    """Show that external_id really is its own column now."""
+    table_class = vector_store._table_class
+    table_name = table_class.__tablename__
+    extra = ", ".join(vector_store._custom_columns)
+    select_columns = f"node_id, {extra}, metadata_" if extra else "node_id, metadata_"
+
+    with vector_store._engine.connect() as conn:
+        columns = conn.execute(
+            sql_text(
+                "SELECT column_name, data_type "
+                "FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table_name "
+                "ORDER BY ordinal_position"
+            ),
+            {"schema": vector_store.schema_name, "table_name": table_name},
+        ).fetchall()
+        rows = conn.execute(
+            sql_text(
+                f'SELECT {select_columns} FROM "{vector_store.schema_name}"."{table_name}"'
+            )
+        ).fetchall()
+
+    print("Table columns:")
+    for column_name, data_type in columns:
+        print(f"  - {column_name} ({data_type})")
+    print("Rows (custom column + metadata JSON):")
+    for row in rows:
+        print(" ", dict(row._mapping))
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store,
+    )
+
+    return index
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index = run_agent(request)
+
+    vector_store = index.vector_store
+    print("Vector store created and documents indexed")
+    describe_table(vector_store)
+
+    # nodes read back through the store still expose external_id in metadata
+    nodes = vector_store.get_nodes(node_ids=None) if hasattr(vector_store, "get_nodes") else []
+    for node in nodes:
+        print("node.metadata:", node.metadata)
+
+--------------------------------------------------------------------------------

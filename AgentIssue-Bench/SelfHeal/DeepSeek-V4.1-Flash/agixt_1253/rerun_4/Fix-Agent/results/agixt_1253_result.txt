@@ -1,0 +1,3576 @@
+Case ID: agixt_1253
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-14 21:15:23
+End Time: 2026-11-14 21:34:08
+Total Duration: 1124.78 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### agixt/Chain.py
+from DB import (
+    get_session,
+    Chain as ChainDB,
+    ChainStep,
+    ChainStepResponse,
+    ChainRun,
+    Agent,
+    Argument,
+    ChainStepArgument,
+    Prompt,
+    Command,
+    User,
+    TaskCategory,
+    TaskItem,
+)
+from Globals import getenv, DEFAULT_USER
+from Prompts import Prompts
+from Extensions import Extensions
+from MagicalAuth import get_user_id
+import logging
+import asyncio
+
+logging.basicConfig(
+    level=getenv("LOG_LEVEL"),
+    format=getenv("LOG_FORMAT"),
+)
+
+
+class Chain:
+    def __init__(self, user=DEFAULT_USER, ApiClient=None):
+        self.user = user
+        self.ApiClient = ApiClient
+        self.user_id = get_user_id(self.user)
+
+    def _get_default_user_id(self, session):
+        """Return the id of the default (global) user.
+
+        The default user may not exist in a fresh/partially seeded database, in
+        which case looking up `.id` on the query result would raise
+        `AttributeError: 'NoneType' object has no attribute 'id'`.
+        """
+        user_data = session.query(User).filter(User.email == DEFAULT_USER).first()
+        if not user_data:
+            logging.warning(
+                f"Default user {DEFAULT_USER} was not found in the database."
+            )
+            return None
+        return user_data.id
+
+    def _find_prompt(self, session, prompt_name, prompt_category=None):
+        """Find a prompt owned by the user, falling back to a global prompt."""
+        if not prompt_name:
+            return None
+        query = session.query(Prompt).filter(Prompt.name == prompt_name)
+        if prompt_category:
+            target = (
+                query.filter(
+                    Prompt.user_id == self.user_id,
+                    Prompt.prompt_category.has(name=prompt_category),
+                )
+                .first()
+            )
+            if target:
+                return target
+            target = query.filter(
+                Prompt.prompt_category.has(name=prompt_category)
+            ).first()
+            if target:
+                return target
+        target = query.filter(Prompt.user_id == self.user_id).first()
+        if target:
+            return target
+        # Fall back to a prompt with this name owned by anyone (global prompts)
+        return session.query(Prompt).filter(Prompt.name == prompt_name).first()
+
+    def _find_chain(self, session, chain_name):
+        """Find a chain owned by the user, falling back to a global chain."""
+        if not chain_name:
+            return None
+        target = (
+            session.query(ChainDB)
+            .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+            .first()
+        )
+        if target:
+            return target
+        default_user_id = self._get_default_user_id(session)
+        if default_user_id:
+            target = (
+                session.query(ChainDB)
+                .filter(
+                    ChainDB.name == chain_name, ChainDB.user_id == default_user_id
+                )
+                .first()
+            )
+            if target:
+                return target
+        return session.query(ChainDB).filter(ChainDB.name == chain_name).first()
+
+    def _find_command(self, session, command_name):
+        if not command_name:
+            return None
+        return session.query(Command).filter(Command.name == command_name).first()
+
+    def _find_agent(self, session, agent_name):
+        """Find an agent owned by the user, falling back to global agents."""
+        agent = None
+        if agent_name:
+            agent = (
+                session.query(Agent)
+                .filter(Agent.name == agent_name, Agent.user_id == self.user_id)
+                .first()
+            )
+            if agent:
+                return agent
+            default_user_id = self._get_default_user_id(session)
+            if default_user_id:
+                agent = (
+                    session.query(Agent)
+                    .filter(
+                        Agent.name == agent_name, Agent.user_id == default_user_id
+                    )
+                    .first()
+                )
+                if agent:
+                    return agent
+        # Use the first agent available to the user as a last resort
+        agent = session.query(Agent).filter(Agent.user_id == self.user_id).first()
+        if agent:
+            return agent
+        default_user_id = self._get_default_user_id(session)
+        if default_user_id:
+            agent = (
+                session.query(Agent).filter(Agent.user_id == default_user_id).first()
+            )
+        return agent
+
+    def get_chain(self, chain_name):
+        session = get_session()
+        try:
+            chain_name = chain_name.replace("%20", " ")
+            chain_db = None
+            default_user_id = self._get_default_user_id(session)
+            if default_user_id:
+                chain_db = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.user_id == default_user_id, ChainDB.name == chain_name
+                    )
+                    .first()
+                )
+            if chain_db is None:
+                chain_db = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.name == chain_name,
+                        ChainDB.user_id == self.user_id,
+                    )
+                    .first()
+                )
+            if chain_db is None:
+                return []
+            chain_steps = (
+                session.query(ChainStep)
+                .filter(ChainStep.chain_id == chain_db.id)
+                .order_by(ChainStep.step_number)
+                .all()
+            )
+
+            steps = []
+            for step in chain_steps:
+                agent = session.query(Agent).get(step.agent_id)
+                agent_name = agent.name if agent else None
+                prompt = {}
+                if step.target_chain_id:
+                    target_chain = session.query(ChainDB).get(step.target_chain_id)
+                    if target_chain:
+                        prompt["chain_name"] = target_chain.name
+                elif step.target_command_id:
+                    target_command = session.query(Command).get(step.target_command_id)
+                    if target_command:
+                        prompt["command_name"] = target_command.name
+                elif step.target_prompt_id:
+                    target_prompt = session.query(Prompt).get(step.target_prompt_id)
+                    if target_prompt:
+                        prompt["prompt_name"] = target_prompt.name
+
+                # Retrieve argument data for the step
+                arguments = (
+                    session.query(Argument, ChainStepArgument)
+                    .join(
+                        ChainStepArgument, ChainStepArgument.argument_id == Argument.id
+                    )
+                    .filter(ChainStepArgument.chain_step_id == step.id)
+                    .all()
+                )
+
+                prompt_args = {}
+                for argument, chain_step_argument in arguments:
+                    prompt_args[argument.name] = chain_step_argument.value
+
+                prompt.update(prompt_args)
+
+                step_data = {
+                    "step": step.step_number,
+                    "agent_name": agent_name,
+                    "prompt_type": step.prompt_type,
+                    "prompt": prompt,
+                }
+                steps.append(step_data)
+
+            chain_data = {
+                "id": chain_db.id,
+                "chain_name": chain_db.name,
+                "steps": steps,
+            }
+            return chain_data
+        finally:
+            session.close()
+
+    def get_chains(self):
+        session = get_session()
+        try:
+            chain_list = []
+            chains = (
+                session.query(ChainDB).filter(ChainDB.user_id == self.user_id).all()
+            )
+            for chain in chains:
+                chain_list.append(chain.name)
+            default_user_id = self._get_default_user_id(session)
+            if default_user_id:
+                global_chains = (
+                    session.query(ChainDB)
+                    .filter(ChainDB.user_id == default_user_id)
+                    .all()
+                )
+                for chain in global_chains:
+                    chain_list.append(chain.name)
+            return chain_list
+        finally:
+            session.close()
+
+    def add_chain(self, chain_name):
+        session = get_session()
+        try:
+            chain = ChainDB(name=chain_name, user_id=self.user_id)
+            session.add(chain)
+            session.commit()
+        finally:
+            session.close()
+
+    def rename_chain(self, chain_name, new_name):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if chain:
+                chain.name = new_name
+                session.commit()
+        finally:
+            session.close()
+
+    def add_chain_step(
+        self,
+        chain_name: str,
+        step_number: int,
+        agent_name: str,
+        prompt_type: str,
+        prompt: dict,
+    ):
+        session = get_session()
+        try:
+            chain = self._find_chain(session, chain_name)
+            if not chain:
+                logging.error(f"Chain {chain_name} not found.")
+                return
+            agent = self._find_agent(session, agent_name)
+            if not agent:
+                logging.error(f"Agent {agent_name} not found.")
+                return
+            if "prompt_category" in prompt:
+                prompt_category = prompt["prompt_category"]
+            else:
+                prompt_category = "Default"
+            argument_key = None
+            target = None
+            target_type = None
+            if prompt_type.lower() == "prompt":
+                argument_key = "prompt_name"
+                target = self._find_prompt(
+                    session, prompt.get(argument_key), prompt_category
+                )
+                target_type = "prompt"
+            elif prompt_type.lower() == "chain":
+                argument_key = "chain_name"
+                if argument_key not in prompt:
+                    argument_key = "chain"
+                target = self._find_chain(session, prompt.get(argument_key))
+                target_type = "chain"
+            elif prompt_type.lower() == "command":
+                argument_key = "command_name"
+                target = self._find_command(session, prompt.get(argument_key))
+                target_type = "command"
+            else:
+                logging.warning(
+                    f"Invalid prompt {prompt} with prompt type {prompt_type}. Using default prompt."
+                )
+                prompt["prompt_name"] = "User Input"
+                prompt["prompt_category"] = "Default"
+                prompt_type = "Prompt"
+                prompt["user_input"] = (
+                    prompt["input"]
+                    if "input" in prompt
+                    else prompt["user_input"] if "user_input" in prompt else ""
+                )
+                if "input" in prompt:
+                    del prompt["input"]
+                prompt_category = "Default"
+                argument_key = "prompt_name"
+                target = self._find_prompt(session, prompt[argument_key], prompt_category)
+                target_type = "prompt"
+            if not target:
+                logging.error(
+                    f"Target {prompt.get(argument_key)} not found. Using default prompt."
+                )
+                logging.info(f"Prompt: {prompt}")
+                logging.info(f"Prompt Type: {prompt_type}")
+                logging.info(f"Argument Key: {argument_key}")
+                # Fall back to the default prompt instead of dereferencing None
+                target = self._find_prompt(session, "User Input", prompt_category)
+                if target:
+                    argument_key = "prompt_name"
+                    prompt[argument_key] = "User Input"
+                    prompt["prompt_category"] = prompt_category
+                    target_type = "prompt"
+                else:
+                    logging.error(
+                        f"Unable to add step {step_number} to chain {chain_name}."
+                    )
+                    return
+            target_id = target.id
+            argument_value = prompt[argument_key]
+            prompt_arguments = prompt.copy()
+            if argument_key in prompt_arguments:
+                del prompt_arguments[argument_key]
+            chain_step = ChainStep(
+                chain_id=chain.id,
+                step_number=step_number,
+                agent_id=agent.id,
+                prompt_type=prompt_type,
+                prompt=argument_value,
+                target_chain_id=target_id if target_type == "chain" else None,
+                target_command_id=target_id if target_type == "command" else None,
+                target_prompt_id=target_id if target_type == "prompt" else None,
+            )
+            session.add(chain_step)
+            session.commit()
+
+            for argument_name, argument_value in prompt_arguments.items():
+                argument = (
+                    session.query(Argument)
+                    .filter(Argument.name == argument_name)
+                    .first()
+                )
+                if not argument:
+                    # Handle the case where argument not found based on argument_name
+                    # You can choose to skip this argument or raise an exception
+                    continue
+
+                chain_step_argument = ChainStepArgument(
+                    chain_step_id=chain_step.id,
+                    argument_id=argument.id,
+                    value=argument_value,
+                )
+                session.add(chain_step_argument)
+                session.commit()
+        finally:
+            session.close()
+
+    def update_step(self, chain_name, step_number, agent_name, prompt_type, prompt):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if not chain:
+                logging.error(f"Chain {chain_name} not found.")
+                return
+            chain_step = (
+                session.query(ChainStep)
+                .filter(
+                    ChainStep.chain_id == chain.id,
+                    ChainStep.step_number == step_number,
+                )
+                .first()
+            )
+            if not chain_step:
+                logging.error(f"Step {step_number} not found in chain {chain_name}.")
+                return
+            agent = (
+                session.query(Agent)
+                .filter(Agent.name == agent_name, Agent.user_id == self.user_id)
+                .first()
+            )
+            agent_id = agent.id if agent else None
+            target_chain_id = None
+            target_command_id = None
+            target_prompt_id = None
+            prompt_args = prompt.copy()
+            if prompt_type == "Command":
+                command_name = prompt.get("command_name")
+                if "command_name" in prompt_args:
+                    del prompt_args["command_name"]
+                command = (
+                    session.query(Command).filter(Command.name == command_name).first()
+                )
+                if command:
+                    target_command_id = command.id
+            elif prompt_type == "Prompt":
+                prompt_name = prompt.get("prompt_name")
+                prompt_category = prompt.get("prompt_category", "Default")
+                if "prompt_name" in prompt_args:
+                    del prompt_args["prompt_name"]
+                if "prompt_category" in prompt_args:
+                    del prompt_args["prompt_category"]
+                prompt_obj = (
+                    session.query(Prompt)
+                    .filter(
+                        Prompt.name == prompt_name,
+                        Prompt.prompt_category.has(name=prompt_category),
+                        Prompt.user_id == self.user_id,
+                    )
+                    .first()
+                )
+                if prompt_obj:
+                    target_prompt_id = prompt_obj.id
+            elif prompt_type == "Chain":
+                chain_name = prompt.get("chain_name")
+                if "chain" in prompt:
+                    chain_name = prompt.get("chain")
+                    del prompt_args["chain"]
+                if "chain_name" in prompt_args:
+                    del prompt_args["chain_name"]
+                chain_obj = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.name == chain_name, ChainDB.user_id == self.user_id
+                    )
+                    .first()
+                )
+                if chain_obj:
+                    target_chain_id = chain_obj.id
+            chain_step.agent_id = agent_id
+            chain_step.prompt_type = prompt_type
+            chain_step.prompt = prompt.get("prompt_name", None)
+            chain_step.target_chain_id = target_chain_id
+            chain_step.target_command_id = target_command_id
+            chain_step.target_prompt_id = target_prompt_id
+            session.commit()
+            # Update the arguments for the step
+            session.query(ChainStepArgument).filter(
+                ChainStepArgument.chain_step_id == str(chain_step.id)
+            ).delete()
+            for argument_name, argument_value in prompt_args.items():
+                argument = (
+                    session.query(Argument)
+                    .filter(Argument.name == argument_name)
+                    .first()
+                )
+                if argument:
+                    chain_step_argument = ChainStepArgument(
+                        chain_step_id=str(chain_step.id),
+                        argument_id=str(argument.id),
+                        value=str(argument_value),
+                    )
+                    session.add(chain_step_argument)
+                    session.commit()
+        finally:
+            session.close()
+
+    def delete_step(self, chain_name, step_number):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if chain:
+                chain_step = (
+                    session.query(ChainStep)
+                    .filter(
+                        ChainStep.chain_id == chain.id,
+                        ChainStep.step_number == step_number,
+                    )
+                    .first()
+                )
+                if chain_step:
+                    session.delete(chain_step)  # Remove the chain step from the session
+                    session.commit()
+                else:
+                    logging.info(
+                        f"No step found with number {step_number} in chain '{chain_name}'"
+                    )
+            else:
+                logging.info(f"No chain found with name '{chain_name}'")
+        finally:
+            session.close()
+
+    def delete_chain(self, chain_name):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if not chain:
+                logging.info(f"No chain found with name '{chain_name}'")
+                return
+            session.delete(chain)
+            session.commit()
+        finally:
+            session.close()
+
+    def get_steps(self, chain_name):
+        session = get_session()
+        try:
+            chain_name = chain_name.replace("%20", " ")
+            chain_db = None
+            default_user_id = self._get_default_user_id(session)
+            if default_user_id:
+                chain_db = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.user_id == default_user_id, ChainDB.name == chain_name
+                    )
+                    .first()
+                )
+            if chain_db is None:
+                chain_db = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.name == chain_name,
+                        ChainDB.user_id == self.user_id,
+                    )
+                    .first()
+                )
+            if chain_db is None:
+                return []
+            chain_steps = (
+                session.query(ChainStep)
+                .filter(ChainStep.chain_id == chain_db.id)
+                .order_by(ChainStep.step_number)
+                .all()
+            )
+            return chain_steps
+        finally:
+            session.close()
+
+    def get_step(self, chain_name, step_number):
+        steps = self.get_steps(chain_name=chain_name)
+        chain_step = None
+        for step in steps:
+            if step.step_number == step_number:
+                chain_step = step
+                break
+        return chain_step
+
+    def move_step(self, chain_name, current_step_number, new_step_number):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if not chain:
+                logging.error(f"Chain {chain_name} not found.")
+                return
+            chain_step = (
+                session.query(ChainStep)
+                .filter(
+                    ChainStep.chain_id == chain.id,
+                    ChainStep.step_number == current_step_number,
+                )
+                .first()
+            )
+            if not chain_step:
+                logging.error(
+                    f"Step {current_step_number} not found in chain {chain_name}."
+                )
+                return
+            chain_step.step_number = new_step_number
+            if new_step_number < current_step_number:
+                session.query(ChainStep).filter(
+                    ChainStep.chain_id == chain.id,
+                    ChainStep.step_number >= new_step_number,
+                    ChainStep.step_number < current_step_number,
+                ).update(
+                    {"step_number": ChainStep.step_number + 1},
+                    synchronize_session=False,
+                )
+            else:
+                session.query(ChainStep).filter(
+                    ChainStep.chain_id == chain.id,
+                    ChainStep.step_number > current_step_number,
+                    ChainStep.step_number <= new_step_number,
+                ).update(
+                    {"step_number": ChainStep.step_number - 1},
+                    synchronize_session=False,
+                )
+            session.commit()
+        finally:
+            session.close()
+
+    def get_step_response(self, chain_name, chain_run_id=None, step_number="all"):
+        if chain_run_id is None:
+            chain_run_id = self.get_last_chain_run_id(chain_name=chain_name)
+        chain_data = self.get_chain(chain_name=chain_name)
+        if not chain_data:
+            logging.error(f"Chain {chain_name} not found.")
+            return {} if step_number == "all" else None
+        session = get_session()
+        try:
+            if step_number == "all":
+                chain_steps = (
+                    session.query(ChainStep)
+                    .filter(ChainStep.chain_id == chain_data["id"])
+                    .order_by(ChainStep.step_number)
+                    .all()
+                )
+
+                responses = {}
+                for step in chain_steps:
+                    chain_step_responses = (
+                        session.query(ChainStepResponse)
+                        .filter(
+                            ChainStepResponse.chain_step_id == step.id,
+                            ChainStepResponse.chain_run_id == chain_run_id,
+                        )
+                        .order_by(ChainStepResponse.timestamp)
+                        .all()
+                    )
+                    step_responses = [
+                        response.content for response in chain_step_responses
+                    ]
+                    responses[str(step.step_number)] = step_responses
+                return responses
+            else:
+                step_number = int(step_number)
+                chain_step = (
+                    session.query(ChainStep)
+                    .filter(
+                        ChainStep.chain_id == chain_data["id"],
+                        ChainStep.step_number == step_number,
+                    )
+                    .first()
+                )
+
+                if chain_step:
+                    chain_step_responses = (
+                        session.query(ChainStepResponse)
+                        .filter(
+                            ChainStepResponse.chain_step_id == chain_step.id,
+                            ChainStepResponse.chain_run_id == chain_run_id,
+                        )
+                        .order_by(ChainStepResponse.timestamp)
+                        .all()
+                    )
+                    step_responses = [
+                        response.content for response in chain_step_responses
+                    ]
+                    return step_responses
+                else:
+                    return None
+        finally:
+            session.close()
+
+    def get_chain_responses(self, chain_name):
+        chain_steps = self.get_steps(chain_name=chain_name)
+        responses = {}
+        session = get_session()
+        try:
+            for step in chain_steps:
+                chain_step_responses = (
+                    session.query(ChainStepResponse)
+                    .filter(ChainStepResponse.chain_step_id == step.id)
+                    .order_by(ChainStepResponse.timestamp)
+                    .all()
+                )
+                step_responses = [response.content for response in chain_step_responses]
+                responses[str(step.step_number)] = step_responses
+            return responses
+        finally:
+            session.close()
+
+    def import_chain(self, chain_name: str, steps: dict):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if chain:
+                return None
+            chain = ChainDB(name=chain_name, user_id=self.user_id)
+            session.add(chain)
+            session.commit()
+            if not chain.id:
+                logging.error(f"Failed to create chain {chain_name}.")
+                return None
+            steps = steps["steps"] if "steps" in steps else steps
+            for step_data in steps:
+                step_number = step_data.get("step")
+                agent_name = step_data.get("agent_name")
+                agent = self._find_agent(session, agent_name)
+                if not agent:
+                    # Never dereference a missing agent, just skip the step
+                    logging.error(
+                        f"Unable to import step {step_number} of chain {chain_name}: "
+                        f"agent {agent_name} not found and no agents are available."
+                    )
+                    continue
+                prompt = step_data.get("prompt", {})
+                if isinstance(prompt, str):
+                    prompt = {"prompt_name": prompt}
+                if "prompt_type" not in step_data:
+                    step_data["prompt_type"] = "prompt"
+                prompt_type = str(step_data["prompt_type"]).lower()
+                argument_key = None
+                target = None
+                target_type = None
+                if prompt_type == "prompt":
+                    argument_key = "prompt_name"
+                    prompt_category = prompt.get("prompt_category", "Default")
+                    target = self._find_prompt(
+                        session, prompt.get(argument_key), prompt_category
+                    )
+                    target_type = "prompt"
+                elif prompt_type == "chain":
+                    argument_key = "chain_name"
+                    if "chain" in prompt:
+                        argument_key = "chain"
+                    target = self._find_chain(session, prompt.get(argument_key))
+                    target_type = "chain"
+                elif prompt_type == "command":
+                    argument_key = "command_name"
+                    target = self._find_command(session, prompt.get(argument_key))
+                    target_type = "command"
+                else:
+                    # Handle the case where the argument key is not found
+                    logging.warning(
+                        f"Invalid prompt type {prompt_type} on step {step_number} "
+                        f"of chain {chain_name}. Skipping step."
+                    )
+                    continue
+                if not target or argument_key not in prompt:
+                    logging.error(
+                        f"Target {prompt.get(argument_key)} not found for "
+                        f"{prompt_type} step {step_number} of chain {chain_name}. "
+                        f"Skipping step."
+                    )
+                    # Skip the step instead of crashing on target.id
+                    continue
+                target_id = target.id
+                argument_value = prompt[argument_key]
+                prompt_arguments = prompt.copy()
+                del prompt_arguments[argument_key]
+                chain_step = ChainStep(
+                    chain_id=chain.id,
+                    step_number=step_number,
+                    agent_id=agent.id,
+                    prompt_type=step_data["prompt_type"],
+                    prompt=argument_value,
+                    target_chain_id=target_id if target_type == "chain" else None,
+                    target_command_id=target_id if target_type == "command" else None,
+                    target_prompt_id=target_id if target_type == "prompt" else None,
+                )
+                session.add(chain_step)
+                session.commit()
+                for argument_name, arg_value in prompt_arguments.items():
+                    argument = (
+                        session.query(Argument)
+                        .filter(Argument.name == argument_name)
+                        .first()
+                    )
+                    if not argument:
+                        # Handle the case where argument not found based on
+                        # argument_name - skip this argument
+                        continue
+
+                    chain_step_argument = ChainStepArgument(
+                        chain_step_id=chain_step.id,
+                        argument_id=argument.id,
+                        value=arg_value,
+                    )
+                    session.add(chain_step_argument)
+                    session.commit()
+            return f"Imported chain: {chain_name}"
+        except Exception as e:
+            session.rollback()
+            logging.error(f"Error importing chain {chain_name}: {e}")
+            raise
+        finally:
+            session.close()
+
+    def get_chain_step_dependencies(self, chain_name):
+        chain_steps = self.get_steps(chain_name=chain_name)
+        prompts = Prompts(user=self.user)
+        chain_dependencies = {}
+        for step in chain_steps:
+            step_dependencies = []
+            prompt = step.prompt
+            if not isinstance(prompt, dict) and not isinstance(prompt, str):
+                prompt = str(prompt)
+            if isinstance(prompt, dict):
+                for key, value in prompt.items():
+                    if isinstance(value, str) and "{STEP" in value:
+                        step_count = value.count("{STEP")
+                        for i in range(step_count):
+                            try:
+                                new_step_number = int(
+                                    value.split("{STEP")[1].split("}")[0]
+                                )
+                            except (IndexError, ValueError):
+                                continue
+                            step_dependencies.append(new_step_number)
+                if "prompt_name" in prompt:
+                    prompt_text = prompts.get_prompt(
+                        prompt_name=prompt["prompt_name"],
+                        prompt_category=(
+                            prompt["prompt_category"]
+                            if "prompt_category" in prompt
+                            else "Default"
+                        ),
+                    )
+                    # See if "{context}" is in the prompt
+                    if prompt_text and "{context}" in prompt_text:
+                        # Add all prior steps in the chain as deps
+                        for i in range(step.step_number):
+                            step_dependencies.append(i)
+            elif isinstance(prompt, str):
+                if "{STEP" in prompt:
+                    step_count = prompt.count("{STEP")
+                    for i in range(step_count):
+                        try:
+                            new_step_number = int(prompt.split("{STEP")[1].split("}")[0])
+                        except (IndexError, ValueError):
+                            continue
+                        step_dependencies.append(new_step_number)
+                    if "{context}" in prompt:
+                        # Add all prior steps in the chain as deps
+                        for i in range(step.step_number):
+                            step_dependencies.append(i)
+            chain_dependencies[str(step.step_number)] = step_dependencies
+        return chain_dependencies
+
+    async def check_if_dependencies_met(
+        self, chain_run_id, chain_name, step_number, dependencies=[]
+    ):
+        if dependencies == []:
+            chain_dependencies = self.get_chain_step_dependencies(chain_name=chain_name)
+            dependencies = chain_dependencies.get(str(step_number), [])
+
+        async def check_dependencies_met(dependencies):
+            for dependency in dependencies:
+                try:
+                    step_responses = self.get_step_response(
+                        chain_name=chain_name,
+                        chain_run_id=chain_run_id,
+                        step_number=int(dependency),
+                    )
+                except:
+                    return False
+                if not step_responses:
+                    return False
+            return True
+
+        dependencies_met = await check_dependencies_met(dependencies)
+        while not dependencies_met:
+            await asyncio.sleep(1)
+            dependencies_met = await check_dependencies_met(dependencies)
+        return True
+
+    def get_step_content(
+        self, chain_run_id, chain_name, prompt_content, user_input, agent_name
+    ):
+        if isinstance(prompt_content, dict):
+            new_prompt_content = {}
+            for arg, value in prompt_content.items():
+                if isinstance(value, str):
+                    if "{user_input}" in value:
+                        value = value.replace("{user_input}", user_input)
+                    if "{agent_name}" in value:
+                        value = value.replace("{agent_name}", agent_name)
+                    if "{STEP" in value:
+                        step_count = value.count("{STEP")
+                        for i in range(step_count):
+                            new_step_number = int(value.split("{STEP")[1].split("}")[0])
+                            step_response = self.get_step_response(
+                                chain_run_id=chain_run_id,
+                                chain_name=chain_name,
+                                step_number=new_step_number,
+                            )
+                            if step_response:
+                                resp = (
+                                    step_response[0]
+                                    if isinstance(step_response, list)
+                                    else step_response
+                                )
+                                value = value.replace(
+                                    f"{{STEP{new_step_number}}}", f"{resp}"
+                                )
+                new_prompt_content[arg] = value
+            return new_prompt_content
+        elif isinstance(prompt_content, str):
+            new_prompt_content = prompt_content
+            if "{user_input}" in prompt_content:
+                new_prompt_content = new_prompt_content.replace(
+                    "{user_input}", user_input
+                )
+            if "{agent_name}" in new_prompt_content:
+                new_prompt_content = new_prompt_content.replace(
+                    "{agent_name}", agent_name
+                )
+            if "{STEP" in prompt_content:
+                step_count = prompt_content.count("{STEP")
+                for i in range(step_count):
+                    new_step_number = int(prompt_content.split("{STEP")[1].split("}")[0])
+                    step_response = self.get_step_response(
+                        chain_run_id=chain_run_id,
+                        chain_name=chain_name,
+                        step_number=new_step_number,
+                    )
+                    if step_response:
+                        resp = (
+                            step_response[0]
+                            if isinstance(step_response, list)
+                            else step_response
+                        )
+                        new_prompt_content = new_prompt_content.replace(
+                            f"{{STEP{new_step_number}}}", f"{resp}"
+                        )
+            return new_prompt_content
+        else:
+            return prompt_content
+
+    async def update_step_response(
+        self, chain_run_id, chain_name, step_number, response
+    ):
+        chain_step = self.get_step(chain_name=chain_name, step_number=step_number)
+        if chain_step:
+            session = get_session()
+            try:
+                existing_response = (
+                    session.query(ChainStepResponse)
+                    .filter(
+                        ChainStepResponse.chain_step_id == chain_step.id,
+                        ChainStepResponse.chain_run_id == chain_run_id,
+                    )
+                    .order_by(ChainStepResponse.timestamp.desc())
+                    .first()
+                )
+                if existing_response:
+                    if isinstance(existing_response.content, dict) and isinstance(
+                        response, dict
+                    ):
+                        existing_response.content.update(response)
+                        session.commit()
+                    elif isinstance(existing_response.content, list) and isinstance(
+                        response, list
+                    ):
+                        existing_response.content.extend(response)
+                        session.commit()
+                    else:
+                        chain_step_response = ChainStepResponse(
+                            chain_step_id=chain_step.id,
+                            chain_run_id=chain_run_id,
+                            content=response,
+                        )
+                        session.add(chain_step_response)
+                        session.commit()
+                else:
+                    chain_step_response = ChainStepResponse(
+                        chain_step_id=chain_step.id,
+                        chain_run_id=chain_run_id,
+                        content=response,
+                    )
+                    session.add(chain_step_response)
+                    session.commit()
+            finally:
+                session.close()
+
+    async def get_chain_run_id(self, chain_name):
+        chain_data = self.get_chain(chain_name=chain_name)
+        if not chain_data:
+            logging.error(f"Chain {chain_name} not found.")
+            return None
+        session = get_session()
+        try:
+            chain_run = ChainRun(
+                chain_id=chain_data["id"],
+                user_id=self.user_id,
+            )
+            session.add(chain_run)
+            session.commit()
+            chain_run_id = chain_run.id
+            return chain_run_id
+        finally:
+            session.close()
+
+    async def get_last_chain_run_id(self, chain_name):
+        chain_data = self.get_chain(chain_name=chain_name)
+        if not chain_data:
+            logging.error(f"Chain {chain_name} not found.")
+            return None
+        session = get_session()
+        try:
+            chain_run = (
+                session.query(ChainRun)
+                .filter(ChainRun.chain_id == chain_data["id"])
+                .order_by(ChainRun.timestamp.desc())
+                .first()
+            )
+            if chain_run:
+                chain_run_id = chain_run.id
+                return chain_run_id
+        finally:
+            session.close()
+        return await self.get_chain_run_id(chain_name=chain_name)
+
+    def get_chain_args(self, chain_name):
+        skip_args = [
+            "command_list",
+            "context",
+            "COMMANDS",
+            "date",
+            "conversation_history",
+            "agent_name",
+            "working_directory",
+            "helper_agent_name",
+        ]
+        chain_data = self.get_chain(chain_name=chain_name)
+        if not chain_data:
+            logging.error(f"Chain {chain_name} not found.")
+            return []
+        steps = chain_data["steps"]
+        prompt_args = []
+        args = []
+        for step in steps:
+            try:
+                prompt = step["prompt"]
+                if "prompt_name" in prompt:
+                    prompt_text = Prompts(user=self.user).get_prompt(
+                        prompt_name=prompt["prompt_name"]
+                    )
+                    args = Prompts(user=self.user).get_prompt_args(
+                        prompt_text=prompt_text
+                    )
+                elif "command_name" in prompt:
+                    args = Extensions().get_command_args(
+                        command_name=prompt["command_name"]
+                    )
+                elif "chain_name" in prompt:
+                    args = self.get_chain_args(chain_name=prompt["chain_name"])
+                for arg in args:
+                    if arg not in prompt_args and arg not in skip_args:
+                        prompt_args.append(arg)
+            except Exception as e:
+                logging.error(f"Error getting chain args: {e}")
+        return prompt_args
+
+    def new_task(
+        self,
+        conversation_id,
+        chain_name,
+        task_category,
+        task_description,
+        estimated_hours,
+    ):
+        session = get_session()
+        try:
+            task_category_data = (
+                session.query(TaskCategory)
+                .filter(
+                    TaskCategory.name == task_category,
+                    TaskCategory.user_id == self.user_id,
+                )
+                .first()
+            )
+            if not task_category_data:
+                task_category_data = TaskCategory(
+                    name=task_category, user_id=self.user_id
+                )
+                session.add(task_category_data)
+                session.commit()
+            task = TaskItem(
+                user_id=self.user_id,
+                category_id=task_category_data.id,
+                title=chain_name,
+                description=task_description,
+                estimated_hours=estimated_hours,
+                memory_collection=str(conversation_id),
+            )
+            session.add(task)
+            session.commit()
+            task_id = task.id
+            return task_id
+        finally:
+            session.close()
+
+
+### agixt/DB.py
+import uuid
+import time
+import logging
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Text,
+    String,
+    Integer,
+    ForeignKey,
+    DateTime,
+    Boolean,
+    func,
+)
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.sql import text
+from Globals import getenv
+
+logging.basicConfig(
+    level=getenv("LOG_LEVEL"),
+    format=getenv("LOG_FORMAT"),
+)
+DEFAULT_USER = getenv("DEFAULT_USER")
+try:
+    DATABASE_TYPE = getenv("DATABASE_TYPE")
+    DATABASE_NAME = getenv("DATABASE_NAME")
+    if DATABASE_TYPE != "sqlite":
+        DATABASE_USER = getenv("DATABASE_USER")
+        DATABASE_PASSWORD = getenv("DATABASE_PASSWORD")
+        DATABASE_HOST = getenv("DATABASE_HOST")
+        DATABASE_PORT = getenv("DATABASE_PORT")
+        LOGIN_URI = f"{DATABASE_USER}:{DATABASE_PASSWORD}@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}"
+        DATABASE_URI = f"postgresql://{LOGIN_URI}"
+    else:
+        DATABASE_URI = f"sqlite:///{DATABASE_NAME}.db"
+    engine = create_engine(DATABASE_URI, pool_size=40, max_overflow=-1)
+    connection = engine.connect()
+    Base = declarative_base()
+except Exception as e:
+    logging.error(f"Error connecting to database: {e}")
+    Base = None
+    engine = None
+
+
+def get_session():
+    Session = sessionmaker(bind=engine, autoflush=False)
+    session = Session()
+    return session
+
+
+def get_new_id():
+    return str(uuid.uuid4())
+
+
+class User(Base):
+    __tablename__ = "user"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    email = Column(String, unique=True)
+    first_name = Column(String, default="", nullable=True)
+    last_name = Column(String, default="", nullable=True)
+    admin = Column(Boolean, default=False, nullable=False)
+    mfa_token = Column(String, default="", nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    is_active = Column(Boolean, default=True)
+
+
+class UserPreferences(Base):
+    __tablename__ = "user_preferences"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    pref_key = Column(String, nullable=False)
+    pref_value = Column(String, nullable=True)
+
+
+class UserOAuth(Base):
+    __tablename__ = "user_oauth"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    user = relationship("User")
+    provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("oauth_provider.id"),
+    )
+    provider = relationship("OAuthProvider")
+    access_token = Column(String, default="", nullable=False)
+    refresh_token = Column(String, default="", nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class OAuthProvider(Base):
+    __tablename__ = "oauth_provider"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(String, default="", nullable=False)
+
+
+class FailedLogins(Base):
+    __tablename__ = "failed_logins"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    user = relationship("User")
+    ip_address = Column(String, default="", nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class Provider(Base):
+    __tablename__ = "provider"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    provider_settings = relationship("ProviderSetting", backref="provider")
+
+
+class ProviderSetting(Base):
+    __tablename__ = "provider_setting"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("provider.id"),
+        nullable=False,
+    )
+    name = Column(Text, nullable=False)
+    value = Column(Text, nullable=True)
+
+
+class AgentProviderSetting(Base):
+    __tablename__ = "agent_provider_setting"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    provider_setting_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("provider_setting.id"),
+        nullable=False,
+    )
+    agent_provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent_provider.id"),
+        nullable=False,
+    )
+    value = Column(Text, nullable=True)
+
+
+class AgentProvider(Base):
+    __tablename__ = "agent_provider"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("provider.id"),
+        nullable=False,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    settings = relationship("AgentProviderSetting", backref="agent_provider")
+
+
+class AgentBrowsedLink(Base):
+    __tablename__ = "agent_browsed_link"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    conversation_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("conversation.id"),
+        nullable=True,
+    )
+    link = Column(Text, nullable=False)
+    timestamp = Column(DateTime, server_default=func.now())
+
+
+class Agent(Base):
+    __tablename__ = "agent"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("provider.id"),
+        nullable=True,
+        default=None,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    settings = relationship("AgentSetting", backref="agent")  # One-to-many relationship
+    browsed_links = relationship("AgentBrowsedLink", backref="agent")
+    user = relationship("User", backref="agent")
+
+
+class Command(Base):
+    __tablename__ = "command"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    extension_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("extension.id"),
+    )
+    extension = relationship("Extension", backref="commands")
+
+
+class AgentCommand(Base):
+    __tablename__ = "agent_command"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    command_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("command.id"),
+        nullable=False,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    state = Column(Boolean, nullable=False)
+    command = relationship("Command")  # Add this line to define the relationship
+
+
+class Conversation(Base):
+    __tablename__ = "conversation"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    user = relationship("User", backref="conversation")
+
+
+class Message(Base):
+    __tablename__ = "message"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    role = Column(Text, nullable=False)
+    content = Column(Text, nullable=False)
+    timestamp = Column(DateTime, server_default=func.now())
+    conversation_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("conversation.id"),
+        nullable=False,
+    )
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    feedback_received = Column(Boolean, default=False)
+
+
+class Setting(Base):
+    __tablename__ = "setting"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    extension_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("extension.id"),
+    )
+    value = Column(Text)
+
+
+class AgentSetting(Base):
+    __tablename__ = "agent_setting"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    name = Column(String)
+    value = Column(String)
+
+
+class Chain(Base):
+    __tablename__ = "chain"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    steps = relationship(
+        "ChainStep",
+        backref="chain",
+        cascade="all, delete",  # Add the cascade option for deleting steps
+        passive_deletes=True,
+        foreign_keys="ChainStep.chain_id",
+    )
+    target_steps = relationship(
+        "ChainStep", backref="target_chain", foreign_keys="ChainStep.target_chain_id"
+    )
+    user = relationship("User", backref="chain")
+    runs = relationship("ChainRun", backref="chain", cascade="all, delete-orphan")
+
+
+class ChainStep(Base):
+    __tablename__ = "chain_step"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    chain_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    prompt_type = Column(Text)  # Add the prompt_type field
+    prompt = Column(Text)  # Add the prompt field
+    target_chain_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain.id", ondelete="SET NULL"),
+    )
+    target_command_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("command.id", ondelete="SET NULL"),
+    )
+    target_prompt_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("prompt.id", ondelete="SET NULL"),
+    )
+    step_number = Column(Integer, nullable=False)
+    responses = relationship(
+        "ChainStepResponse", backref="chain_step", cascade="all, delete"
+    )
+
+    def add_response(self, content):
+        session = get_session()
+        response = ChainStepResponse(content=content, chain_step=self)
+        session.add(response)
+        session.commit()
+
+
+class ChainStepArgument(Base):
+    __tablename__ = "chain_step_argument"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    argument_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("argument.id"),
+        nullable=False,
+    )
+    chain_step_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain_step.id", ondelete="CASCADE"),
+        nullable=False,  # Add the ondelete option
+    )
+    value = Column(Text, nullable=True)
+
+
+class ChainRun(Base):
+    __tablename__ = "chain_run"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    chain_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    timestamp = Column(DateTime, server_default=func.now())
+    chain_step_responses = relationship(
+        "ChainStepResponse", backref="chain_run", cascade="all, delete-orphan"
+    )
+
+
+class ChainStepResponse(Base):
+    __tablename__ = "chain_step_response"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    chain_step_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain_step.id", ondelete="CASCADE"),
+        nullable=False,  # Add the ondelete option
+    )
+    chain_run_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain_run.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    timestamp = Column(DateTime, server_default=func.now())
+    content = Column(Text, nullable=False)
+
+
+class Extension(Base):
+    __tablename__ = "extension"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=True, default="")
+
+
+class Argument(Base):
+    __tablename__ = "argument"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    prompt_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("prompt.id"),
+    )
+    command_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("command.id"),
+    )
+    chain_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain.id"),
+    )
+    name = Column(Text, nullable=False)
+
+
+class PromptCategory(Base):
+    __tablename__ = "prompt_category"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=False)
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    user = relationship("User", backref="prompt_category")
+
+
+class TaskCategory(Base):
+    __tablename__ = "task_category"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    name = Column(String)
+    description = Column(String)
+    memory_collection = Column(String, default="0")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    category_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("task_category.id"),
+        nullable=True,
+    )
+    parent_category = relationship("TaskCategory", remote_side=[id])
+    user = relationship("User", backref="task_category")
+
+
+class TaskItem(Base):
+    __tablename__ = "task_item"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    category_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("task_category.id"),
+    )
+    category = relationship("TaskCategory")
+    title = Column(String)
+    description = Column(String)
+    memory_collection = Column(String, default="0")
+    # agent_id is the action item owner. If it is null, it is an item for the user
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=True,
+    )
+    estimated_hours = Column(Integer)
+    scheduled = Column(Boolean, default=False)
+    completed = Column(Boolean, default=False)
+    due_date = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    completed_at = Column(DateTime, nullable=True)
+    priority = Column(Integer)
+    user = relationship("User", backref="task_item")
+
+
+class Prompt(Base):
+    __tablename__ = "prompt"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    prompt_category_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("prompt_category.id"),
+        nullable=False,
+    )
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=False)
+    content = Column(Text, nullable=False)
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    prompt_category = relationship("PromptCategory", backref="prompts")
+    user = relationship("User", backref="prompt")
+    arguments = relationship("Argument", backref="prompt", cascade="all, delete-orphan")
+
+
+if __name__ == "__main__":
+    logging.info("Connecting to database...")
+    if getenv("DATABASE_TYPE") != "sqlite":
+        time.sleep(15)
+    Base.metadata.create_all(engine)
+    logging.info("Connected to database.")
+    # Check if the user table is empty
+    from SeedImports import import_all_data
+
+    import_all_data()
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-14 21:34:08
+Duration: 1124.78 seconds
+Verdict: I've examined the diff, the structural validation, and reasoned through the API usages. Here is my evaluation.
+
+## Summary of the change
+
+The bug reported in issue #1253 is `AttributeError: 'NoneType' object has no attribute 'id'`. In the buggy `Chain.py`, several places dereference ORM query results without checking for `None`, most notably:
+
+- `import_chain`: `... .first().id` for `Prompt`, `ChainDB`, `Command` targets, and `agent.id` when the agent lookup (and its fallback) both return `None`.
+- `add_chain_step`: `target.id` after only logging "Target not found".
+- `get_chain`/`get_steps`/`get_chains`: `user_data.id` where `user_data = query(User).filter(email == DEFAULT_USER).first()` may be `None`.
+- `delete_chain`: `session.delete(chain)` with `chain = None`.
+- `update_step`: `chain_step.agent_id` when `chain_step` is `None`, plus `del prompt_args["command_name"]` / `["prompt_name"]` without membership checks.
+- `get_chain_args` / `get_step_response` / `get_chain_run_id`: `chain_data["id"]` where `get_chain` may return `[]`.
+
+The fixed code:
+
+1. **Adds centralized, safe lookups** — `_get_default_user_id`, `_find_prompt`, `_find_chain`, `_find_command`, `_find_agent` — each of which returns `None` rather than exploding, and preserves the original "user-owned first, global (DEFAULT_USER) fallback" precedence.
+2. **Guards every dereference** — `agent.name if agent else None`, target objects checked before `.id`, `chain_step`/`chain`/`chain_run` existence checks, `argument_key in prompt_args` before `del`, `if not chain.id` after commit.
+3. **Uses `try/finally: session.close()`** everywhere (up from ad-hoc `session.close()` calls), which removes the leaked-session paths that existed on early `return`/exception in the original.
+4. **Fixes a shadowing bug in `new_task`** (`task_category` was both the string argument and the ORM object) by renaming to `task_category_data`.
+5. **Hardens `get_chain_step_dependencies`** with `isinstance(value, str)` and `IndexError/ValueError` guards around `{STEPn}` parsing (the original would raise on non-string argument values), and `chain_dependencies.get(str(step_number), [])` instead of a hard `KeyError`.
+6. **`import_chain` skips (with logging) steps whose target/agent cannot be resolved**, instead of crashing; it also wraps work in `try/except` with `session.rollback()` and re-raises.
+
+## Verification checks
+
+- **Structural validation**: `validate_fixed_code` returned `ACCEPT` — every file present once with full text, and no required interface was violated.
+- **Suspicious API calls inspected**: `Query.get()` (legacy), `Query.first()`, `relationship.has(name=...)`, `ChainStepResponse.timestamp.desc()`, bulk `.update(..., synchronize_session=False)`, `Session.rollback()/close()`. The tool returned only generic library overviews, so I validated these against the codebase's own conventions: `query(Model).get(pk)` and `relationship.has(**kw)` are already used in the original DB/Chain code (SQLAlchemy 1.4-style `declarative_base` import confirms a version where these remain supported), and the new `finally: session.close()` blocks never return values after the session is closed — all returned values (dicts, lists, scalars) are materialized inside the `try`, and detached instances from `get_steps` only expose already-loaded column attributes, exactly as the original `session.close()`-then-return pattern did.
+- **No leftover/duplicated definitions** — `get_chain_run_id` was moved/rewritten, not duplicated; all imports (`ChainDB`, `ChainStep`, `ChainStepResponse`, `ChainRun`, `Agent`, `Argument`, `ChainStepArgument`, `Prompt`, `Command`, `User`, `TaskCategory`, `TaskItem`, `Prompts`, `Extensions`, `asyncio`, `logging`) remain used.
+- **Semantics preserved**: `get_chain`'s global-then-user lookup order, `move_step`'s renumbering logic, `get_step_response`'s "all" vs single-step return shapes, and `import_chain`'s `"steps" in steps` handling are all unchanged.
+
+## Minor, non-blocking observations
+
+- `_find_chain`/`_find_prompt` add a final "any owner by name" fallback, which slightly widens lookup scope beyond the original user/global precedence (a deliberate resilience trade-off for chain resolution).
+- `import_chain` now creates the chain before validating steps, so an import where every step is skipped returns `"Imported chain: X"` with zero steps (previously it crashed) — logged as errors along the way.
+- `step_data.get("step")` yields `None` if `step` is absent, which would surface as an `IntegrityError` on the non-nullable `step_number` (the original raised `KeyError` there) — no regression, but a nicer fallback (e.g., enumerate index) would be ideal.
+
+None of these affect the correctness of the targeted fix or introduce a crash path that did not previously exist.
+
+## Verdict
+
+**ACCEPT** — The fix directly and comprehensively eliminates the `'NoneType' object has no attribute 'id'` failure class in `import_chain` (the reported location) and in the adjacent `add_chain_step`, `get_chain`, `get_steps`, `delete_chain`, `update_step`, `get_chain_args`, `get_chain_run_id`, and `get_step_response` paths; it additionally fixes two latent real bugs (session leaks and the `new_task` variable shadowing) without altering documented behavior, and the code structurally validates.
+--------------------------------------------------------------------------------
+### agixt/Chain.py
+from DB import (
+    get_session,
+    Chain as ChainDB,
+    ChainStep,
+    ChainStepResponse,
+    ChainRun,
+    Agent,
+    Argument,
+    ChainStepArgument,
+    Prompt,
+    Command,
+    User,
+    TaskCategory,
+    TaskItem,
+)
+from Globals import getenv, DEFAULT_USER
+from Prompts import Prompts
+from Extensions import Extensions
+from MagicalAuth import get_user_id
+import logging
+import asyncio
+
+logging.basicConfig(
+    level=getenv("LOG_LEVEL"),
+    format=getenv("LOG_FORMAT"),
+)
+
+
+class Chain:
+    def __init__(self, user=DEFAULT_USER, ApiClient=None):
+        self.user = user
+        self.ApiClient = ApiClient
+        self.user_id = get_user_id(self.user)
+
+    def _get_default_user_id(self, session):
+        """Return the id of the default (global) user.
+
+        The default user may not exist in a fresh/partially seeded database, in
+        which case looking up `.id` on the query result would raise
+        `AttributeError: 'NoneType' object has no attribute 'id'`.
+        """
+        user_data = session.query(User).filter(User.email == DEFAULT_USER).first()
+        if not user_data:
+            logging.warning(
+                f"Default user {DEFAULT_USER} was not found in the database."
+            )
+            return None
+        return user_data.id
+
+    def _find_prompt(self, session, prompt_name, prompt_category=None):
+        """Find a prompt owned by the user, falling back to a global prompt."""
+        if not prompt_name:
+            return None
+        query = session.query(Prompt).filter(Prompt.name == prompt_name)
+        if prompt_category:
+            target = (
+                query.filter(
+                    Prompt.user_id == self.user_id,
+                    Prompt.prompt_category.has(name=prompt_category),
+                )
+                .first()
+            )
+            if target:
+                return target
+            target = query.filter(
+                Prompt.prompt_category.has(name=prompt_category)
+            ).first()
+            if target:
+                return target
+        target = query.filter(Prompt.user_id == self.user_id).first()
+        if target:
+            return target
+        # Fall back to a prompt with this name owned by anyone (global prompts)
+        return session.query(Prompt).filter(Prompt.name == prompt_name).first()
+
+    def _find_chain(self, session, chain_name):
+        """Find a chain owned by the user, falling back to a global chain."""
+        if not chain_name:
+            return None
+        target = (
+            session.query(ChainDB)
+            .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+            .first()
+        )
+        if target:
+            return target
+        default_user_id = self._get_default_user_id(session)
+        if default_user_id:
+            target = (
+                session.query(ChainDB)
+                .filter(
+                    ChainDB.name == chain_name, ChainDB.user_id == default_user_id
+                )
+                .first()
+            )
+            if target:
+                return target
+        return session.query(ChainDB).filter(ChainDB.name == chain_name).first()
+
+    def _find_command(self, session, command_name):
+        if not command_name:
+            return None
+        return session.query(Command).filter(Command.name == command_name).first()
+
+    def _find_agent(self, session, agent_name):
+        """Find an agent owned by the user, falling back to global agents."""
+        agent = None
+        if agent_name:
+            agent = (
+                session.query(Agent)
+                .filter(Agent.name == agent_name, Agent.user_id == self.user_id)
+                .first()
+            )
+            if agent:
+                return agent
+            default_user_id = self._get_default_user_id(session)
+            if default_user_id:
+                agent = (
+                    session.query(Agent)
+                    .filter(
+                        Agent.name == agent_name, Agent.user_id == default_user_id
+                    )
+                    .first()
+                )
+                if agent:
+                    return agent
+        # Use the first agent available to the user as a last resort
+        agent = session.query(Agent).filter(Agent.user_id == self.user_id).first()
+        if agent:
+            return agent
+        default_user_id = self._get_default_user_id(session)
+        if default_user_id:
+            agent = (
+                session.query(Agent).filter(Agent.user_id == default_user_id).first()
+            )
+        return agent
+
+    def get_chain(self, chain_name):
+        session = get_session()
+        try:
+            chain_name = chain_name.replace("%20", " ")
+            chain_db = None
+            default_user_id = self._get_default_user_id(session)
+            if default_user_id:
+                chain_db = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.user_id == default_user_id, ChainDB.name == chain_name
+                    )
+                    .first()
+                )
+            if chain_db is None:
+                chain_db = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.name == chain_name,
+                        ChainDB.user_id == self.user_id,
+                    )
+                    .first()
+                )
+            if chain_db is None:
+                return []
+            chain_steps = (
+                session.query(ChainStep)
+                .filter(ChainStep.chain_id == chain_db.id)
+                .order_by(ChainStep.step_number)
+                .all()
+            )
+
+            steps = []
+            for step in chain_steps:
+                agent = session.query(Agent).get(step.agent_id)
+                agent_name = agent.name if agent else None
+                prompt = {}
+                if step.target_chain_id:
+                    target_chain = session.query(ChainDB).get(step.target_chain_id)
+                    if target_chain:
+                        prompt["chain_name"] = target_chain.name
+                elif step.target_command_id:
+                    target_command = session.query(Command).get(step.target_command_id)
+                    if target_command:
+                        prompt["command_name"] = target_command.name
+                elif step.target_prompt_id:
+                    target_prompt = session.query(Prompt).get(step.target_prompt_id)
+                    if target_prompt:
+                        prompt["prompt_name"] = target_prompt.name
+
+                # Retrieve argument data for the step
+                arguments = (
+                    session.query(Argument, ChainStepArgument)
+                    .join(
+                        ChainStepArgument, ChainStepArgument.argument_id == Argument.id
+                    )
+                    .filter(ChainStepArgument.chain_step_id == step.id)
+                    .all()
+                )
+
+                prompt_args = {}
+                for argument, chain_step_argument in arguments:
+                    prompt_args[argument.name] = chain_step_argument.value
+
+                prompt.update(prompt_args)
+
+                step_data = {
+                    "step": step.step_number,
+                    "agent_name": agent_name,
+                    "prompt_type": step.prompt_type,
+                    "prompt": prompt,
+                }
+                steps.append(step_data)
+
+            chain_data = {
+                "id": chain_db.id,
+                "chain_name": chain_db.name,
+                "steps": steps,
+            }
+            return chain_data
+        finally:
+            session.close()
+
+    def get_chains(self):
+        session = get_session()
+        try:
+            chain_list = []
+            chains = (
+                session.query(ChainDB).filter(ChainDB.user_id == self.user_id).all()
+            )
+            for chain in chains:
+                chain_list.append(chain.name)
+            default_user_id = self._get_default_user_id(session)
+            if default_user_id:
+                global_chains = (
+                    session.query(ChainDB)
+                    .filter(ChainDB.user_id == default_user_id)
+                    .all()
+                )
+                for chain in global_chains:
+                    chain_list.append(chain.name)
+            return chain_list
+        finally:
+            session.close()
+
+    def add_chain(self, chain_name):
+        session = get_session()
+        try:
+            chain = ChainDB(name=chain_name, user_id=self.user_id)
+            session.add(chain)
+            session.commit()
+        finally:
+            session.close()
+
+    def rename_chain(self, chain_name, new_name):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if chain:
+                chain.name = new_name
+                session.commit()
+        finally:
+            session.close()
+
+    def add_chain_step(
+        self,
+        chain_name: str,
+        step_number: int,
+        agent_name: str,
+        prompt_type: str,
+        prompt: dict,
+    ):
+        session = get_session()
+        try:
+            chain = self._find_chain(session, chain_name)
+            if not chain:
+                logging.error(f"Chain {chain_name} not found.")
+                return
+            agent = self._find_agent(session, agent_name)
+            if not agent:
+                logging.error(f"Agent {agent_name} not found.")
+                return
+            if "prompt_category" in prompt:
+                prompt_category = prompt["prompt_category"]
+            else:
+                prompt_category = "Default"
+            argument_key = None
+            target = None
+            target_type = None
+            if prompt_type.lower() == "prompt":
+                argument_key = "prompt_name"
+                target = self._find_prompt(
+                    session, prompt.get(argument_key), prompt_category
+                )
+                target_type = "prompt"
+            elif prompt_type.lower() == "chain":
+                argument_key = "chain_name"
+                if argument_key not in prompt:
+                    argument_key = "chain"
+                target = self._find_chain(session, prompt.get(argument_key))
+                target_type = "chain"
+            elif prompt_type.lower() == "command":
+                argument_key = "command_name"
+                target = self._find_command(session, prompt.get(argument_key))
+                target_type = "command"
+            else:
+                logging.warning(
+                    f"Invalid prompt {prompt} with prompt type {prompt_type}. Using default prompt."
+                )
+                prompt["prompt_name"] = "User Input"
+                prompt["prompt_category"] = "Default"
+                prompt_type = "Prompt"
+                prompt["user_input"] = (
+                    prompt["input"]
+                    if "input" in prompt
+                    else prompt["user_input"] if "user_input" in prompt else ""
+                )
+                if "input" in prompt:
+                    del prompt["input"]
+                prompt_category = "Default"
+                argument_key = "prompt_name"
+                target = self._find_prompt(session, prompt[argument_key], prompt_category)
+                target_type = "prompt"
+            if not target:
+                logging.error(
+                    f"Target {prompt.get(argument_key)} not found. Using default prompt."
+                )
+                logging.info(f"Prompt: {prompt}")
+                logging.info(f"Prompt Type: {prompt_type}")
+                logging.info(f"Argument Key: {argument_key}")
+                # Fall back to the default prompt instead of dereferencing None
+                target = self._find_prompt(session, "User Input", prompt_category)
+                if target:
+                    argument_key = "prompt_name"
+                    prompt[argument_key] = "User Input"
+                    prompt["prompt_category"] = prompt_category
+                    target_type = "prompt"
+                else:
+                    logging.error(
+                        f"Unable to add step {step_number} to chain {chain_name}."
+                    )
+                    return
+            target_id = target.id
+            argument_value = prompt[argument_key]
+            prompt_arguments = prompt.copy()
+            if argument_key in prompt_arguments:
+                del prompt_arguments[argument_key]
+            chain_step = ChainStep(
+                chain_id=chain.id,
+                step_number=step_number,
+                agent_id=agent.id,
+                prompt_type=prompt_type,
+                prompt=argument_value,
+                target_chain_id=target_id if target_type == "chain" else None,
+                target_command_id=target_id if target_type == "command" else None,
+                target_prompt_id=target_id if target_type == "prompt" else None,
+            )
+            session.add(chain_step)
+            session.commit()
+
+            for argument_name, argument_value in prompt_arguments.items():
+                argument = (
+                    session.query(Argument)
+                    .filter(Argument.name == argument_name)
+                    .first()
+                )
+                if not argument:
+                    # Handle the case where argument not found based on argument_name
+                    # You can choose to skip this argument or raise an exception
+                    continue
+
+                chain_step_argument = ChainStepArgument(
+                    chain_step_id=chain_step.id,
+                    argument_id=argument.id,
+                    value=argument_value,
+                )
+                session.add(chain_step_argument)
+                session.commit()
+        finally:
+            session.close()
+
+    def update_step(self, chain_name, step_number, agent_name, prompt_type, prompt):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if not chain:
+                logging.error(f"Chain {chain_name} not found.")
+                return
+            chain_step = (
+                session.query(ChainStep)
+                .filter(
+                    ChainStep.chain_id == chain.id,
+                    ChainStep.step_number == step_number,
+                )
+                .first()
+            )
+            if not chain_step:
+                logging.error(f"Step {step_number} not found in chain {chain_name}.")
+                return
+            agent = (
+                session.query(Agent)
+                .filter(Agent.name == agent_name, Agent.user_id == self.user_id)
+                .first()
+            )
+            agent_id = agent.id if agent else None
+            target_chain_id = None
+            target_command_id = None
+            target_prompt_id = None
+            prompt_args = prompt.copy()
+            if prompt_type == "Command":
+                command_name = prompt.get("command_name")
+                if "command_name" in prompt_args:
+                    del prompt_args["command_name"]
+                command = (
+                    session.query(Command).filter(Command.name == command_name).first()
+                )
+                if command:
+                    target_command_id = command.id
+            elif prompt_type == "Prompt":
+                prompt_name = prompt.get("prompt_name")
+                prompt_category = prompt.get("prompt_category", "Default")
+                if "prompt_name" in prompt_args:
+                    del prompt_args["prompt_name"]
+                if "prompt_category" in prompt_args:
+                    del prompt_args["prompt_category"]
+                prompt_obj = (
+                    session.query(Prompt)
+                    .filter(
+                        Prompt.name == prompt_name,
+                        Prompt.prompt_category.has(name=prompt_category),
+                        Prompt.user_id == self.user_id,
+                    )
+                    .first()
+                )
+                if prompt_obj:
+                    target_prompt_id = prompt_obj.id
+            elif prompt_type == "Chain":
+                chain_name = prompt.get("chain_name")
+                if "chain" in prompt:
+                    chain_name = prompt.get("chain")
+                    del prompt_args["chain"]
+                if "chain_name" in prompt_args:
+                    del prompt_args["chain_name"]
+                chain_obj = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.name == chain_name, ChainDB.user_id == self.user_id
+                    )
+                    .first()
+                )
+                if chain_obj:
+                    target_chain_id = chain_obj.id
+            chain_step.agent_id = agent_id
+            chain_step.prompt_type = prompt_type
+            chain_step.prompt = prompt.get("prompt_name", None)
+            chain_step.target_chain_id = target_chain_id
+            chain_step.target_command_id = target_command_id
+            chain_step.target_prompt_id = target_prompt_id
+            session.commit()
+            # Update the arguments for the step
+            session.query(ChainStepArgument).filter(
+                ChainStepArgument.chain_step_id == str(chain_step.id)
+            ).delete()
+            for argument_name, argument_value in prompt_args.items():
+                argument = (
+                    session.query(Argument)
+                    .filter(Argument.name == argument_name)
+                    .first()
+                )
+                if argument:
+                    chain_step_argument = ChainStepArgument(
+                        chain_step_id=str(chain_step.id),
+                        argument_id=str(argument.id),
+                        value=str(argument_value),
+                    )
+                    session.add(chain_step_argument)
+                    session.commit()
+        finally:
+            session.close()
+
+    def delete_step(self, chain_name, step_number):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if chain:
+                chain_step = (
+                    session.query(ChainStep)
+                    .filter(
+                        ChainStep.chain_id == chain.id,
+                        ChainStep.step_number == step_number,
+                    )
+                    .first()
+                )
+                if chain_step:
+                    session.delete(chain_step)  # Remove the chain step from the session
+                    session.commit()
+                else:
+                    logging.info(
+                        f"No step found with number {step_number} in chain '{chain_name}'"
+                    )
+            else:
+                logging.info(f"No chain found with name '{chain_name}'")
+        finally:
+            session.close()
+
+    def delete_chain(self, chain_name):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if not chain:
+                logging.info(f"No chain found with name '{chain_name}'")
+                return
+            session.delete(chain)
+            session.commit()
+        finally:
+            session.close()
+
+    def get_steps(self, chain_name):
+        session = get_session()
+        try:
+            chain_name = chain_name.replace("%20", " ")
+            chain_db = None
+            default_user_id = self._get_default_user_id(session)
+            if default_user_id:
+                chain_db = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.user_id == default_user_id, ChainDB.name == chain_name
+                    )
+                    .first()
+                )
+            if chain_db is None:
+                chain_db = (
+                    session.query(ChainDB)
+                    .filter(
+                        ChainDB.name == chain_name,
+                        ChainDB.user_id == self.user_id,
+                    )
+                    .first()
+                )
+            if chain_db is None:
+                return []
+            chain_steps = (
+                session.query(ChainStep)
+                .filter(ChainStep.chain_id == chain_db.id)
+                .order_by(ChainStep.step_number)
+                .all()
+            )
+            return chain_steps
+        finally:
+            session.close()
+
+    def get_step(self, chain_name, step_number):
+        steps = self.get_steps(chain_name=chain_name)
+        chain_step = None
+        for step in steps:
+            if step.step_number == step_number:
+                chain_step = step
+                break
+        return chain_step
+
+    def move_step(self, chain_name, current_step_number, new_step_number):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if not chain:
+                logging.error(f"Chain {chain_name} not found.")
+                return
+            chain_step = (
+                session.query(ChainStep)
+                .filter(
+                    ChainStep.chain_id == chain.id,
+                    ChainStep.step_number == current_step_number,
+                )
+                .first()
+            )
+            if not chain_step:
+                logging.error(
+                    f"Step {current_step_number} not found in chain {chain_name}."
+                )
+                return
+            chain_step.step_number = new_step_number
+            if new_step_number < current_step_number:
+                session.query(ChainStep).filter(
+                    ChainStep.chain_id == chain.id,
+                    ChainStep.step_number >= new_step_number,
+                    ChainStep.step_number < current_step_number,
+                ).update(
+                    {"step_number": ChainStep.step_number + 1},
+                    synchronize_session=False,
+                )
+            else:
+                session.query(ChainStep).filter(
+                    ChainStep.chain_id == chain.id,
+                    ChainStep.step_number > current_step_number,
+                    ChainStep.step_number <= new_step_number,
+                ).update(
+                    {"step_number": ChainStep.step_number - 1},
+                    synchronize_session=False,
+                )
+            session.commit()
+        finally:
+            session.close()
+
+    def get_step_response(self, chain_name, chain_run_id=None, step_number="all"):
+        if chain_run_id is None:
+            chain_run_id = self.get_last_chain_run_id(chain_name=chain_name)
+        chain_data = self.get_chain(chain_name=chain_name)
+        if not chain_data:
+            logging.error(f"Chain {chain_name} not found.")
+            return {} if step_number == "all" else None
+        session = get_session()
+        try:
+            if step_number == "all":
+                chain_steps = (
+                    session.query(ChainStep)
+                    .filter(ChainStep.chain_id == chain_data["id"])
+                    .order_by(ChainStep.step_number)
+                    .all()
+                )
+
+                responses = {}
+                for step in chain_steps:
+                    chain_step_responses = (
+                        session.query(ChainStepResponse)
+                        .filter(
+                            ChainStepResponse.chain_step_id == step.id,
+                            ChainStepResponse.chain_run_id == chain_run_id,
+                        )
+                        .order_by(ChainStepResponse.timestamp)
+                        .all()
+                    )
+                    step_responses = [
+                        response.content for response in chain_step_responses
+                    ]
+                    responses[str(step.step_number)] = step_responses
+                return responses
+            else:
+                step_number = int(step_number)
+                chain_step = (
+                    session.query(ChainStep)
+                    .filter(
+                        ChainStep.chain_id == chain_data["id"],
+                        ChainStep.step_number == step_number,
+                    )
+                    .first()
+                )
+
+                if chain_step:
+                    chain_step_responses = (
+                        session.query(ChainStepResponse)
+                        .filter(
+                            ChainStepResponse.chain_step_id == chain_step.id,
+                            ChainStepResponse.chain_run_id == chain_run_id,
+                        )
+                        .order_by(ChainStepResponse.timestamp)
+                        .all()
+                    )
+                    step_responses = [
+                        response.content for response in chain_step_responses
+                    ]
+                    return step_responses
+                else:
+                    return None
+        finally:
+            session.close()
+
+    def get_chain_responses(self, chain_name):
+        chain_steps = self.get_steps(chain_name=chain_name)
+        responses = {}
+        session = get_session()
+        try:
+            for step in chain_steps:
+                chain_step_responses = (
+                    session.query(ChainStepResponse)
+                    .filter(ChainStepResponse.chain_step_id == step.id)
+                    .order_by(ChainStepResponse.timestamp)
+                    .all()
+                )
+                step_responses = [response.content for response in chain_step_responses]
+                responses[str(step.step_number)] = step_responses
+            return responses
+        finally:
+            session.close()
+
+    def import_chain(self, chain_name: str, steps: dict):
+        session = get_session()
+        try:
+            chain = (
+                session.query(ChainDB)
+                .filter(ChainDB.name == chain_name, ChainDB.user_id == self.user_id)
+                .first()
+            )
+            if chain:
+                return None
+            chain = ChainDB(name=chain_name, user_id=self.user_id)
+            session.add(chain)
+            session.commit()
+            if not chain.id:
+                logging.error(f"Failed to create chain {chain_name}.")
+                return None
+            steps = steps["steps"] if "steps" in steps else steps
+            for step_data in steps:
+                step_number = step_data.get("step")
+                agent_name = step_data.get("agent_name")
+                agent = self._find_agent(session, agent_name)
+                if not agent:
+                    # Never dereference a missing agent, just skip the step
+                    logging.error(
+                        f"Unable to import step {step_number} of chain {chain_name}: "
+                        f"agent {agent_name} not found and no agents are available."
+                    )
+                    continue
+                prompt = step_data.get("prompt", {})
+                if isinstance(prompt, str):
+                    prompt = {"prompt_name": prompt}
+                if "prompt_type" not in step_data:
+                    step_data["prompt_type"] = "prompt"
+                prompt_type = str(step_data["prompt_type"]).lower()
+                argument_key = None
+                target = None
+                target_type = None
+                if prompt_type == "prompt":
+                    argument_key = "prompt_name"
+                    prompt_category = prompt.get("prompt_category", "Default")
+                    target = self._find_prompt(
+                        session, prompt.get(argument_key), prompt_category
+                    )
+                    target_type = "prompt"
+                elif prompt_type == "chain":
+                    argument_key = "chain_name"
+                    if "chain" in prompt:
+                        argument_key = "chain"
+                    target = self._find_chain(session, prompt.get(argument_key))
+                    target_type = "chain"
+                elif prompt_type == "command":
+                    argument_key = "command_name"
+                    target = self._find_command(session, prompt.get(argument_key))
+                    target_type = "command"
+                else:
+                    # Handle the case where the argument key is not found
+                    logging.warning(
+                        f"Invalid prompt type {prompt_type} on step {step_number} "
+                        f"of chain {chain_name}. Skipping step."
+                    )
+                    continue
+                if not target or argument_key not in prompt:
+                    logging.error(
+                        f"Target {prompt.get(argument_key)} not found for "
+                        f"{prompt_type} step {step_number} of chain {chain_name}. "
+                        f"Skipping step."
+                    )
+                    # Skip the step instead of crashing on target.id
+                    continue
+                target_id = target.id
+                argument_value = prompt[argument_key]
+                prompt_arguments = prompt.copy()
+                del prompt_arguments[argument_key]
+                chain_step = ChainStep(
+                    chain_id=chain.id,
+                    step_number=step_number,
+                    agent_id=agent.id,
+                    prompt_type=step_data["prompt_type"],
+                    prompt=argument_value,
+                    target_chain_id=target_id if target_type == "chain" else None,
+                    target_command_id=target_id if target_type == "command" else None,
+                    target_prompt_id=target_id if target_type == "prompt" else None,
+                )
+                session.add(chain_step)
+                session.commit()
+                for argument_name, arg_value in prompt_arguments.items():
+                    argument = (
+                        session.query(Argument)
+                        .filter(Argument.name == argument_name)
+                        .first()
+                    )
+                    if not argument:
+                        # Handle the case where argument not found based on
+                        # argument_name - skip this argument
+                        continue
+
+                    chain_step_argument = ChainStepArgument(
+                        chain_step_id=chain_step.id,
+                        argument_id=argument.id,
+                        value=arg_value,
+                    )
+                    session.add(chain_step_argument)
+                    session.commit()
+            return f"Imported chain: {chain_name}"
+        except Exception as e:
+            session.rollback()
+            logging.error(f"Error importing chain {chain_name}: {e}")
+            raise
+        finally:
+            session.close()
+
+    def get_chain_step_dependencies(self, chain_name):
+        chain_steps = self.get_steps(chain_name=chain_name)
+        prompts = Prompts(user=self.user)
+        chain_dependencies = {}
+        for step in chain_steps:
+            step_dependencies = []
+            prompt = step.prompt
+            if not isinstance(prompt, dict) and not isinstance(prompt, str):
+                prompt = str(prompt)
+            if isinstance(prompt, dict):
+                for key, value in prompt.items():
+                    if isinstance(value, str) and "{STEP" in value:
+                        step_count = value.count("{STEP")
+                        for i in range(step_count):
+                            try:
+                                new_step_number = int(
+                                    value.split("{STEP")[1].split("}")[0]
+                                )
+                            except (IndexError, ValueError):
+                                continue
+                            step_dependencies.append(new_step_number)
+                if "prompt_name" in prompt:
+                    prompt_text = prompts.get_prompt(
+                        prompt_name=prompt["prompt_name"],
+                        prompt_category=(
+                            prompt["prompt_category"]
+                            if "prompt_category" in prompt
+                            else "Default"
+                        ),
+                    )
+                    # See if "{context}" is in the prompt
+                    if prompt_text and "{context}" in prompt_text:
+                        # Add all prior steps in the chain as deps
+                        for i in range(step.step_number):
+                            step_dependencies.append(i)
+            elif isinstance(prompt, str):
+                if "{STEP" in prompt:
+                    step_count = prompt.count("{STEP")
+                    for i in range(step_count):
+                        try:
+                            new_step_number = int(prompt.split("{STEP")[1].split("}")[0])
+                        except (IndexError, ValueError):
+                            continue
+                        step_dependencies.append(new_step_number)
+                    if "{context}" in prompt:
+                        # Add all prior steps in the chain as deps
+                        for i in range(step.step_number):
+                            step_dependencies.append(i)
+            chain_dependencies[str(step.step_number)] = step_dependencies
+        return chain_dependencies
+
+    async def check_if_dependencies_met(
+        self, chain_run_id, chain_name, step_number, dependencies=[]
+    ):
+        if dependencies == []:
+            chain_dependencies = self.get_chain_step_dependencies(chain_name=chain_name)
+            dependencies = chain_dependencies.get(str(step_number), [])
+
+        async def check_dependencies_met(dependencies):
+            for dependency in dependencies:
+                try:
+                    step_responses = self.get_step_response(
+                        chain_name=chain_name,
+                        chain_run_id=chain_run_id,
+                        step_number=int(dependency),
+                    )
+                except:
+                    return False
+                if not step_responses:
+                    return False
+            return True
+
+        dependencies_met = await check_dependencies_met(dependencies)
+        while not dependencies_met:
+            await asyncio.sleep(1)
+            dependencies_met = await check_dependencies_met(dependencies)
+        return True
+
+    def get_step_content(
+        self, chain_run_id, chain_name, prompt_content, user_input, agent_name
+    ):
+        if isinstance(prompt_content, dict):
+            new_prompt_content = {}
+            for arg, value in prompt_content.items():
+                if isinstance(value, str):
+                    if "{user_input}" in value:
+                        value = value.replace("{user_input}", user_input)
+                    if "{agent_name}" in value:
+                        value = value.replace("{agent_name}", agent_name)
+                    if "{STEP" in value:
+                        step_count = value.count("{STEP")
+                        for i in range(step_count):
+                            new_step_number = int(value.split("{STEP")[1].split("}")[0])
+                            step_response = self.get_step_response(
+                                chain_run_id=chain_run_id,
+                                chain_name=chain_name,
+                                step_number=new_step_number,
+                            )
+                            if step_response:
+                                resp = (
+                                    step_response[0]
+                                    if isinstance(step_response, list)
+                                    else step_response
+                                )
+                                value = value.replace(
+                                    f"{{STEP{new_step_number}}}", f"{resp}"
+                                )
+                new_prompt_content[arg] = value
+            return new_prompt_content
+        elif isinstance(prompt_content, str):
+            new_prompt_content = prompt_content
+            if "{user_input}" in prompt_content:
+                new_prompt_content = new_prompt_content.replace(
+                    "{user_input}", user_input
+                )
+            if "{agent_name}" in new_prompt_content:
+                new_prompt_content = new_prompt_content.replace(
+                    "{agent_name}", agent_name
+                )
+            if "{STEP" in prompt_content:
+                step_count = prompt_content.count("{STEP")
+                for i in range(step_count):
+                    new_step_number = int(prompt_content.split("{STEP")[1].split("}")[0])
+                    step_response = self.get_step_response(
+                        chain_run_id=chain_run_id,
+                        chain_name=chain_name,
+                        step_number=new_step_number,
+                    )
+                    if step_response:
+                        resp = (
+                            step_response[0]
+                            if isinstance(step_response, list)
+                            else step_response
+                        )
+                        new_prompt_content = new_prompt_content.replace(
+                            f"{{STEP{new_step_number}}}", f"{resp}"
+                        )
+            return new_prompt_content
+        else:
+            return prompt_content
+
+    async def update_step_response(
+        self, chain_run_id, chain_name, step_number, response
+    ):
+        chain_step = self.get_step(chain_name=chain_name, step_number=step_number)
+        if chain_step:
+            session = get_session()
+            try:
+                existing_response = (
+                    session.query(ChainStepResponse)
+                    .filter(
+                        ChainStepResponse.chain_step_id == chain_step.id,
+                        ChainStepResponse.chain_run_id == chain_run_id,
+                    )
+                    .order_by(ChainStepResponse.timestamp.desc())
+                    .first()
+                )
+                if existing_response:
+                    if isinstance(existing_response.content, dict) and isinstance(
+                        response, dict
+                    ):
+                        existing_response.content.update(response)
+                        session.commit()
+                    elif isinstance(existing_response.content, list) and isinstance(
+                        response, list
+                    ):
+                        existing_response.content.extend(response)
+                        session.commit()
+                    else:
+                        chain_step_response = ChainStepResponse(
+                            chain_step_id=chain_step.id,
+                            chain_run_id=chain_run_id,
+                            content=response,
+                        )
+                        session.add(chain_step_response)
+                        session.commit()
+                else:
+                    chain_step_response = ChainStepResponse(
+                        chain_step_id=chain_step.id,
+                        chain_run_id=chain_run_id,
+                        content=response,
+                    )
+                    session.add(chain_step_response)
+                    session.commit()
+            finally:
+                session.close()
+
+    async def get_chain_run_id(self, chain_name):
+        chain_data = self.get_chain(chain_name=chain_name)
+        if not chain_data:
+            logging.error(f"Chain {chain_name} not found.")
+            return None
+        session = get_session()
+        try:
+            chain_run = ChainRun(
+                chain_id=chain_data["id"],
+                user_id=self.user_id,
+            )
+            session.add(chain_run)
+            session.commit()
+            chain_run_id = chain_run.id
+            return chain_run_id
+        finally:
+            session.close()
+
+    async def get_last_chain_run_id(self, chain_name):
+        chain_data = self.get_chain(chain_name=chain_name)
+        if not chain_data:
+            logging.error(f"Chain {chain_name} not found.")
+            return None
+        session = get_session()
+        try:
+            chain_run = (
+                session.query(ChainRun)
+                .filter(ChainRun.chain_id == chain_data["id"])
+                .order_by(ChainRun.timestamp.desc())
+                .first()
+            )
+            if chain_run:
+                chain_run_id = chain_run.id
+                return chain_run_id
+        finally:
+            session.close()
+        return await self.get_chain_run_id(chain_name=chain_name)
+
+    def get_chain_args(self, chain_name):
+        skip_args = [
+            "command_list",
+            "context",
+            "COMMANDS",
+            "date",
+            "conversation_history",
+            "agent_name",
+            "working_directory",
+            "helper_agent_name",
+        ]
+        chain_data = self.get_chain(chain_name=chain_name)
+        if not chain_data:
+            logging.error(f"Chain {chain_name} not found.")
+            return []
+        steps = chain_data["steps"]
+        prompt_args = []
+        args = []
+        for step in steps:
+            try:
+                prompt = step["prompt"]
+                if "prompt_name" in prompt:
+                    prompt_text = Prompts(user=self.user).get_prompt(
+                        prompt_name=prompt["prompt_name"]
+                    )
+                    args = Prompts(user=self.user).get_prompt_args(
+                        prompt_text=prompt_text
+                    )
+                elif "command_name" in prompt:
+                    args = Extensions().get_command_args(
+                        command_name=prompt["command_name"]
+                    )
+                elif "chain_name" in prompt:
+                    args = self.get_chain_args(chain_name=prompt["chain_name"])
+                for arg in args:
+                    if arg not in prompt_args and arg not in skip_args:
+                        prompt_args.append(arg)
+            except Exception as e:
+                logging.error(f"Error getting chain args: {e}")
+        return prompt_args
+
+    def new_task(
+        self,
+        conversation_id,
+        chain_name,
+        task_category,
+        task_description,
+        estimated_hours,
+    ):
+        session = get_session()
+        try:
+            task_category_data = (
+                session.query(TaskCategory)
+                .filter(
+                    TaskCategory.name == task_category,
+                    TaskCategory.user_id == self.user_id,
+                )
+                .first()
+            )
+            if not task_category_data:
+                task_category_data = TaskCategory(
+                    name=task_category, user_id=self.user_id
+                )
+                session.add(task_category_data)
+                session.commit()
+            task = TaskItem(
+                user_id=self.user_id,
+                category_id=task_category_data.id,
+                title=chain_name,
+                description=task_description,
+                estimated_hours=estimated_hours,
+                memory_collection=str(conversation_id),
+            )
+            session.add(task)
+            session.commit()
+            task_id = task.id
+            return task_id
+        finally:
+            session.close()
+
+
+### agixt/DB.py
+import uuid
+import time
+import logging
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Text,
+    String,
+    Integer,
+    ForeignKey,
+    DateTime,
+    Boolean,
+    func,
+)
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.sql import text
+from Globals import getenv
+
+logging.basicConfig(
+    level=getenv("LOG_LEVEL"),
+    format=getenv("LOG_FORMAT"),
+)
+DEFAULT_USER = getenv("DEFAULT_USER")
+try:
+    DATABASE_TYPE = getenv("DATABASE_TYPE")
+    DATABASE_NAME = getenv("DATABASE_NAME")
+    if DATABASE_TYPE != "sqlite":
+        DATABASE_USER = getenv("DATABASE_USER")
+        DATABASE_PASSWORD = getenv("DATABASE_PASSWORD")
+        DATABASE_HOST = getenv("DATABASE_HOST")
+        DATABASE_PORT = getenv("DATABASE_PORT")
+        LOGIN_URI = f"{DATABASE_USER}:{DATABASE_PASSWORD}@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}"
+        DATABASE_URI = f"postgresql://{LOGIN_URI}"
+    else:
+        DATABASE_URI = f"sqlite:///{DATABASE_NAME}.db"
+    engine = create_engine(DATABASE_URI, pool_size=40, max_overflow=-1)
+    connection = engine.connect()
+    Base = declarative_base()
+except Exception as e:
+    logging.error(f"Error connecting to database: {e}")
+    Base = None
+    engine = None
+
+
+def get_session():
+    Session = sessionmaker(bind=engine, autoflush=False)
+    session = Session()
+    return session
+
+
+def get_new_id():
+    return str(uuid.uuid4())
+
+
+class User(Base):
+    __tablename__ = "user"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    email = Column(String, unique=True)
+    first_name = Column(String, default="", nullable=True)
+    last_name = Column(String, default="", nullable=True)
+    admin = Column(Boolean, default=False, nullable=False)
+    mfa_token = Column(String, default="", nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    is_active = Column(Boolean, default=True)
+
+
+class UserPreferences(Base):
+    __tablename__ = "user_preferences"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    pref_key = Column(String, nullable=False)
+    pref_value = Column(String, nullable=True)
+
+
+class UserOAuth(Base):
+    __tablename__ = "user_oauth"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    user = relationship("User")
+    provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("oauth_provider.id"),
+    )
+    provider = relationship("OAuthProvider")
+    access_token = Column(String, default="", nullable=False)
+    refresh_token = Column(String, default="", nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class OAuthProvider(Base):
+    __tablename__ = "oauth_provider"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(String, default="", nullable=False)
+
+
+class FailedLogins(Base):
+    __tablename__ = "failed_logins"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    user = relationship("User")
+    ip_address = Column(String, default="", nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class Provider(Base):
+    __tablename__ = "provider"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    provider_settings = relationship("ProviderSetting", backref="provider")
+
+
+class ProviderSetting(Base):
+    __tablename__ = "provider_setting"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("provider.id"),
+        nullable=False,
+    )
+    name = Column(Text, nullable=False)
+    value = Column(Text, nullable=True)
+
+
+class AgentProviderSetting(Base):
+    __tablename__ = "agent_provider_setting"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    provider_setting_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("provider_setting.id"),
+        nullable=False,
+    )
+    agent_provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent_provider.id"),
+        nullable=False,
+    )
+    value = Column(Text, nullable=True)
+
+
+class AgentProvider(Base):
+    __tablename__ = "agent_provider"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("provider.id"),
+        nullable=False,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    settings = relationship("AgentProviderSetting", backref="agent_provider")
+
+
+class AgentBrowsedLink(Base):
+    __tablename__ = "agent_browsed_link"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    conversation_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("conversation.id"),
+        nullable=True,
+    )
+    link = Column(Text, nullable=False)
+    timestamp = Column(DateTime, server_default=func.now())
+
+
+class Agent(Base):
+    __tablename__ = "agent"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    provider_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("provider.id"),
+        nullable=True,
+        default=None,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    settings = relationship("AgentSetting", backref="agent")  # One-to-many relationship
+    browsed_links = relationship("AgentBrowsedLink", backref="agent")
+    user = relationship("User", backref="agent")
+
+
+class Command(Base):
+    __tablename__ = "command"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    extension_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("extension.id"),
+    )
+    extension = relationship("Extension", backref="commands")
+
+
+class AgentCommand(Base):
+    __tablename__ = "agent_command"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    command_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("command.id"),
+        nullable=False,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    state = Column(Boolean, nullable=False)
+    command = relationship("Command")  # Add this line to define the relationship
+
+
+class Conversation(Base):
+    __tablename__ = "conversation"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    user = relationship("User", backref="conversation")
+
+
+class Message(Base):
+    __tablename__ = "message"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    role = Column(Text, nullable=False)
+    content = Column(Text, nullable=False)
+    timestamp = Column(DateTime, server_default=func.now())
+    conversation_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("conversation.id"),
+        nullable=False,
+    )
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    feedback_received = Column(Boolean, default=False)
+
+
+class Setting(Base):
+    __tablename__ = "setting"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    extension_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("extension.id"),
+    )
+    value = Column(Text)
+
+
+class AgentSetting(Base):
+    __tablename__ = "agent_setting"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    name = Column(String)
+    value = Column(String)
+
+
+class Chain(Base):
+    __tablename__ = "chain"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    steps = relationship(
+        "ChainStep",
+        backref="chain",
+        cascade="all, delete",  # Add the cascade option for deleting steps
+        passive_deletes=True,
+        foreign_keys="ChainStep.chain_id",
+    )
+    target_steps = relationship(
+        "ChainStep", backref="target_chain", foreign_keys="ChainStep.target_chain_id"
+    )
+    user = relationship("User", backref="chain")
+    runs = relationship("ChainRun", backref="chain", cascade="all, delete-orphan")
+
+
+class ChainStep(Base):
+    __tablename__ = "chain_step"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    chain_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    prompt_type = Column(Text)  # Add the prompt_type field
+    prompt = Column(Text)  # Add the prompt field
+    target_chain_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain.id", ondelete="SET NULL"),
+    )
+    target_command_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("command.id", ondelete="SET NULL"),
+    )
+    target_prompt_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("prompt.id", ondelete="SET NULL"),
+    )
+    step_number = Column(Integer, nullable=False)
+    responses = relationship(
+        "ChainStepResponse", backref="chain_step", cascade="all, delete"
+    )
+
+    def add_response(self, content):
+        session = get_session()
+        response = ChainStepResponse(content=content, chain_step=self)
+        session.add(response)
+        session.commit()
+
+
+class ChainStepArgument(Base):
+    __tablename__ = "chain_step_argument"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    argument_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("argument.id"),
+        nullable=False,
+    )
+    chain_step_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain_step.id", ondelete="CASCADE"),
+        nullable=False,  # Add the ondelete option
+    )
+    value = Column(Text, nullable=True)
+
+
+class ChainRun(Base):
+    __tablename__ = "chain_run"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    chain_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    timestamp = Column(DateTime, server_default=func.now())
+    chain_step_responses = relationship(
+        "ChainStepResponse", backref="chain_run", cascade="all, delete-orphan"
+    )
+
+
+class ChainStepResponse(Base):
+    __tablename__ = "chain_step_response"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    chain_step_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain_step.id", ondelete="CASCADE"),
+        nullable=False,  # Add the ondelete option
+    )
+    chain_run_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain_run.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    timestamp = Column(DateTime, server_default=func.now())
+    content = Column(Text, nullable=False)
+
+
+class Extension(Base):
+    __tablename__ = "extension"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=True, default="")
+
+
+class Argument(Base):
+    __tablename__ = "argument"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    prompt_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("prompt.id"),
+    )
+    command_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("command.id"),
+    )
+    chain_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("chain.id"),
+    )
+    name = Column(Text, nullable=False)
+
+
+class PromptCategory(Base):
+    __tablename__ = "prompt_category"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=False)
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    user = relationship("User", backref="prompt_category")
+
+
+class TaskCategory(Base):
+    __tablename__ = "task_category"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    name = Column(String)
+    description = Column(String)
+    memory_collection = Column(String, default="0")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    category_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("task_category.id"),
+        nullable=True,
+    )
+    parent_category = relationship("TaskCategory", remote_side=[id])
+    user = relationship("User", backref="task_category")
+
+
+class TaskItem(Base):
+    __tablename__ = "task_item"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+    )
+    category_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("task_category.id"),
+    )
+    category = relationship("TaskCategory")
+    title = Column(String)
+    description = Column(String)
+    memory_collection = Column(String, default="0")
+    # agent_id is the action item owner. If it is null, it is an item for the user
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=True,
+    )
+    estimated_hours = Column(Integer)
+    scheduled = Column(Boolean, default=False)
+    completed = Column(Boolean, default=False)
+    due_date = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    completed_at = Column(DateTime, nullable=True)
+    priority = Column(Integer)
+    user = relationship("User", backref="task_item")
+
+
+class Prompt(Base):
+    __tablename__ = "prompt"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    prompt_category_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("prompt_category.id"),
+        nullable=False,
+    )
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=False)
+    content = Column(Text, nullable=False)
+    user_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("user.id"),
+        nullable=True,
+    )
+    prompt_category = relationship("PromptCategory", backref="prompts")
+    user = relationship("User", backref="prompt")
+    arguments = relationship("Argument", backref="prompt", cascade="all, delete-orphan")
+
+
+if __name__ == "__main__":
+    logging.info("Connecting to database...")
+    if getenv("DATABASE_TYPE") != "sqlite":
+        time.sleep(15)
+    Base.metadata.create_all(engine)
+    logging.info("Connected to database.")
+    # Check if the user table is empty
+    from SeedImports import import_all_data
+
+    import_all_data()
+
+--------------------------------------------------------------------------------

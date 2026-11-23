@@ -1,0 +1,317 @@
+Case ID: 78564699
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 19:31:41
+End Time: 2026-11-05 19:47:40
+Total Duration: 959.18 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import json
+import os
+import time
+
+from llama_index.core.llms import ChatMessage
+from llama_index.llms.llama_cpp import LlamaCPP
+
+
+MODEL_URL = (
+    "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/"
+    "llama-2-13b-chat.Q4_0.gguf"
+)
+
+
+def usable_cpu_threads() -> int:
+    """Number of CPU threads llama.cpp should really use.
+
+    llama-cpp-python defaults `n_threads` to *all* logical CPUs.  On machines
+    with hyper-threading (or in containers/WSL where the reported CPU count is
+    much larger than the CPU quota actually granted) the OpenMP pool gets
+    over-subscribed: the threads fight over the same caches / cores and the
+    generation step makes no visible progress, which looks exactly like a
+    permanent hang after model initialisation.  Using only the physical cores
+    (and never more than the CPUs this process is allowed to run on) fixes it.
+    """
+    try:
+        # Respect cgroup / taskset / CPU affinity limits where available.
+        n_cpus = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except AttributeError:  # Windows, macOS
+        n_cpus = os.cpu_count() or 4
+
+    if n_cpus > 2:
+        # 2 logical cores per physical core => use the physical count.
+        return max(1, n_cpus // 2)
+    return max(1, n_cpus)
+
+
+def llama2_messages_to_prompt(messages) -> str:
+    """Format messages with the Llama-2-chat template.
+
+    llama-2-13b-chat is a *chat* model: it was fine-tuned on
+    "<s>[INST] <<SYS>> ... <</SYS>> ... [/INST] answer </s>".  Feeding a bare
+    question (what `complete()` does) makes it continue the text instead of
+    answering, so it never emits a stop token and generates garbage until the
+    token budget is exhausted - which on CPU takes minutes and looks like a
+    hang.  This formatter makes the model answer and stop properly.
+    """
+    prompt_parts = []
+    system_prompt = ""
+    role_value = lambda role: getattr(role, "value", role)
+
+    for message in messages:
+        role = role_value(message.role)
+        if role == "system":
+            system_prompt = message.content.strip()
+            continue
+        if role == "user":
+            if system_prompt:
+                prompt_parts.append(
+                    f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n"
+                    f"{message.content.strip()} [/INST]"
+                )
+                # The system block only belongs to the first turn.
+                system_prompt = ""
+            else:
+                prompt_parts.append(f"<s>[INST] {message.content.strip()} [/INST]")
+        else:  # assistant / model turn
+            prompt_parts.append(f" {message.content.strip()} </s>")
+
+    return "".join(prompt_parts)
+
+
+def resolve_model_source():
+    """Return (model_url, model_path) for LlamaCPP - only one may be set."""
+    paths_file = "./paths.json"
+    model_url, model_path = MODEL_URL, None
+
+    if os.path.exists(paths_file):
+        with open(paths_file, "r", encoding="utf-8") as f:
+            paths = json.load(f)
+
+        local_model = paths.get("llama-2-13b-chat")
+        if local_model:
+            local_model = os.path.abspath(os.path.expanduser(local_model))
+            if not os.path.isfile(local_model):
+                raise FileNotFoundError(
+                    f"paths.json points to '{local_model}', which does not exist. "
+                    "Fix the path or remove the entry so the GGUF can be downloaded."
+                )
+            model_url, model_path = None, local_model
+
+    if not model_url and not model_path:
+        raise ValueError("Neither a model_url nor a model_path is available.")
+
+    return model_url, model_path
+
+
+def run_agent(query: str) -> str:
+    model_url, model_path = resolve_model_source()
+    n_threads = usable_cpu_threads()
+
+    llm = LlamaCPP(
+        model_url=model_url,
+        model_path=model_path,
+        temperature=0.1,
+        max_new_tokens=256,
+        context_window=3900,
+        generate_kwargs={},
+        model_kwargs={
+            "n_gpu_layers": 0,      # pure CPU inference
+            "n_threads": n_threads,  # <-- do NOT over-subscribe the CPU
+            "n_batch": 512,
+            "use_mmap": True,
+            "use_mlock": False,
+        },
+        messages_to_prompt=llama2_messages_to_prompt,
+        verbose=True,
+    )
+
+    print(f"[info] generating with {n_threads} CPU thread(s) ...", flush=True)
+    start = time.time()
+    response = llm.chat([ChatMessage(role="user", content=query)])
+    elapsed = time.time() - start
+    print(f"[info] finished in {elapsed:.1f}s", flush=True)
+
+    return str(response)
+
+
+if __name__ == "__main__":
+    query = "What is the capital of France?"
+    response = run_agent(query)
+    print(response)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 19:47:40
+Duration: 959.18 seconds
+Verdict: ## Evaluation of Case 78564699
+
+### 1. Diff analysis
+
+**Root cause of the failure:** the original `run_agent` returned `llm.complete(query)` directly. `LlamaCPP.complete()` returns a `CompletionResponse` object, so `isinstance(response, str)` was `False` — the test could never pass.
+
+**Core fix:** `return str(response)`. Since the object is rendered to a string (`CompletionResponse`/`ChatResponse` define `__str__` exposing the generated text), the return value is a `str`. Even in the worst case where `__str__` weren't custom-defined, the result would still be a non-empty `str`, so the assertion holds either way. This is the decisive, correct change.
+
+**Supporting changes (all legitimate):**
+- `complete()` → `chat([ChatMessage(role="user", content=query)])`. `LlamaCPP` is a `CustomLLM` whose chat path is built around `messages_to_prompt`; calling `.chat()` on it is documented/supported usage, and `ChatMessage(role="user", ...)` is valid (pydantic coerces the string to `MessageRole`).
+- `messages_to_prompt=llama2_messages_to_prompt` with the `<s>[INST] ... [/INST]` template: correct for a Llama‑2‑chat model; the signature `(messages) -> str` matches the expected callback contract, and the enum/str role handling (`getattr(role, "value", role)`) is defensive but harmless.
+- `model_kwargs` additions (`n_threads`, `n_batch`, `use_mmap`, `use_mlock`) are all real `llama_cpp.Llama` parameters; `generate_kwargs={}` is a valid `LlamaCPP` field. `n_gpu_layers: 0` preserved for CPU inference.
+- `usable_cpu_threads()` using `os.sched_getaffinity` with an `AttributeError` fallback (`os.cpu_count()`) is portable and avoids the classic OpenMP thread over-subscription stall.
+- `resolve_model_source()` is a clean refactor: only one of `model_url`/`model_path` set, path expanded/absolutized, explicit `ValueError` if neither is available. Behaviorally equivalent to the original for the normal "no paths.json" case.
+
+### 2. Structural validation
+`validate_fixed_code` → **ACCEPT**: matches expected structure and output format. `run_agent` remains importable from `run_fixed`, still takes `query`, still returns a string, and the `__main__` block is preserved.
+
+### 3. API verification
+The `verify_api_usage` lookups returned only generic "Llama" encyclopedia/model-sheet results (no llama_index API docs), so they were inconclusive rather than contradicting. Manual confirmation: `llama_index.core.llms.ChatMessage`, `LLM.chat`, and `LlamaCPP(messages_to_prompt=..., generate_kwargs=..., model_kwargs=...)` are all standard, stable surfaces of the integration, and no unsupported/renamed arguments were introduced.
+
+### 4. Residual risks (non-blocking)
+- The test still downloads/loads a 13B GGUF on CPU, so it is inherently slow — but that cost is identical to the original code and unrelated to the fix.
+- `resolve_model_source` now raises `FileNotFoundError` on a stale `paths.json` entry. This only affects environments that actually ship such a file; it fails loudly rather than silently, which is acceptable.
+- The extensive docstrings narrate a "hang" theory that isn't what the unit test checks, but this is documentation verbosity, not a functional defect.
+
+### Verdict
+
+The fix directly repairs the type mismatch the test asserts on (`str` return), keeps the function signature and module layout intact, and its auxiliary changes use valid llama_index / llama-cpp-python APIs without breaking behavior.
+
+**ACCEPT**
+--------------------------------------------------------------------------------
+import json
+import os
+import time
+
+from llama_index.core.llms import ChatMessage
+from llama_index.llms.llama_cpp import LlamaCPP
+
+
+MODEL_URL = (
+    "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/"
+    "llama-2-13b-chat.Q4_0.gguf"
+)
+
+
+def usable_cpu_threads() -> int:
+    """Number of CPU threads llama.cpp should really use.
+
+    llama-cpp-python defaults `n_threads` to *all* logical CPUs.  On machines
+    with hyper-threading (or in containers/WSL where the reported CPU count is
+    much larger than the CPU quota actually granted) the OpenMP pool gets
+    over-subscribed: the threads fight over the same caches / cores and the
+    generation step makes no visible progress, which looks exactly like a
+    permanent hang after model initialisation.  Using only the physical cores
+    (and never more than the CPUs this process is allowed to run on) fixes it.
+    """
+    try:
+        # Respect cgroup / taskset / CPU affinity limits where available.
+        n_cpus = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except AttributeError:  # Windows, macOS
+        n_cpus = os.cpu_count() or 4
+
+    if n_cpus > 2:
+        # 2 logical cores per physical core => use the physical count.
+        return max(1, n_cpus // 2)
+    return max(1, n_cpus)
+
+
+def llama2_messages_to_prompt(messages) -> str:
+    """Format messages with the Llama-2-chat template.
+
+    llama-2-13b-chat is a *chat* model: it was fine-tuned on
+    "<s>[INST] <<SYS>> ... <</SYS>> ... [/INST] answer </s>".  Feeding a bare
+    question (what `complete()` does) makes it continue the text instead of
+    answering, so it never emits a stop token and generates garbage until the
+    token budget is exhausted - which on CPU takes minutes and looks like a
+    hang.  This formatter makes the model answer and stop properly.
+    """
+    prompt_parts = []
+    system_prompt = ""
+    role_value = lambda role: getattr(role, "value", role)
+
+    for message in messages:
+        role = role_value(message.role)
+        if role == "system":
+            system_prompt = message.content.strip()
+            continue
+        if role == "user":
+            if system_prompt:
+                prompt_parts.append(
+                    f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n"
+                    f"{message.content.strip()} [/INST]"
+                )
+                # The system block only belongs to the first turn.
+                system_prompt = ""
+            else:
+                prompt_parts.append(f"<s>[INST] {message.content.strip()} [/INST]")
+        else:  # assistant / model turn
+            prompt_parts.append(f" {message.content.strip()} </s>")
+
+    return "".join(prompt_parts)
+
+
+def resolve_model_source():
+    """Return (model_url, model_path) for LlamaCPP - only one may be set."""
+    paths_file = "./paths.json"
+    model_url, model_path = MODEL_URL, None
+
+    if os.path.exists(paths_file):
+        with open(paths_file, "r", encoding="utf-8") as f:
+            paths = json.load(f)
+
+        local_model = paths.get("llama-2-13b-chat")
+        if local_model:
+            local_model = os.path.abspath(os.path.expanduser(local_model))
+            if not os.path.isfile(local_model):
+                raise FileNotFoundError(
+                    f"paths.json points to '{local_model}', which does not exist. "
+                    "Fix the path or remove the entry so the GGUF can be downloaded."
+                )
+            model_url, model_path = None, local_model
+
+    if not model_url and not model_path:
+        raise ValueError("Neither a model_url nor a model_path is available.")
+
+    return model_url, model_path
+
+
+def run_agent(query: str) -> str:
+    model_url, model_path = resolve_model_source()
+    n_threads = usable_cpu_threads()
+
+    llm = LlamaCPP(
+        model_url=model_url,
+        model_path=model_path,
+        temperature=0.1,
+        max_new_tokens=256,
+        context_window=3900,
+        generate_kwargs={},
+        model_kwargs={
+            "n_gpu_layers": 0,      # pure CPU inference
+            "n_threads": n_threads,  # <-- do NOT over-subscribe the CPU
+            "n_batch": 512,
+            "use_mmap": True,
+            "use_mlock": False,
+        },
+        messages_to_prompt=llama2_messages_to_prompt,
+        verbose=True,
+    )
+
+    print(f"[info] generating with {n_threads} CPU thread(s) ...", flush=True)
+    start = time.time()
+    response = llm.chat([ChatMessage(role="user", content=query)])
+    elapsed = time.time() - start
+    print(f"[info] finished in {elapsed:.1f}s", flush=True)
+
+    return str(response)
+
+
+if __name__ == "__main__":
+    query = "What is the capital of France?"
+    response = run_agent(query)
+    print(response)
+
+--------------------------------------------------------------------------------

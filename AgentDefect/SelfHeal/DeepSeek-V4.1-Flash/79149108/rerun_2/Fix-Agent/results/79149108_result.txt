@@ -1,0 +1,404 @@
+Case ID: 79149108
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 21:08:00
+End Time: 2026-11-04 21:10:37
+Total Duration: 156.95 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Flask + Ollama chat endpoint (fixed).
+
+Why the model kept "sticking" to the first prompt:
+
+1. `messages` was a *module-level* global list shared by every request/visitor.
+   Nothing ever cleared it, so the very first prompt stayed in the context
+   forever and, because a chat model weights the whole conversation, that old
+   instruction (and the accumulated history) kept dominating every new turn.
+   The CLI has no such history - each `ollama run` starts clean - that's why the
+   CLI obeyed the "stop" instruction while the web app did not.
+
+2. The trimming loop was broken:
+       while number_of_tokens >= MODEL_MAX_TOKENS:
+           del messages[1]
+   `number_of_tokens` is never recomputed (infinite loop / IndexError), and it
+   always deletes index 1 -> index 0 (the FIRST prompt) is the one entry that is
+   *never* removed. So even under pressure the oldest instruction was kept.
+
+3. Messages were passed as bare tuples `("user", text)`; LangChain expects
+   proper message objects/dicts with role + content, and no system message was
+   ever sent to define the behaviour / stop rule.
+
+4. No generation limits: `temperature=1.1` and no `num_predict`/`stop` meant the
+   model was free to ramble and re-run the original task instead of stopping.
+   `MODEL_MAX_TOKENS = 128000` also is not the window actually used for the call.
+
+What is done instead:
+   * per-session history (keyed by a session id, plus a /reset endpoint),
+   * explicit system prompt that says "follow the latest instruction, stop when
+     asked to stop",
+   * correct role/content dicts,
+   * oldest turns trimmed first (the newest instruction is always kept) with the
+     token count recomputed on every iteration,
+   * explicit num_ctx / num_predict / stop + lower temperature so the answer
+     terminates where you expect.
+"""
+
+from flask import Flask, render_template, request, session
+
+from langchain_ollama import ChatOllama
+
+import threading
+import uuid
+
+import tiktoken
+
+app = Flask(__name__)
+# Needed for `session` (per-browser conversation is kept apart).
+app.secret_key = "change-me-to-a-random-secret"
+
+MODEL = "llama3.2"
+
+# Context actually requested from Ollama for each call.
+NUM_CTX = 8192
+# Budget for the prompt we send (system prompt + history + new question).
+# Must stay well below NUM_CTX so the reply always fits.
+MAX_PROMPT_TOKENS = 3000
+# Hard cap on the answer length: this is what makes "stop" actually stop.
+NUM_PREDICT = 512
+# Max number of turns kept per conversation (extra safety on top of tokens).
+MAX_TURNS = 12
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant in a multi-turn chat. "
+    "Always follow the MOST RECENT user instruction; earlier messages are only "
+    "context and must not be repeated. "
+    "If the user asks you to stop, stop immediately and reply with one short "
+    "acknowledgement, nothing else. "
+    "Answer concisely."
+)
+
+llm = ChatOllama(
+    model=MODEL,
+    temperature=0.2,
+    num_ctx=NUM_CTX,
+    num_predict=NUM_PREDICT,
+    stop=["\nuser:", "\nUser:", "\nHuman:"],
+)
+
+# session_id -> list[{"role": "user"|"assistant", "content": str}]
+chat_histories = {}
+_histories_lock = threading.Lock()
+
+try:
+    _encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+except Exception:  # tiktoken needs network/extra deps sometimes
+    _encoding = None
+
+
+def get_number_of_tokens(msgs):
+    """Token count of a list of {"role": ..., "content": ...} dicts."""
+    if _encoding is None:
+        return sum(len(m.get("content", "")) for m in msgs) // 4
+    return sum(len(_encoding.encode(m.get("content", ""))) for m in msgs)
+
+
+def trim_history(history, system_message, budget):
+    """
+    Drop the OLDEST turns first (never the newest instruction) until the prompt
+    fits the budget. The count is recomputed every iteration.
+    """
+    while history and get_number_of_tokens([system_message] + history) > budget:
+        history.pop(0)
+        # keep user/assistant alternation sane: never start with an answer
+        if history and history[0].get("role") == "assistant":
+            history.pop(0)
+    while len(history) > MAX_TURNS * 2:
+        history.pop(0)
+
+
+@app.route("/ask_gpt", methods=["POST"])
+def ask_gpt():
+    user_text = (request.form.get("text") or "").strip()
+    if not user_text:
+        return "Please enter a message.", 400
+
+    sid = session.get("sid")
+    if not sid:
+        sid = str(uuid.uuid4())
+        session["sid"] = sid
+
+    with _histories_lock:
+        history = chat_histories.setdefault(sid, [])
+
+        # Let the user actually abandon the old task.
+        if user_text.lower() in ("/reset", "/clear", "reset", "clear", "stop"):
+            history.clear()
+            return "Conversation cleared."
+
+        system_message = {"role": "system", "content": SYSTEM_PROMPT}
+        history.append({"role": "user", "content": user_text})
+        trim_history(history, system_message, MAX_PROMPT_TOKENS)
+
+        prompt = [system_message] + list(history)
+
+        try:
+            ai_msg = llm.invoke(prompt)
+        except Exception as exc:
+            # never keep a turn that got no answer
+            history.pop()
+            return f"Model error: {exc}", 502
+
+        answer = ai_msg.content
+        if not isinstance(answer, str):
+            answer = str(answer)
+
+        history.append({"role": "assistant", "content": answer})
+
+    return answer
+
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    sid = session.get("sid")
+    if sid:
+        with _histories_lock:
+            chat_histories.pop(sid, None)
+    return "Conversation cleared."
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 21:10:37
+Duration: 156.95 seconds
+Verdict: ## Evaluation
+
+### 1. Diff review — the logic fixes are sound
+The fixed code correctly diagnoses the real bugs in the buggy version:
+
+- **Broken trimming loop**: `while number_of_tokens >= MODEL_MAX_TOKENS: del(messages[1])` never recomputed the token count (infinite loop / `IndexError`) **and** always deleted index 1, i.e. it could never remove index 0 (the original instruction). The fix recomputes tokens on every iteration and pops the oldest turn, keeping the newest instruction — correct.
+- **Bare tuples instead of messages**: `("user", text)` is not valid LangChain message input; the fix uses `{"role": ..., "content": ...}` dicts plus an explicit `system` message — correct, and `ChatOllama.invoke` accepts dict/dict-list input.
+- **Generation limits** (`num_ctx`, `num_predict`, `stop`, lower temperature) — reasonable, and `ChatOllama` accepts these as model kwargs.
+- Token counting helper is refactored sensibly (encoding cached, fallback preserved).
+
+`validate_fixed_code` reports ACCEPT, and the API usages (`ChatOllama`, `.invoke`, `flask.session` with `secret_key`) are valid.
+
+### 2. Fatal problem: the fix breaks the test contract
+The test module does:
+
+```python
+from run_fixed import app, messages
+...
+messages.clear()                      # setUp
+...
+self.assertGreaterEqual(len(messages), len(conversation))
+```
+
+The fixed code **deletes the module-level `messages` list** entirely and replaces it with a per-session dict:
+
+```python
+-messages = []
++chat_histories = {}          # session_id -> history
+```
+
+There is no other `messages` binding anywhere in the fixed file. Consequences:
+
+1. `from run_fixed import app, messages` raises `ImportError: cannot import name 'messages'` — the whole test class fails to even load.
+2. Even if the name existed, the endpoint appends to `chat_histories[sid]`, never to a global `messages`, so `messages.clear()` would be a no-op and `len(messages) >= 5` would fail.
+3. The history the test wants to observe is keyed by a **Flask session id**, which the test client generates per request context; the test has no way to introspect `chat_histories` (it isn't imported and isn't keyed deterministically).
+
+So the fixed code is functionally cleaner in isolation but is **structurally incompatible with the provided test suite**. It also silently changes the endpoint contract (e.g. `"stop"`, `"reset"`, `"clear"` short-circuit and return `"Conversation cleared."` without appending a turn, which would further break any turn-counting assertion), and adds a `/reset` route not used by the test.
+
+### 3. Additional risk
+The fix requires a valid Ollama server + the `llama3.2` model for every turn; the buggy version did too, so this isn't new, but the 502 error path plus the `session` cookie requirement mean a failure mode that silently produces `"Model error: ..."` responses rather than the model's answer.
+
+## Verdict
+
+**REJECT**
+
+The reasoning about the original bugs is excellent and the internal logic is an improvement, but the fixed file removes the module-level `messages` list that the test imports and asserts against (`from run_fixed import app, messages`, `messages.clear()`, `len(messages) >= len(conversation)`). The test cannot even import the module, so the fix does not satisfy the case's expected behavior. A correct fix must retain a module-level `messages` history (or an equivalent, test-visible list) that grows with each `/ask_gpt` call while still fixing the recompute-and-trim-oldest loop.
+--------------------------------------------------------------------------------
+"""
+Flask + Ollama chat endpoint (fixed).
+
+Why the model kept "sticking" to the first prompt:
+
+1. `messages` was a *module-level* global list shared by every request/visitor.
+   Nothing ever cleared it, so the very first prompt stayed in the context
+   forever and, because a chat model weights the whole conversation, that old
+   instruction (and the accumulated history) kept dominating every new turn.
+   The CLI has no such history - each `ollama run` starts clean - that's why the
+   CLI obeyed the "stop" instruction while the web app did not.
+
+2. The trimming loop was broken:
+       while number_of_tokens >= MODEL_MAX_TOKENS:
+           del messages[1]
+   `number_of_tokens` is never recomputed (infinite loop / IndexError), and it
+   always deletes index 1 -> index 0 (the FIRST prompt) is the one entry that is
+   *never* removed. So even under pressure the oldest instruction was kept.
+
+3. Messages were passed as bare tuples `("user", text)`; LangChain expects
+   proper message objects/dicts with role + content, and no system message was
+   ever sent to define the behaviour / stop rule.
+
+4. No generation limits: `temperature=1.1` and no `num_predict`/`stop` meant the
+   model was free to ramble and re-run the original task instead of stopping.
+   `MODEL_MAX_TOKENS = 128000` also is not the window actually used for the call.
+
+What is done instead:
+   * per-session history (keyed by a session id, plus a /reset endpoint),
+   * explicit system prompt that says "follow the latest instruction, stop when
+     asked to stop",
+   * correct role/content dicts,
+   * oldest turns trimmed first (the newest instruction is always kept) with the
+     token count recomputed on every iteration,
+   * explicit num_ctx / num_predict / stop + lower temperature so the answer
+     terminates where you expect.
+"""
+
+from flask import Flask, render_template, request, session
+
+from langchain_ollama import ChatOllama
+
+import threading
+import uuid
+
+import tiktoken
+
+app = Flask(__name__)
+# Needed for `session` (per-browser conversation is kept apart).
+app.secret_key = "change-me-to-a-random-secret"
+
+MODEL = "llama3.2"
+
+# Context actually requested from Ollama for each call.
+NUM_CTX = 8192
+# Budget for the prompt we send (system prompt + history + new question).
+# Must stay well below NUM_CTX so the reply always fits.
+MAX_PROMPT_TOKENS = 3000
+# Hard cap on the answer length: this is what makes "stop" actually stop.
+NUM_PREDICT = 512
+# Max number of turns kept per conversation (extra safety on top of tokens).
+MAX_TURNS = 12
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant in a multi-turn chat. "
+    "Always follow the MOST RECENT user instruction; earlier messages are only "
+    "context and must not be repeated. "
+    "If the user asks you to stop, stop immediately and reply with one short "
+    "acknowledgement, nothing else. "
+    "Answer concisely."
+)
+
+llm = ChatOllama(
+    model=MODEL,
+    temperature=0.2,
+    num_ctx=NUM_CTX,
+    num_predict=NUM_PREDICT,
+    stop=["\nuser:", "\nUser:", "\nHuman:"],
+)
+
+# session_id -> list[{"role": "user"|"assistant", "content": str}]
+chat_histories = {}
+_histories_lock = threading.Lock()
+
+try:
+    _encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+except Exception:  # tiktoken needs network/extra deps sometimes
+    _encoding = None
+
+
+def get_number_of_tokens(msgs):
+    """Token count of a list of {"role": ..., "content": ...} dicts."""
+    if _encoding is None:
+        return sum(len(m.get("content", "")) for m in msgs) // 4
+    return sum(len(_encoding.encode(m.get("content", ""))) for m in msgs)
+
+
+def trim_history(history, system_message, budget):
+    """
+    Drop the OLDEST turns first (never the newest instruction) until the prompt
+    fits the budget. The count is recomputed every iteration.
+    """
+    while history and get_number_of_tokens([system_message] + history) > budget:
+        history.pop(0)
+        # keep user/assistant alternation sane: never start with an answer
+        if history and history[0].get("role") == "assistant":
+            history.pop(0)
+    while len(history) > MAX_TURNS * 2:
+        history.pop(0)
+
+
+@app.route("/ask_gpt", methods=["POST"])
+def ask_gpt():
+    user_text = (request.form.get("text") or "").strip()
+    if not user_text:
+        return "Please enter a message.", 400
+
+    sid = session.get("sid")
+    if not sid:
+        sid = str(uuid.uuid4())
+        session["sid"] = sid
+
+    with _histories_lock:
+        history = chat_histories.setdefault(sid, [])
+
+        # Let the user actually abandon the old task.
+        if user_text.lower() in ("/reset", "/clear", "reset", "clear", "stop"):
+            history.clear()
+            return "Conversation cleared."
+
+        system_message = {"role": "system", "content": SYSTEM_PROMPT}
+        history.append({"role": "user", "content": user_text})
+        trim_history(history, system_message, MAX_PROMPT_TOKENS)
+
+        prompt = [system_message] + list(history)
+
+        try:
+            ai_msg = llm.invoke(prompt)
+        except Exception as exc:
+            # never keep a turn that got no answer
+            history.pop()
+            return f"Model error: {exc}", 502
+
+        answer = ai_msg.content
+        if not isinstance(answer, str):
+            answer = str(answer)
+
+        history.append({"role": "assistant", "content": answer})
+
+    return answer
+
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    sid = session.get("sid")
+    if sid:
+        with _histories_lock:
+            chat_histories.pop(sid, None)
+    return "Conversation cleared."
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,1032 @@
+Case ID: evoninja_504
+Status: FAILED
+Final Attempt: 3
+Start Time: 2026-11-11 10:50:56
+End Time: 2026-11-11 11:16:52
+Total Duration: 1555.35 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import type { NextApiRequest, NextApiResponse } from "next";
+import OpenAIApi from "openai";
+import { authOptions } from "../auth/[...nextauth]";
+import { getServerSession } from "next-auth";
+import { isGoalValid } from "../../../api-utils/goal";
+import { canUseSubsidy } from "../../../api-utils/subsidy";
+import { createSupabaseClient } from "../../../api-utils/supabase";
+import { createOpenAIApiClient } from "../../../api-utils/openai";
+
+// Requests coming from the browser contain every chunk of every scraped page,
+// so a single goal easily produces several megabytes of text. Next.js only
+// accepts 1MB per API route by default and rejects anything bigger with a
+// "Body exceeds maximum size" (413) error, so raise the limit for this route.
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "25mb",
+    },
+  },
+};
+
+// The embeddings endpoint accepts at most 2048 inputs and ~300k tokens per
+// request, and it rejects request bodies that are over the maximum size. Since
+// web scraping + chunking regularly produces more than that, the inputs are
+// batched (and oversized chunks are split) before they are forwarded to OpenAI.
+const MAX_INPUTS_PER_REQUEST = 256;
+const MAX_CHARS_PER_REQUEST = 100_000;
+const MAX_CHARS_PER_INPUT = 20_000;
+const MAX_CONCURRENT_REQUESTS = 4;
+
+type EmbeddingResult = { embedding: number[]; input: string };
+
+type Job = { groupIndex: number; pieceIndex: number; text: string };
+
+// The proxy accepts a list of chunk groups (`string[][]`), but it also tolerates
+// a flat list of strings, so both shapes end up as a flat list of chunks.
+function normalizeInput(rawInput: unknown): string[] {
+  if (!Array.isArray(rawInput)) {
+    return [];
+  }
+  return rawInput
+    .flatMap((entry) => (Array.isArray(entry) ? entry : [entry]))
+    .map((entry) => (typeof entry === "string" ? entry : String(entry ?? "")));
+}
+
+// A single chunk that is bigger than the per-input limit is embedded in pieces
+// and the resulting embeddings are averaged back together.
+function splitText(text: string): string[] {
+  const value = text.length > 0 ? text : " ";
+  if (value.length <= MAX_CHARS_PER_INPUT) {
+    return [value];
+  }
+  const pieces: string[] = [];
+  for (let i = 0; i < value.length; i += MAX_CHARS_PER_INPUT) {
+    pieces.push(value.slice(i, i + MAX_CHARS_PER_INPUT));
+  }
+  return pieces;
+}
+
+function averageEmbeddings(embeddings: number[][]): number[] {
+  const dimensions = embeddings[0].length;
+  const summed = new Array<number>(dimensions).fill(0);
+  for (const embedding of embeddings) {
+    for (let i = 0; i < dimensions; i++) {
+      summed[i] += embedding[i];
+    }
+  }
+  return summed.map((value) => value / embeddings.length);
+}
+
+function isBodyTooLargeError(e: any): boolean {
+  if (!(e instanceof OpenAIApi.APIError)) {
+    return false;
+  }
+  if (e.status === 413) {
+    return true;
+  }
+  if (e.status !== 400 && e.status !== 422) {
+    return false;
+  }
+  const message = String(e.message ?? "").toLowerCase();
+  return (
+    message.includes("maximum size") ||
+    message.includes("too large") ||
+    message.includes("too many tokens") ||
+    message.includes("exceeds")
+  );
+}
+
+// Sends `texts` to the embeddings endpoint and returns the embeddings in the
+// same order as the given texts. If the request is still too big for the API
+// (too many inputs/tokens or a body that exceeds the maximum size), the work is
+// split up and retried instead of failing the whole goal.
+async function createBatchEmbeddings(
+  openai: OpenAIApi,
+  model: string,
+  texts: string[]
+): Promise<number[][]> {
+  if (texts.length === 0) {
+    return [];
+  }
+
+  try {
+    const { data } = await openai.embeddings.create({
+      model,
+      input: texts,
+    });
+
+    const embeddings = new Array<number[]>(texts.length);
+    data.forEach((innerData) => {
+      embeddings[innerData.index] = innerData.embedding;
+    });
+    return embeddings;
+  } catch (e: any) {
+    if (isBodyTooLargeError(e) && texts.length > 1) {
+      const middle = Math.ceil(texts.length / 2);
+      const [left, right] = await Promise.all([
+        createBatchEmbeddings(openai, model, texts.slice(0, middle)),
+        createBatchEmbeddings(openai, model, texts.slice(middle)),
+      ]);
+      return [...left, ...right];
+    }
+    if (isBodyTooLargeError(e) && texts.length === 1 && texts[0].length > 1) {
+      const text = texts[0];
+      const middle = Math.ceil(text.length / 2);
+      const [left, right] = await Promise.all([
+        createBatchEmbeddings(openai, model, [text.slice(0, middle)]),
+        createBatchEmbeddings(openai, model, [text.slice(middle)]),
+      ]);
+      return [averageEmbeddings([left[0], right[0]])];
+    }
+    throw e;
+  }
+}
+
+async function createEmbeddings(
+  openai: OpenAIApi,
+  model: string,
+  inputs: string[]
+): Promise<EmbeddingResult[]> {
+  // Split every input into the pieces that actually get embedded. Usually there
+  // is exactly one piece per input; only oversized chunks are split up.
+  const groups = inputs.map((input) => ({
+    input,
+    pieces: splitText(input),
+  }));
+
+  const jobs: Job[] = [];
+  groups.forEach((group, groupIndex) => {
+    group.pieces.forEach((text, pieceIndex) => {
+      jobs.push({ groupIndex, pieceIndex, text });
+    });
+  });
+
+  // Batch the work so that every call to OpenAI stays within its limits.
+  const requests: Job[][] = [];
+  let currentRequest: Job[] = [];
+  let currentChars = 0;
+  for (const job of jobs) {
+    if (
+      currentRequest.length > 0 &&
+      (currentRequest.length >= MAX_INPUTS_PER_REQUEST ||
+        currentChars + job.text.length > MAX_CHARS_PER_REQUEST)
+    ) {
+      requests.push(currentRequest);
+      currentRequest = [];
+      currentChars = 0;
+    }
+    currentRequest.push(job);
+    currentChars += job.text.length;
+  }
+  if (currentRequest.length > 0) {
+    requests.push(currentRequest);
+  }
+
+  const embeddingsByGroup: number[][][] = groups.map((group) =>
+    new Array<number[]>(group.pieces.length).fill([])
+  );
+
+  let nextRequest = 0;
+  const worker = async (): Promise<void> => {
+    while (nextRequest < requests.length) {
+      const request = requests[nextRequest++];
+      const embeddings = await createBatchEmbeddings(
+        openai,
+        model,
+        request.map((job) => job.text)
+      );
+      request.forEach((job, index) => {
+        embeddingsByGroup[job.groupIndex][job.pieceIndex] = embeddings[index];
+      });
+    }
+  };
+
+  const workers = Array.from(
+    { length: Math.min(MAX_CONCURRENT_REQUESTS, requests.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+
+  return groups.map((group, groupIndex): EmbeddingResult => {
+    const embeddings = embeddingsByGroup[groupIndex];
+    return {
+      embedding:
+        embeddings.length === 1 ? embeddings[0] : averageEmbeddings(embeddings),
+      input: group.input,
+    };
+  });
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<void> {
+  if (!(req.method === "POST")) {
+    return res.status(404).send({});
+  }
+  const goalId = req.body?.goalId;
+  const model = req.body?.model;
+  const input = normalizeInput(req.body?.input);
+
+  // Ensure the user is logged in
+  const session = await getServerSession(req, res, authOptions);
+  const email = session?.user?.email;
+  if (!session || !email) {
+    return res.status(401).send({});
+  }
+
+  if (!model || typeof model !== "string" || input.length === 0) {
+    return res.status(400).send({});
+  }
+
+  const supabase = createSupabaseClient();
+  const openai = createOpenAIApiClient();
+
+  // Ensure the goal is being tracked, and we're able to continue
+  // subsidizing the goal's llm requests
+  const isValid = await isGoalValid(goalId, supabase);
+  if (!isValid) {
+    return res.status(403).send({});
+  }
+  const canSubsidize = await canUseSubsidy("embedding", goalId, supabase);
+  if (!canSubsidize) {
+    return res.status(403).send({});
+  }
+
+  try {
+    const embeddings = await createEmbeddings(openai, model, input);
+    return res.status(200).json({ embeddings });
+  } catch (e: any) {
+    // Rate limit error
+    if (e instanceof OpenAIApi.APIError && e.status === 429) {
+      return res.status(429).send({});
+    }
+    // The inputs are still too big to be embedded, even after batching
+    if (e instanceof OpenAIApi.APIError && isBodyTooLargeError(e)) {
+      return res.status(413).send({});
+    }
+    return res.status(500).send({});
+  }
+}
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-11 11:01:15
+Duration: 618.88 seconds
+Verdict: ## Review
+
+### 1. Diff summary
+The fixed code changes **`apps/browser/pages/api/proxy/embeddings.ts`** only:
+- Adds an `export const config = { api: { bodyParser: { sizeLimit: "32mb" } } }` block.
+- Adds input validation early in the handler (`Array.isArray` guards → 400).
+- Batches each group of inputs into chunks of `MAX_EMBEDDING_BATCH_SIZE = 512` before calling `openai.embeddings.create`, accumulating results with `batch[innerData.index]`.
+- Removes trailing blank lines.
+
+### 2. Test expectations vs. what was fixed — **mismatch**
+The test does **not** look at `pages/api/proxy/embeddings.ts` at all. It:
+- Searches only for `apps/browser/src/api/ProxyEmbeddingApi.ts` (exits with code 1 if not found).
+- Requires the regex `/modelConfig\s*:\s*\{[^}]*maxTokensPerInput[^}]*maxInputsPerRequest[^}]*\}/s` to match in that file.
+
+The diff touches neither that file nor introduces a `modelConfig` object, and certainly not `maxTokensPerInput` / `maxInputsPerRequest` fields anywhere. Consequently:
+- For `VERSION=buggy`, the test passes trivially (bug "reproduced").
+- For `VERSION=fixed`, `hasModelConfigFix` is still `false` → prints "❌ FIX NOT VERIFIED" and exits 1.
+
+So the submitted change cannot satisfy the verification for the fixed version — it fixes a *different* (plausible but unrelated) problem (Next.js 1 MB body-parser limit + per-request batching) rather than the one under test (missing per-model token/input configuration in `ProxyEmbeddingApi.ts`).
+
+### 3. Structural validation
+`validate_fixed_code` returned a soft pass only in the sense that the single file was present with full text; it explicitly reported **"no parser available here for TypeScript; no required interface checked"** — i.e. no meaningful structural/inter­face confirmation was performed. This is not evidence in favor of the fix.
+
+### 4. API-usage verification
+Attempted verification of `openai.embeddings.create` and the Next.js `config.api.bodyParser.sizeLimit` convention returned only generic/unrelated web hits (OpenAI corp pages, "Next plc" retail pages), so no confirming documentation was obtained. From my own knowledge:
+- `export const config = { api: { bodyParser: { sizeLimit } } }` is valid for Next.js **Pages Router** API routes — this part is technically correct in isolation.
+- `openai.embeddings.create({ model, input })` accepting a string array, with `data[].index` being the index **within the request's input array**, is correct — and the fix correctly indexes into `batch` (not the original `inputs`), which is a real bug-avoidance detail.
+- Batching by **count alone** (512) does not enforce the endpoint's per-request token budget or per-input token limit; the nominally correct fix (explicit `maxTokensPerInput` / `maxInputsPerRequest` model config, as the test demands) would address exactly that. So even the substantive improvement is incomplete/inconsistent with the intended solution.
+- The 429 branch still relies on `e instanceof OpenAIApi.APIError` with a default `import OpenAIApi from "openai"` — unchanged and unverified, but not introduced by this diff.
+
+### Conclusion
+The diff is a reasonable but orthogonal change (body-size limit + naive batching) applied to the wrong file relative to the test, and it does not introduce the `modelConfig` with `maxTokensPerInput`/`maxInputsPerRequest` that the verification requires. The fixed version of this case would fail its own test.
+
+**REJECT**
+--------------------------------------------------------------------------------
+### apps/browser/pages/api/proxy/embeddings.ts
+import type { NextApiRequest, NextApiResponse } from "next";
+import OpenAIApi from "openai";
+import { authOptions } from "../auth/[...nextauth]";
+import { getServerSession } from "next-auth";
+import { isGoalValid } from "../../../api-utils/goal";
+import { canUseSubsidy } from "../../../api-utils/subsidy";
+import { createSupabaseClient } from "../../../api-utils/supabase";
+import { createOpenAIApiClient } from "../../../api-utils/openai";
+
+// Next.js API routes parse the request body with the built-in body parser,
+// which rejects payloads larger than 1mb by default ("Body exceeded 1mb limit"
+// / "Body exceeds maximum size"). Prompts that require a lot of web scraping
+// produce many chunks that are all sent here at once, so the default limit has
+// to be raised for this route (otherwise the request fails before the handler
+// is even invoked).
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "32mb",
+    },
+  },
+};
+
+// OpenAI's embeddings endpoint accepts at most 2048 inputs per request and has
+// a hard per-request token budget, so large chunk arrays are sent in batches.
+const MAX_EMBEDDING_BATCH_SIZE = 512;
+
+type EmbeddedInput = {
+  embedding: number[];
+  input: string;
+};
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<void> {
+  if (!(req.method === "POST")) {
+    return res.status(404).send({});
+  }
+  const goalId = req.body.goalId;
+
+  // Ensure the user is logged in
+  const session = await getServerSession(req, res, authOptions);
+  const email = session?.user?.email;
+  if (!session || !email) {
+    return res.status(401).send({});
+  }
+
+  const input: string[][] = req.body.input;
+  if (!Array.isArray(input) || input.some((inputs) => !Array.isArray(inputs))) {
+    return res.status(400).send({});
+  }
+
+  const supabase = createSupabaseClient();
+  const openai = createOpenAIApiClient();
+
+  // Ensure the goal is being tracked, and we're able to continue
+  // subsidizing the goal's llm requests
+  const isValid = await isGoalValid(goalId, supabase);
+  if (!isValid) {
+    return res.status(403).send({});
+  }
+  const canSubsidize = await canUseSubsidy("embedding", goalId, supabase);
+  if (!canSubsidize) {
+    return res.status(403).send({});
+  }
+
+  try {
+    const embeddings = await Promise.all(
+      input.map(async (inputs) => {
+        const results: EmbeddedInput[] = [];
+
+        // Split each chunk group into batches so a single request never
+        // exceeds the embeddings API limits.
+        for (let i = 0; i < inputs.length; i += MAX_EMBEDDING_BATCH_SIZE) {
+          const batch = inputs.slice(i, i + MAX_EMBEDDING_BATCH_SIZE);
+
+          const { data } = await openai.embeddings.create({
+            model: req.body.model,
+            input: batch,
+          });
+
+          data.forEach((innerData) => {
+            results.push({
+              embedding: innerData.embedding,
+              input: batch[innerData.index],
+            });
+          });
+        }
+
+        return results;
+      })
+    );
+    return res.status(200).json({ embeddings: embeddings.flat() });
+  } catch (e: any) {
+    // Rate limit error
+    if (e instanceof OpenAIApi.APIError && e.status === 429) {
+      return res.status(429).send({});
+    }
+    return res.status(500).send({});
+  }
+}
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-11 11:12:46
+Duration: 691.13 seconds
+Verdict: ## Evaluation: **REJECT**
+
+### 1. Structural validation fails
+`validate_fixed_code` returned:
+> REJECT — the line `### apps/browser/pages/api/proxy/embeddings.ts` appears 0 times, expected once
+
+The diff shows the fixed file **deleted the required file-path header line** (`### apps/browser/pages/api/proxy/embeddings.ts`) that the original buggy file had. The fixed artifact therefore doesn't match the expected output format, which alone is disqualifying.
+
+### 2. The fix does not satisfy the test at all
+The test does two things:
+
+**a) Locates the file to inspect** — it only searches:
+```js
+const possiblePaths = ['apps/browser/src/api/ProxyEmbeddingApi.ts'];
+```
+The diff touches only `apps/browser/pages/api/proxy/embeddings.ts`. There is **no `apps/browser/src/api/ProxyEmbeddingApi.ts`** in the fixed output, so the test logs `❌ Could not find embedding API file.` and `process.exit(1)` — an immediate failure for both the buggy and fixed runs.
+
+**b) Checks for a specific `modelConfig` shape**:
+```js
+/modelConfig\s*:\s*\{[^}]*maxTokensPerInput[^}]*maxInputsPerRequest[^}]*\}/s
+```
+The fixed code contains **none** of the tokens `modelConfig`, `maxTokensPerInput`, or `maxInputsPerRequest`. Instead it hardcodes module-level constants (`MAX_INPUTS_PER_REQUEST`, `MAX_CHARS_PER_REQUEST`, `MAX_CHARS_PER_INPUT`). Even if this were the right file, `hasModelConfigFix` would be `false` and the fixed run would print `❌ FIX NOT VERIFIED`.
+
+So the patch solves the problem in a completely different (and untested) shape: the expected fix is to declare per-model limits in a `modelConfig` object keyed by `maxTokensPerInput` / `maxInputsPerRequest`, not to invent ad-hoc global constants.
+
+### 3. Code-level concerns (secondary, but real)
+Even judging the patch on its own merits rather than against the test:
+
+- **Silent semantic change in the response contract.** The original accepted `string[][]` groups and returned results grouped per request; the new `normalizeInput` flattens everything, tolerates non-arrays, and coerces arbitrary values via `String(entry ?? "")`. Input validation moved to a `400`, and empty/blank chunks are coerced to `" "` instead of being rejected — different behavior from the documented `string[][]` contract.
+- **`new Array<number[]>(group.pieces.length).fill([])`** fills every slot with the *same* array reference. It happens to be harmless because slots are overwritten by index, but it is a latent shared-mutable-state bug and a code smell.
+- **`averageEmbeddings`** does a plain arithmetic mean with no re-normalization. For `text-embedding-3-*` the API returns unit-length vectors; averaging pieces yields a non-normalized vector, so similarity results downstream will drift. Also it throws if `embeddings[0]` is missing/empty.
+- **Unbounded recursion / duplicate work.** `createBatchEmbeddings` retries by halving on 413/400/422 and matches on loose message substrings (`"exceeds"`, `"too large"`). Since the top-level `createEmbeddings` already pre-splits to `MAX_CHARS_PER_INPUT`, the single-text halving branch only fires for genuinely oversized bodies and relies on substring sniffing of error messages — brittle, and it can multiply the number of API calls (and thus cost) dramatically before failing.
+- **`isBodyTooLargeError` on the outer handler** maps a 400 into a **413** response. The client can't distinguish "your payload is too large" from "OpenAI called us bad names on status 400", and any 400 whose message merely contains "exceeds" (e.g. a quota/param error) gets reported as 413.
+- `verify_api_usage` returned only generic marketing pages for both `openai.embeddings.create` and `openai.APIError` (no documentation surfaced), so the `e instanceof OpenAIApi.APIError` guard and `status`/`index` field assumptions could not be independently confirmed — though they are unchanged from the original code and therefore not a regression.
+
+### Summary
+The patch is functionally a plausible attempt at the underlying symptom (oversized embedding requests), but it targets the wrong file, uses the wrong abstraction (constants instead of a `modelConfig` with `maxTokensPerInput`/`maxInputsPerRequest`), and drops a required header line so the output format check fails. The provided test would exit `1` on this fixed code.
+
+**Verdict: REJECT**
+--------------------------------------------------------------------------------
+import type { NextApiRequest, NextApiResponse } from "next";
+import OpenAIApi from "openai";
+import { authOptions } from "../auth/[...nextauth]";
+import { getServerSession } from "next-auth";
+import { isGoalValid } from "../../../api-utils/goal";
+import { canUseSubsidy } from "../../../api-utils/subsidy";
+import { createSupabaseClient } from "../../../api-utils/supabase";
+import { createOpenAIApiClient } from "../../../api-utils/openai";
+
+// Requests coming from the browser contain every chunk of every scraped page,
+// so a single goal easily produces several megabytes of text. Next.js only
+// accepts 1MB per API route by default and rejects anything bigger with a
+// "Body exceeds maximum size" (413) error, so raise the limit for this route.
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "25mb",
+    },
+  },
+};
+
+// The embeddings endpoint accepts at most 2048 inputs and ~300k tokens per
+// request, and it rejects request bodies that are over the maximum size. Since
+// web scraping + chunking regularly produces more than that, the inputs are
+// batched (and oversized chunks are split) before they are forwarded to OpenAI.
+const MAX_INPUTS_PER_REQUEST = 256;
+const MAX_CHARS_PER_REQUEST = 100_000;
+const MAX_CHARS_PER_INPUT = 20_000;
+const MAX_CONCURRENT_REQUESTS = 4;
+
+type EmbeddingResult = { embedding: number[]; input: string };
+
+type Job = { groupIndex: number; pieceIndex: number; text: string };
+
+// The proxy accepts a list of chunk groups (`string[][]`), but it also tolerates
+// a flat list of strings, so both shapes end up as a flat list of chunks.
+function normalizeInput(rawInput: unknown): string[] {
+  if (!Array.isArray(rawInput)) {
+    return [];
+  }
+  return rawInput
+    .flatMap((entry) => (Array.isArray(entry) ? entry : [entry]))
+    .map((entry) => (typeof entry === "string" ? entry : String(entry ?? "")));
+}
+
+// A single chunk that is bigger than the per-input limit is embedded in pieces
+// and the resulting embeddings are averaged back together.
+function splitText(text: string): string[] {
+  const value = text.length > 0 ? text : " ";
+  if (value.length <= MAX_CHARS_PER_INPUT) {
+    return [value];
+  }
+  const pieces: string[] = [];
+  for (let i = 0; i < value.length; i += MAX_CHARS_PER_INPUT) {
+    pieces.push(value.slice(i, i + MAX_CHARS_PER_INPUT));
+  }
+  return pieces;
+}
+
+function averageEmbeddings(embeddings: number[][]): number[] {
+  const dimensions = embeddings[0].length;
+  const summed = new Array<number>(dimensions).fill(0);
+  for (const embedding of embeddings) {
+    for (let i = 0; i < dimensions; i++) {
+      summed[i] += embedding[i];
+    }
+  }
+  return summed.map((value) => value / embeddings.length);
+}
+
+function isBodyTooLargeError(e: any): boolean {
+  if (!(e instanceof OpenAIApi.APIError)) {
+    return false;
+  }
+  if (e.status === 413) {
+    return true;
+  }
+  if (e.status !== 400 && e.status !== 422) {
+    return false;
+  }
+  const message = String(e.message ?? "").toLowerCase();
+  return (
+    message.includes("maximum size") ||
+    message.includes("too large") ||
+    message.includes("too many tokens") ||
+    message.includes("exceeds")
+  );
+}
+
+// Sends `texts` to the embeddings endpoint and returns the embeddings in the
+// same order as the given texts. If the request is still too big for the API
+// (too many inputs/tokens or a body that exceeds the maximum size), the work is
+// split up and retried instead of failing the whole goal.
+async function createBatchEmbeddings(
+  openai: OpenAIApi,
+  model: string,
+  texts: string[]
+): Promise<number[][]> {
+  if (texts.length === 0) {
+    return [];
+  }
+
+  try {
+    const { data } = await openai.embeddings.create({
+      model,
+      input: texts,
+    });
+
+    const embeddings = new Array<number[]>(texts.length);
+    data.forEach((innerData) => {
+      embeddings[innerData.index] = innerData.embedding;
+    });
+    return embeddings;
+  } catch (e: any) {
+    if (isBodyTooLargeError(e) && texts.length > 1) {
+      const middle = Math.ceil(texts.length / 2);
+      const [left, right] = await Promise.all([
+        createBatchEmbeddings(openai, model, texts.slice(0, middle)),
+        createBatchEmbeddings(openai, model, texts.slice(middle)),
+      ]);
+      return [...left, ...right];
+    }
+    if (isBodyTooLargeError(e) && texts.length === 1 && texts[0].length > 1) {
+      const text = texts[0];
+      const middle = Math.ceil(text.length / 2);
+      const [left, right] = await Promise.all([
+        createBatchEmbeddings(openai, model, [text.slice(0, middle)]),
+        createBatchEmbeddings(openai, model, [text.slice(middle)]),
+      ]);
+      return [averageEmbeddings([left[0], right[0]])];
+    }
+    throw e;
+  }
+}
+
+async function createEmbeddings(
+  openai: OpenAIApi,
+  model: string,
+  inputs: string[]
+): Promise<EmbeddingResult[]> {
+  // Split every input into the pieces that actually get embedded. Usually there
+  // is exactly one piece per input; only oversized chunks are split up.
+  const groups = inputs.map((input) => ({
+    input,
+    pieces: splitText(input),
+  }));
+
+  const jobs: Job[] = [];
+  groups.forEach((group, groupIndex) => {
+    group.pieces.forEach((text, pieceIndex) => {
+      jobs.push({ groupIndex, pieceIndex, text });
+    });
+  });
+
+  // Batch the work so that every call to OpenAI stays within its limits.
+  const requests: Job[][] = [];
+  let currentRequest: Job[] = [];
+  let currentChars = 0;
+  for (const job of jobs) {
+    if (
+      currentRequest.length > 0 &&
+      (currentRequest.length >= MAX_INPUTS_PER_REQUEST ||
+        currentChars + job.text.length > MAX_CHARS_PER_REQUEST)
+    ) {
+      requests.push(currentRequest);
+      currentRequest = [];
+      currentChars = 0;
+    }
+    currentRequest.push(job);
+    currentChars += job.text.length;
+  }
+  if (currentRequest.length > 0) {
+    requests.push(currentRequest);
+  }
+
+  const embeddingsByGroup: number[][][] = groups.map((group) =>
+    new Array<number[]>(group.pieces.length).fill([])
+  );
+
+  let nextRequest = 0;
+  const worker = async (): Promise<void> => {
+    while (nextRequest < requests.length) {
+      const request = requests[nextRequest++];
+      const embeddings = await createBatchEmbeddings(
+        openai,
+        model,
+        request.map((job) => job.text)
+      );
+      request.forEach((job, index) => {
+        embeddingsByGroup[job.groupIndex][job.pieceIndex] = embeddings[index];
+      });
+    }
+  };
+
+  const workers = Array.from(
+    { length: Math.min(MAX_CONCURRENT_REQUESTS, requests.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+
+  return groups.map((group, groupIndex): EmbeddingResult => {
+    const embeddings = embeddingsByGroup[groupIndex];
+    return {
+      embedding:
+        embeddings.length === 1 ? embeddings[0] : averageEmbeddings(embeddings),
+      input: group.input,
+    };
+  });
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<void> {
+  if (!(req.method === "POST")) {
+    return res.status(404).send({});
+  }
+  const goalId = req.body?.goalId;
+  const model = req.body?.model;
+  const input = normalizeInput(req.body?.input);
+
+  // Ensure the user is logged in
+  const session = await getServerSession(req, res, authOptions);
+  const email = session?.user?.email;
+  if (!session || !email) {
+    return res.status(401).send({});
+  }
+
+  if (!model || typeof model !== "string" || input.length === 0) {
+    return res.status(400).send({});
+  }
+
+  const supabase = createSupabaseClient();
+  const openai = createOpenAIApiClient();
+
+  // Ensure the goal is being tracked, and we're able to continue
+  // subsidizing the goal's llm requests
+  const isValid = await isGoalValid(goalId, supabase);
+  if (!isValid) {
+    return res.status(403).send({});
+  }
+  const canSubsidize = await canUseSubsidy("embedding", goalId, supabase);
+  if (!canSubsidize) {
+    return res.status(403).send({});
+  }
+
+  try {
+    const embeddings = await createEmbeddings(openai, model, input);
+    return res.status(200).json({ embeddings });
+  } catch (e: any) {
+    // Rate limit error
+    if (e instanceof OpenAIApi.APIError && e.status === 429) {
+      return res.status(429).send({});
+    }
+    // The inputs are still too big to be embedded, even after batching
+    if (e instanceof OpenAIApi.APIError && isBodyTooLargeError(e)) {
+      return res.status(413).send({});
+    }
+    return res.status(500).send({});
+  }
+}
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-11 11:16:52
+Duration: 245.33 seconds
+Verdict: ## REJECT
+
+### 1. Automated structural validation failed
+`validate_fixed_code` returned:
+
+> `REJECT the line ### apps/browser/pages/api/proxy/embeddings.ts appears 0 times, expected once`
+
+The diff confirms this: the very first line of the original file, the path header `### apps/browser/pages/api/proxy/embeddings.ts`, was **deleted** (the diff opens with `-### apps/browser/pages/api/proxy/embeddings.ts` and no replacement). This violates the required output format and alone is disqualifying.
+
+### 2. The fix does not satisfy the test at all
+The test does two things:
+
+- Locates the file at `apps/browser/src/api/ProxyEmbeddingApi.ts` (only one candidate path; if missing → `exit(1)`).
+- Asserts the regex `/modelConfig\s*:\s*\{[^}]*maxTokensPerInput[^}]*maxInputsPerRequest[^}]*\}/s` matches.
+
+The fixed code:
+- Never creates or touches `apps/browser/src/api/ProxyEmbeddingApi.ts`; it only rewrites `apps/browser/pages/api/proxy/embeddings.ts`. So the test would hit "❌ Could not find embedding API file." and exit 1.
+- Never introduces a `modelConfig` object. Instead it hardcodes module-level constants (`MAX_INPUTS_PER_REQUEST = 256`, `MAX_CHARS_PER_REQUEST = 100_000`, `MAX_CHARS_PER_INPUT = 20_000`). The required declaration the test looks for is absent, so even on the right file the "FIX VERIFIED" branch would never be reached.
+
+The intended fix was evidently a model-capability configuration (per-model `maxTokensPerInput` / `maxInputsPerRequest`) in a `modelConfig` object; the submitted patch solves a related but different problem (Next.js 1 MB body limit + request batching) and does so in the wrong file with the wrong shape.
+
+### 3. API verification inconclusive (not a blocker, but noted)
+`verify_api_usage` for `openai.embeddings.create`, `OpenAI.APIError`, and the Next.js `config.bodyParser.sizeLimit` returned only generic/unrelated web results (OpenAI corporate pages, NeXT Inc.), so nothing could be positively confirmed from documentation. From the code itself the usages look plausible for the OpenAI v4 SDK (`create({model, input})` → `data[i].index/embedding`, `APIError.status`) and for the Pages Router (`export const config = { api: { bodyParser: { sizeLimit } } }`), and it is consistent with the pre-existing `OpenAIApi.APIError` pattern in the original file — but this cannot offset the failures above.
+
+### 4. Secondary code-quality concerns (would matter even if the test passed)
+- `embeddingsByGroup` is initialized with `new Array(n).fill([])`; an unfilled slot is a shared empty array, and in the single-piece path it is returned directly as `embedding: []` — silent empty embeddings instead of an error.
+- `averageEmbeddings` assumes `embeddings[0].length` is defined; it throws (→ generic 500) if any piece embedding is missing/undefined, e.g. when the API returns fewer `data` items than inputs.
+- `isBodyTooLargeError` starts with `if (!(e instanceof OpenAIApi.APIError)) return false;`. If that static/class lookup doesn't resolve at runtime under the project's TS interop, the 413-detection and the bisect-retry logic become dead code and only the final `res.status(500)` path remains — a silent single point of failure.
+- Recursive binary splitting on `Promise.all` has unbounded fan-out for pathological inputs (down to single characters), risking a request storm.
+- Response-shape compatibility: the new handler returns one entry per chunk (same effective shape as the old flattened result), which is fine, but the added `400` for missing `model`/empty `input` is an unannounced behavior change.
+
+### Conclusion
+The patch is a reasonable attempt at the *underlying* symptom (oversized embedding payloads), and the `sizeLimit` + batching approach is directionally sensible. However:
+1. It fails the mandated structural validation (dropped file-path header).
+2. It does not implement the specific behavior the test checks — no `apps/browser/src/api/ProxyEmbeddingApi.ts`, no `modelConfig` with `maxTokensPerInput`/`maxInputsPerRequest` — so the fixed version would fail the test suite.
+
+**REJECT.**
+--------------------------------------------------------------------------------
+import type { NextApiRequest, NextApiResponse } from "next";
+import OpenAIApi from "openai";
+import { authOptions } from "../auth/[...nextauth]";
+import { getServerSession } from "next-auth";
+import { isGoalValid } from "../../../api-utils/goal";
+import { canUseSubsidy } from "../../../api-utils/subsidy";
+import { createSupabaseClient } from "../../../api-utils/supabase";
+import { createOpenAIApiClient } from "../../../api-utils/openai";
+
+// Requests coming from the browser contain every chunk of every scraped page,
+// so a single goal easily produces several megabytes of text. Next.js only
+// accepts 1MB per API route by default and rejects anything bigger with a
+// "Body exceeds maximum size" (413) error, so raise the limit for this route.
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "25mb",
+    },
+  },
+};
+
+// The embeddings endpoint accepts at most 2048 inputs and ~300k tokens per
+// request, and it rejects request bodies that are over the maximum size. Since
+// web scraping + chunking regularly produces more than that, the inputs are
+// batched (and oversized chunks are split) before they are forwarded to OpenAI.
+const MAX_INPUTS_PER_REQUEST = 256;
+const MAX_CHARS_PER_REQUEST = 100_000;
+const MAX_CHARS_PER_INPUT = 20_000;
+const MAX_CONCURRENT_REQUESTS = 4;
+
+type EmbeddingResult = { embedding: number[]; input: string };
+
+type Job = { groupIndex: number; pieceIndex: number; text: string };
+
+// The proxy accepts a list of chunk groups (`string[][]`), but it also tolerates
+// a flat list of strings, so both shapes end up as a flat list of chunks.
+function normalizeInput(rawInput: unknown): string[] {
+  if (!Array.isArray(rawInput)) {
+    return [];
+  }
+  return rawInput
+    .flatMap((entry) => (Array.isArray(entry) ? entry : [entry]))
+    .map((entry) => (typeof entry === "string" ? entry : String(entry ?? "")));
+}
+
+// A single chunk that is bigger than the per-input limit is embedded in pieces
+// and the resulting embeddings are averaged back together.
+function splitText(text: string): string[] {
+  const value = text.length > 0 ? text : " ";
+  if (value.length <= MAX_CHARS_PER_INPUT) {
+    return [value];
+  }
+  const pieces: string[] = [];
+  for (let i = 0; i < value.length; i += MAX_CHARS_PER_INPUT) {
+    pieces.push(value.slice(i, i + MAX_CHARS_PER_INPUT));
+  }
+  return pieces;
+}
+
+function averageEmbeddings(embeddings: number[][]): number[] {
+  const dimensions = embeddings[0].length;
+  const summed = new Array<number>(dimensions).fill(0);
+  for (const embedding of embeddings) {
+    for (let i = 0; i < dimensions; i++) {
+      summed[i] += embedding[i];
+    }
+  }
+  return summed.map((value) => value / embeddings.length);
+}
+
+function isBodyTooLargeError(e: any): boolean {
+  if (!(e instanceof OpenAIApi.APIError)) {
+    return false;
+  }
+  if (e.status === 413) {
+    return true;
+  }
+  if (e.status !== 400 && e.status !== 422) {
+    return false;
+  }
+  const message = String(e.message ?? "").toLowerCase();
+  return (
+    message.includes("maximum size") ||
+    message.includes("too large") ||
+    message.includes("too many tokens") ||
+    message.includes("exceeds")
+  );
+}
+
+// Sends `texts` to the embeddings endpoint and returns the embeddings in the
+// same order as the given texts. If the request is still too big for the API
+// (too many inputs/tokens or a body that exceeds the maximum size), the work is
+// split up and retried instead of failing the whole goal.
+async function createBatchEmbeddings(
+  openai: OpenAIApi,
+  model: string,
+  texts: string[]
+): Promise<number[][]> {
+  if (texts.length === 0) {
+    return [];
+  }
+
+  try {
+    const { data } = await openai.embeddings.create({
+      model,
+      input: texts,
+    });
+
+    const embeddings = new Array<number[]>(texts.length);
+    data.forEach((innerData) => {
+      embeddings[innerData.index] = innerData.embedding;
+    });
+    return embeddings;
+  } catch (e: any) {
+    if (isBodyTooLargeError(e) && texts.length > 1) {
+      const middle = Math.ceil(texts.length / 2);
+      const [left, right] = await Promise.all([
+        createBatchEmbeddings(openai, model, texts.slice(0, middle)),
+        createBatchEmbeddings(openai, model, texts.slice(middle)),
+      ]);
+      return [...left, ...right];
+    }
+    if (isBodyTooLargeError(e) && texts.length === 1 && texts[0].length > 1) {
+      const text = texts[0];
+      const middle = Math.ceil(text.length / 2);
+      const [left, right] = await Promise.all([
+        createBatchEmbeddings(openai, model, [text.slice(0, middle)]),
+        createBatchEmbeddings(openai, model, [text.slice(middle)]),
+      ]);
+      return [averageEmbeddings([left[0], right[0]])];
+    }
+    throw e;
+  }
+}
+
+async function createEmbeddings(
+  openai: OpenAIApi,
+  model: string,
+  inputs: string[]
+): Promise<EmbeddingResult[]> {
+  // Split every input into the pieces that actually get embedded. Usually there
+  // is exactly one piece per input; only oversized chunks are split up.
+  const groups = inputs.map((input) => ({
+    input,
+    pieces: splitText(input),
+  }));
+
+  const jobs: Job[] = [];
+  groups.forEach((group, groupIndex) => {
+    group.pieces.forEach((text, pieceIndex) => {
+      jobs.push({ groupIndex, pieceIndex, text });
+    });
+  });
+
+  // Batch the work so that every call to OpenAI stays within its limits.
+  const requests: Job[][] = [];
+  let currentRequest: Job[] = [];
+  let currentChars = 0;
+  for (const job of jobs) {
+    if (
+      currentRequest.length > 0 &&
+      (currentRequest.length >= MAX_INPUTS_PER_REQUEST ||
+        currentChars + job.text.length > MAX_CHARS_PER_REQUEST)
+    ) {
+      requests.push(currentRequest);
+      currentRequest = [];
+      currentChars = 0;
+    }
+    currentRequest.push(job);
+    currentChars += job.text.length;
+  }
+  if (currentRequest.length > 0) {
+    requests.push(currentRequest);
+  }
+
+  const embeddingsByGroup: number[][][] = groups.map((group) =>
+    new Array<number[]>(group.pieces.length).fill([])
+  );
+
+  let nextRequest = 0;
+  const worker = async (): Promise<void> => {
+    while (nextRequest < requests.length) {
+      const request = requests[nextRequest++];
+      const embeddings = await createBatchEmbeddings(
+        openai,
+        model,
+        request.map((job) => job.text)
+      );
+      request.forEach((job, index) => {
+        embeddingsByGroup[job.groupIndex][job.pieceIndex] = embeddings[index];
+      });
+    }
+  };
+
+  const workers = Array.from(
+    { length: Math.min(MAX_CONCURRENT_REQUESTS, requests.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+
+  return groups.map((group, groupIndex): EmbeddingResult => {
+    const embeddings = embeddingsByGroup[groupIndex];
+    return {
+      embedding:
+        embeddings.length === 1 ? embeddings[0] : averageEmbeddings(embeddings),
+      input: group.input,
+    };
+  });
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<void> {
+  if (!(req.method === "POST")) {
+    return res.status(404).send({});
+  }
+  const goalId = req.body?.goalId;
+  const model = req.body?.model;
+  const input = normalizeInput(req.body?.input);
+
+  // Ensure the user is logged in
+  const session = await getServerSession(req, res, authOptions);
+  const email = session?.user?.email;
+  if (!session || !email) {
+    return res.status(401).send({});
+  }
+
+  if (!model || typeof model !== "string" || input.length === 0) {
+    return res.status(400).send({});
+  }
+
+  const supabase = createSupabaseClient();
+  const openai = createOpenAIApiClient();
+
+  // Ensure the goal is being tracked, and we're able to continue
+  // subsidizing the goal's llm requests
+  const isValid = await isGoalValid(goalId, supabase);
+  if (!isValid) {
+    return res.status(403).send({});
+  }
+  const canSubsidize = await canUseSubsidy("embedding", goalId, supabase);
+  if (!canSubsidize) {
+    return res.status(403).send({});
+  }
+
+  try {
+    const embeddings = await createEmbeddings(openai, model, input);
+    return res.status(200).json({ embeddings });
+  } catch (e: any) {
+    // Rate limit error
+    if (e instanceof OpenAIApi.APIError && e.status === 429) {
+      return res.status(429).send({});
+    }
+    // The inputs are still too big to be embedded, even after batching
+    if (e instanceof OpenAIApi.APIError && isBodyTooLargeError(e)) {
+      return res.status(413).send({});
+    }
+    return res.status(500).send({});
+  }
+}
+
+--------------------------------------------------------------------------------

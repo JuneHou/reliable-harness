@@ -1,0 +1,638 @@
+Case ID: 79343179
+Status: ACCEPTED
+Final Attempt: 2
+Start Time: 2026-11-08 20:47:40
+End Time: 2026-11-08 20:58:23
+Total Duration: 643.04 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import pandas as pd
+from langchain.agents import AgentExecutor, create_react_agent, Tool
+from langchain.tools import tool
+from langchain_community.tools import ShellTool
+from langchain_openai import ChatOpenAI
+from langchain_experimental.utilities import PythonREPL
+from langchain import hub
+import dotenv
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# FIX: shared, module-level store that bridges the agent's execution context
+# and the main script.
+#
+# Why this is required:
+#   * `agent_executor.invoke()` only returns {"input": ..., "output": "<str>"}
+#     -- "output" is a plain string the LLM produced, never a Python object.
+#   * Any DataFrame created inside a tool (or inside python_repl) lives only
+#     in that inner scope; when the tool returns, the object is stringified
+#     for the LLM and the live reference is lost to the caller.
+# Keeping the actual object here lets the main script pick it up after the run.
+# ---------------------------------------------------------------------------
+DATAFRAME_STORE = {}  # filepath -> DataFrame
+
+
+@tool
+def load_excel_response(filepath: str) -> str:
+    """Load an Excel file, transform it into a DataFrame and register it for retrieval.
+
+    Returns a compact JSON preview (row count + first rows). The full
+    DataFrame object is stored and can be retrieved by the caller afterwards.
+    """
+    df = pd.read_excel(filepath, skiprows=2, names=['responses']).reset_index(drop=True)
+    df = df.select_dtypes(include=['object'])
+
+    # FIX: keep the *real* DataFrame object reachable from the calling script
+    # instead of letting it die with the tool's local scope.
+    DATAFRAME_STORE[filepath] = df
+
+    # FIX: return a small, LLM-friendly summary string rather than the raw
+    # DataFrame (tool outputs are stringified for the LLM anyway).
+    preview = df.head().to_json(orient='records')
+    return f"Loaded DataFrame with {len(df)} rows. Preview: {preview}"
+
+
+def run_agent(user_prompt, file_name="data.json"):
+    llm = ChatOpenAI(model='gpt-4o-mini')
+    python_repl = PythonREPL()
+    shell_tool = ShellTool()
+
+    # FIX: make the shared store visible inside the agent's REPL session so
+    # DataFrames created/assigned there (e.g. `df = ...`) can also be captured
+    # for the main script -- the REPL has its own globals/locals namespace.
+    python_repl.globals["DATAFRAME_STORE"] = DATAFRAME_STORE
+
+    repl_tool = Tool(
+        name="python_repl",
+        description=(
+            "Run Python commands in a REPL environment. If you create or load "
+            "a DataFrame, register it for the caller with "
+            "DATAFRAME_STORE['<filepath>'] = df."
+        ),
+        func=python_repl.run,
+    )
+
+    tools_list = [load_excel_response, repl_tool, shell_tool]
+    prompt = hub.pull("hwchase17/react")
+
+    shell_agent = create_react_agent(llm=llm, tools=tools_list, prompt=prompt)
+    agent_executor = AgentExecutor(agent=shell_agent, tools=tools_list, verbose=True)
+
+    response = agent_executor.invoke({"input": user_prompt})
+
+    # FIX: persist the DataFrame that was actually produced during the run,
+    # using the previously dead `file_name` argument (single-file use case).
+    if file_name and DATAFRAME_STORE:
+        captured_df = next(iter(DATAFRAME_STORE.values()))
+        captured_df.to_json(file_name, orient='records', indent=2)
+
+    return response
+
+
+if __name__ == "__main__":
+    path = 'excel_file.xlsx'
+    user_prompt = f"Load the Excel file located at {path} and assign the result to a variable named df."
+    result = run_agent(user_prompt)
+    print(result)  # the agent's textual answer (a string), as before
+
+    # FIX: retrieve the *actual* DataFrame object created during the agent
+    # run -- not just the summary dictionary returned by invoke().
+    df = DATAFRAME_STORE.get(path)
+    if df is None:
+        raise RuntimeError(
+            f"No DataFrame was captured for {path!r} -- "
+            "the agent never called load_excel_response."
+        )
+
+    # Real DataFrame operations now work in the main script's scope.
+    print(type(df))     # <class 'pandas.core.frame.DataFrame'>
+    print(df.shape)
+    print(df.head())
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-08 20:53:35
+Duration: 354.68 seconds
+Verdict: ## Evaluation of Case 79343179
+
+**Verdict: REJECT**
+
+### Analysis
+
+**1. Critical API signature incompatibility (immediate test failure)**
+
+The test calls:
+```python
+result = run_agent(user_prompt, file_name=output_file)
+```
+
+But the fixed code changed the signature to:
+```python
+def run_agent(user_prompt: str, variable_name: str = "df"):
+```
+
+The `file_name` parameter was **removed** and replaced with `variable_name`. Python does not do fuzzy keyword matching, so this call raises:
+```
+TypeError: run_agent() got an unexpected keyword argument 'file_name'
+```
+The test will error out at the call site before any assertion is even evaluated. The original buggy code at least preserved the `(user_prompt, file_name="data.json")` signature that the test depends on.
+
+**2. No file output written (second guaranteed test failure)**
+
+The test explicitly requires:
+```python
+self.assertTrue(os.path.exists(output_file))
+with open(output_file, "r", encoding="utf-8") as f:
+    loaded = json.load(f)
+```
+The fixed code contains **no file-writing logic whatsoever**. Nothing in `run_agent`, the tools, or the `__main__` block ever serializes data to `test_output.json`. Since the test deletes any pre-existing file before running, `os.path.exists(output_file)` will fail, and `json.load()` would raise `FileNotFoundError`.
+
+**3. Wrong return contract**
+
+The test expects `result` to be the JSON payload itself (a dict or list of dicts). The fixed code returns a wrapper dict `{"response": ..., "df": <DataFrame>, "variables": {...}}`. While `isinstance(result, dict)` would incidentally pass, this is not the JSON data the test's prompt requests ("return it is a json. ONLY RETURN THE JSON"). Moreover, the dict contains a live pandas DataFrame and arbitrary objects in `variables`, which are not JSON-serializable — the returned structure is not usable as JSON output.
+
+**4. The fix addresses a different problem than the test verifies**
+
+The fix's own docstring states it solves "how do I get the actual DataFrame created during agent execution as a variable in my main script?" — a real LangChain limitation, and the shared `AGENT_STORE`/`REPL_NAMESPACE` design is technically sound for that goal. However, the test for this case verifies a **JSON response contract plus file output** (`file_name` parameter, JSON written to disk). The fix ignored and actively broke both requirements.
+
+**5. Tool verification results**
+
+The `verify_api_usage` calls returned only generic framework overview content (no specific parameter documentation), so they neither confirm nor refute the LangChain usage. The `AgentExecutor`/`create_react_agent`/`@tool` usage itself appears syntactically reasonable, but that does not offset the contract violations above.
+
+### Conclusion
+
+Despite the validator reporting structural acceptance, the fixed code **breaks the test's calling contract** (`file_name` keyword removed → `TypeError`) and **omits the required file-output behavior** (`test_output.json` never created). These are deterministic, guaranteed test failures based on basic Python semantics, not judgment calls. The engineering behind the shared-store REPL is competent, but it solves the wrong problem for this test case.
+
+**REJECT**
+--------------------------------------------------------------------------------
+"""
+Fix for: "agent_executor.invoke() only returns a summary dict - how do I get the
+actual DataFrame created during agent execution as a variable in my main script?"
+
+ROOT CAUSE
+----------
+1. AgentExecutor.invoke() returns only {"input": ..., "output": <text>}. The
+   "output" is the LLM's final ANSWER STRING; Python objects created by tools
+   never cross the agent boundary as objects.
+2. Tool return values are stringified before being fed back into the LLM
+   context, so returning a raw DataFrame from a tool only pollutes the prompt
+   with a giant table dump - the object itself is lost.
+3. langchain_experimental's PythonREPL.run() executes code in its OWN private
+   globals dict, returns only captured stdout, and discards both the value of
+   the last expression and the namespace. Any `df` created there is unreachable
+   from __main__.
+
+FIX
+---
+- A module-level shared store (AGENT_STORE) acts as the bridge between the
+  agent's execution scope and the calling script. Tools store REAL objects
+  (DataFrames) in it instead of (only) returning them as text.
+- load_excel_response stores the DataFrame under the requested variable name
+  (input "path as df") and returns a compact, LLM-friendly summary instead of
+  the raw DataFrame.
+- A self-contained python_repl tool runs code in a SHARED, PERSISTENT namespace
+  that is readable from the main script, captures stdout, and returns the value
+  of the last expression (exec() alone discards it), so `df = ...` inside the
+  agent makes `df` available outside.
+- run_agent() returns both the agent's textual response AND the actual
+  DataFrame, so the main block can bind it to a local variable `df`.
+"""
+
+import ast
+import contextlib
+import io
+import os
+import re
+import types
+
+import pandas as pd
+from langchain import hub
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.tools import tool
+from langchain_community.tools import ShellTool
+from langchain_openai import ChatOpenAI
+
+import dotenv
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Shared state: the bridge between the agent's execution scope and this script.
+# Objects created during agent execution are stashed here so they can be
+# retrieved as real Python objects after agent_executor.invoke() returns.
+# ---------------------------------------------------------------------------
+AGENT_STORE = {
+    "variables": {},      # variable name -> real Python object (e.g. the df)
+    "last_result": None,  # value of the last expression executed by the REPL
+}
+
+# One namespace shared by every python_repl call AND readable from __main__,
+# so variables the agent creates (like df) survive past invoke().
+REPL_NAMESPACE = {"pd": pd}
+AGENT_STORE["repl_namespace"] = REPL_NAMESPACE
+
+
+def _reset_runtime() -> None:
+    """Start a clean run: drop variables from previous agent invocations."""
+    AGENT_STORE["variables"].clear()
+    AGENT_STORE["last_result"] = None
+    REPL_NAMESPACE.clear()
+    REPL_NAMESPACE["pd"] = pd
+
+
+# ---------------------------------------------------------------------------
+# Tool 1: load the Excel file and STORE the DataFrame (not just describe it)
+# ---------------------------------------------------------------------------
+@tool
+def load_excel_response(command: str) -> str:
+    """Load an Excel file and store the transformed DataFrame for later use.
+
+    Input is the file path, optionally followed by ' as <variable_name>' to
+    choose the name the DataFrame is stored under. Examples:
+        excel_file.xlsx
+        excel_file.xlsx as df
+    Returns a compact summary (shape, columns, dtypes, first rows). The
+    DataFrame itself is stored in the session's shared variables, where it can
+    be inspected with get_variable or python_repl.
+    """
+    command = command.strip()
+
+    # Parse "<path> as <name>" (mirrors "assign the result to a variable named df").
+    match = re.search(r"\s+as\s+(?P<name>[A-Za-z_]\w*)\s*$", command, flags=re.IGNORECASE)
+    if match:
+        var_name = match.group("name")
+        path = command[: match.start()]
+    else:
+        var_name = "df"
+        path = command
+    path = path.strip().strip("'\"").strip()
+
+    # Precondition check + tolerant path recovery if the LLM added extra words.
+    if not path or not os.path.isfile(path):
+        found = re.search(r"[^\s'\"]+\.(?:xlsx|xls|xlsm|csv)", command, flags=re.IGNORECASE)
+        if found and os.path.isfile(found.group(0)):
+            path = found.group(0)
+        else:
+            available = os.listdir(".") if os.path.isdir(".") else []
+            hint = ", ".join(f for f in available if f.lower().endswith((".xlsx", ".xls", ".csv")))[:300]
+            return (
+                f"ERROR: file not found: {path or '(empty)'!r}. "
+                f"Pass an existing Excel path. Files in the working directory: {hint or 'none'}"
+            )
+
+    try:
+        df = pd.read_excel(path, skiprows=2, names=["responses"]).reset_index(drop=True)
+        df = df.select_dtypes(include=["object"]).reset_index(drop=True)
+    except Exception as exc:  # never crash the agent loop on a bad file
+        return f"ERROR: failed to load {path!r}: {type(exc).__name__}: {exc}"
+
+    # >>> Store the REAL object (not a string) so the caller can retrieve it.
+    AGENT_STORE["variables"][var_name] = df
+    AGENT_STORE["last_result"] = df
+    REPL_NAMESPACE.setdefault(var_name, df)
+
+    # Return only a compact, LLM-friendly summary (a raw DataFrame dump would
+    # bloat the prompt and still not give the caller the object).
+    return (
+        f"Loaded {path!r} into variable {var_name!r}: "
+        f"{len(df)} rows x {df.shape[1]} columns; "
+        f"columns/dtypes: {dict(df.dtypes.astype(str))}; "
+        f"first rows: {df.head(3).to_dict(orient='records')}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool 2: inspect a stored variable by name
+# ---------------------------------------------------------------------------
+@tool
+def get_variable(variable_name: str) -> str:
+    """Return a compact summary of a variable stored earlier in this session
+    (for example a DataFrame created by load_excel_response). Input: the
+    variable name, e.g. 'df'."""
+    name = variable_name.strip().strip("'\"")
+    value = AGENT_STORE["variables"].get(name)
+    if value is None:
+        available = ", ".join(AGENT_STORE["variables"]) or "(none)"
+        return f"ERROR: no stored variable named {name!r}. Stored variables: {available}"
+    if isinstance(value, pd.DataFrame):
+        return (
+            f"{name}: DataFrame, shape={value.shape}, "
+            f"columns={list(value.columns)}\n{value.head(5).to_string()}"
+        )
+    return f"{name}: {value!r}"
+
+
+# ---------------------------------------------------------------------------
+# Tool 3: python_repl with a SHARED namespace and last-expression capture
+# ---------------------------------------------------------------------------
+def _exec_and_capture(code: str):
+    """Execute `code` in the shared REPL namespace.
+
+    Returns (stdout_text, last_value). If execution raised, last_value is the
+    exception instance. A trailing expression statement is evaluated separately
+    so its VALUE is returned (plain exec() discards expression results), which
+    is what makes calls like `df.head()` useful.
+    """
+    stdout = io.StringIO()
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return "", exc
+
+    statements = list(tree.body)
+    eval_code = None
+    if statements and isinstance(statements[-1], ast.Expr):
+        last_expr = statements.pop()
+        try:
+            eval_code = compile(ast.Expression(last_expr.value), "<python_repl>", "eval")
+        except Exception as exc:
+            return "", exc
+
+    try:
+        exec_code = compile(ast.Module(body=statements, type_ignores=[]), "<python_repl>", "exec")
+    except SyntaxError as exc:
+        return "", exc
+
+    error = None
+    last_value = None
+    with contextlib.redirect_stdout(stdout):
+        try:
+            exec(exec_code, REPL_NAMESPACE)  # noqa: S102 - intentional REPL
+            if eval_code is not None:
+                last_value = eval(eval_code, REPL_NAMESPACE)  # noqa: S102
+        except Exception as exc:
+            error = exc
+
+    return stdout.getvalue(), error if error is not None else last_value
+
+
+@tool
+def python_repl(code: str) -> str:
+    """Execute Python code in a persistent REPL (pandas is pre-imported as pd).
+
+    Variables persist between calls AND are shared with the calling program,
+    so `df = ...` makes `df` available after the agent finishes. The value of
+    the last expression, plus anything printed, is returned as text.
+    """
+    # Make objects stored by other tools (e.g. the loaded DataFrame) visible.
+    for name, obj in AGENT_STORE["variables"].items():
+        REPL_NAMESPACE.setdefault(name, obj)
+
+    stdout, value = _exec_and_capture(code)
+
+    if isinstance(value, BaseException):
+        return f"ERROR: {type(value).__name__}: {value}"
+
+    REPL_NAMESPACE["_"] = value
+    if value is not None:
+        AGENT_STORE["last_result"] = value
+
+    # Publish non-private, non-module objects the agent created (e.g. df) so
+    # the main script can fetch them by name after invoke() returns.
+    for name, obj in list(REPL_NAMESPACE.items()):
+        if name.startswith("_") or isinstance(obj, types.ModuleType):
+            continue
+        AGENT_STORE["variables"][name] = obj
+
+    parts = []
+    if stdout.strip():
+        parts.append(stdout.strip())
+    if value is not None:
+        if isinstance(value, pd.DataFrame):
+            parts.append(f"[{value.shape[0]} rows x {value.shape[1]} cols]\n{value.head(5).to_string()}")
+        else:
+            parts.append(repr(value))
+    return "\n".join(parts) if parts else "OK (no output)"
+
+
+# ---------------------------------------------------------------------------
+# Agent setup
+# ---------------------------------------------------------------------------
+def run_agent(user_prompt: str, variable_name: str = "df"):
+    """Run the ReAct agent and return BOTH the textual answer and the real
+    DataFrame created during execution.
+
+    Returns a dict:
+        {
+          "response":  <the AgentExecutor.invoke() result, i.e. {'input', 'output'}>,
+          "df":        <the actual pandas DataFrame, or None>,
+          "variables": <all Python objects stored during the run>,
+        }
+    """
+    _reset_runtime()
+
+    llm = ChatOpenAI(model="gpt-4o-mini")
+    shell_tool = ShellTool()  # note: subprocess commands do NOT share variables
+
+    tools_list = [load_excel_response, python_repl, get_variable, shell_tool]
+    prompt = hub.pull("hwchase17/react")
+
+    agent = create_react_agent(llm=llm, tools=tools_list, prompt=prompt)
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=tools_list,
+        verbose=True,
+        handle_parsing_errors=True,  # tolerate malformed ReAct output from the LLM
+        max_iterations=15,
+    )
+
+    # invoke() still returns only {'input': ..., 'output': <text>} ...
+    response = agent_executor.invoke({"input": user_prompt})
+
+    # ... so the REAL DataFrame is recovered from the shared store instead.
+    df = AGENT_STORE["variables"].get(variable_name)
+    if not isinstance(df, pd.DataFrame):
+        # Fallbacks: the last DataFrame produced, or any stored DataFrame.
+        if isinstance(AGENT_STORE["last_result"], pd.DataFrame):
+            df = AGENT_STORE["last_result"]
+        else:
+            for name, obj in AGENT_STORE["variables"].items():
+                if isinstance(obj, pd.DataFrame):
+                    df = obj
+                    break
+
+    return {
+        "response": response,
+        "df": df,
+        "variables": dict(AGENT_STORE["variables"]),
+    }
+
+
+if __name__ == "__main__":
+    path = "excel_file.xlsx"
+    user_prompt = (
+        f"Load the Excel file located at {path} and assign the result to a variable named df."
+    )
+
+    result = run_agent(user_prompt)
+
+    print("\n--- Agent textual output ---")
+    print(result["response"].get("output", ""))
+
+    # The actual DataFrame, bound to a LOCAL variable in this script:
+    df = result["df"]
+    if df is not None:
+        print(f"\n--- Retrieved DataFrame: type={type(df).__name__}, shape={df.shape} ---")
+        print(df.head())
+        print(f"\ncolumns: {list(df.columns)}")
+    else:
+        print("\nNo DataFrame was stored during this run.")
+        print(f"Stored variables: {list(result['variables']) or '(none)'}")
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-08 20:58:23
+Duration: 288.36 seconds
+Verdict: All three verification steps are complete. The web verification returned only general library overviews (no documentation contradicting the usage), so I evaluated the API calls based on their actual signatures and the test's requirements.
+
+**ACCEPT**
+
+## Reasoning
+
+### 1. Diff Analysis — the fix correctly addresses the root bugs
+
+The buggy code had two critical defects relative to the test's expectations:
+
+- **`file_name` was completely dead code** — `run_agent(user_prompt, file_name)` accepted the parameter but never wrote any output file. The test asserts `os.path.exists(output_file)` after the run, which the buggy code could never satisfy.
+- **Returning a raw DataFrame from a tool is useless** — `load_excel_response` returned a live DataFrame, but LangChain tools serialize their return value to a string for the LLM, and `agent_executor.invoke()` only returns `{"input": ..., "output": "<str>"}`. The object dies with the tool's scope.
+
+The fix solves both:
+1. A **module-level `DATAFRAME_STORE`** captures the real DataFrame object inside the tool (`DATAFRAME_STORE[filepath] = df`), bridging the agent's execution scope and the main script.
+2. After `invoke()` returns, the code **writes the captured DataFrame to `file_name`** using the previously dead parameter: `captured_df.to_json(file_name, orient='records', indent=2)`.
+3. The tool now returns an LLM-friendly summary string (row count + preview) instead of a raw DataFrame, which is the correct pattern for ReAct agents.
+4. `python_repl.globals["DATAFRAME_STORE"] = DATAFRAME_STORE` injects the shared store into the REPL's separate namespace so DataFrames created there can also be captured — a thoughtful extra.
+
+### 2. Structural validation
+
+`validate_fixed_code` returned **ACCEPT** — the fixed code matches the expected structure and output format.
+
+### 3. API usage verification
+
+- **`DataFrame.to_json(file_name, orient='records', indent=2)`**: Valid — `orient='records'` produces a JSON list of dicts, and `indent` is a supported parameter. This exactly satisfies the test's file check: `json.load` yields a list where every item is a dict → `file_valid = True`. Even a degenerate empty DataFrame yields `[]`, which passes vacuously.
+- **`PythonREPL.globals`**: Valid — `PythonREPL` is a model with a `globals` dict (default `{}`); mutating it injects names into the REPL's execution namespace. Correct usage.
+- **`AgentExecutor.invoke`**: Returns a dict (`{"input", "output"}`), so the test's first assertion (`isinstance(result, dict)`) passes.
+
+### 4. Test-traceability
+
+Running the test against the fixed code:
+- `result = run_agent(...)` → returns `invoke()`'s dict → first assertion passes ✓
+- Agent calls `load_excel_response('excel_file.xlsx')` → DataFrame stored → after `invoke()`, `to_json` writes `test_output.json` → `os.path.exists` passes ✓
+- JSON file contains `orient='records'` output → `json.load` returns list of dicts → final assertion passes ✓
+- The `__main__` block (including the new `RuntimeError` guard) is not executed during the test since the test imports `run_agent` ✓
+
+### Minor observations (non-blocking)
+
+- `next(iter(DATAFRAME_STORE.values()))` assumes a single-file use case; the comment explicitly acknowledges this, and the test only exercises one file. The store is also never cleared between runs, which could grab a stale DataFrame on repeated calls — but this does not affect the given test.
+- Successful execution still requires a valid OpenAI key and the `excel_file.xlsx` fixture, which is an environmental precondition shared with the original code, not a defect introduced by the fix.
+
+The fix is minimal, targeted at the actual bugs, uses valid APIs, and satisfies every assertion in the test. **ACCEPT**.
+--------------------------------------------------------------------------------
+import pandas as pd
+from langchain.agents import AgentExecutor, create_react_agent, Tool
+from langchain.tools import tool
+from langchain_community.tools import ShellTool
+from langchain_openai import ChatOpenAI
+from langchain_experimental.utilities import PythonREPL
+from langchain import hub
+import dotenv
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# FIX: shared, module-level store that bridges the agent's execution context
+# and the main script.
+#
+# Why this is required:
+#   * `agent_executor.invoke()` only returns {"input": ..., "output": "<str>"}
+#     -- "output" is a plain string the LLM produced, never a Python object.
+#   * Any DataFrame created inside a tool (or inside python_repl) lives only
+#     in that inner scope; when the tool returns, the object is stringified
+#     for the LLM and the live reference is lost to the caller.
+# Keeping the actual object here lets the main script pick it up after the run.
+# ---------------------------------------------------------------------------
+DATAFRAME_STORE = {}  # filepath -> DataFrame
+
+
+@tool
+def load_excel_response(filepath: str) -> str:
+    """Load an Excel file, transform it into a DataFrame and register it for retrieval.
+
+    Returns a compact JSON preview (row count + first rows). The full
+    DataFrame object is stored and can be retrieved by the caller afterwards.
+    """
+    df = pd.read_excel(filepath, skiprows=2, names=['responses']).reset_index(drop=True)
+    df = df.select_dtypes(include=['object'])
+
+    # FIX: keep the *real* DataFrame object reachable from the calling script
+    # instead of letting it die with the tool's local scope.
+    DATAFRAME_STORE[filepath] = df
+
+    # FIX: return a small, LLM-friendly summary string rather than the raw
+    # DataFrame (tool outputs are stringified for the LLM anyway).
+    preview = df.head().to_json(orient='records')
+    return f"Loaded DataFrame with {len(df)} rows. Preview: {preview}"
+
+
+def run_agent(user_prompt, file_name="data.json"):
+    llm = ChatOpenAI(model='gpt-4o-mini')
+    python_repl = PythonREPL()
+    shell_tool = ShellTool()
+
+    # FIX: make the shared store visible inside the agent's REPL session so
+    # DataFrames created/assigned there (e.g. `df = ...`) can also be captured
+    # for the main script -- the REPL has its own globals/locals namespace.
+    python_repl.globals["DATAFRAME_STORE"] = DATAFRAME_STORE
+
+    repl_tool = Tool(
+        name="python_repl",
+        description=(
+            "Run Python commands in a REPL environment. If you create or load "
+            "a DataFrame, register it for the caller with "
+            "DATAFRAME_STORE['<filepath>'] = df."
+        ),
+        func=python_repl.run,
+    )
+
+    tools_list = [load_excel_response, repl_tool, shell_tool]
+    prompt = hub.pull("hwchase17/react")
+
+    shell_agent = create_react_agent(llm=llm, tools=tools_list, prompt=prompt)
+    agent_executor = AgentExecutor(agent=shell_agent, tools=tools_list, verbose=True)
+
+    response = agent_executor.invoke({"input": user_prompt})
+
+    # FIX: persist the DataFrame that was actually produced during the run,
+    # using the previously dead `file_name` argument (single-file use case).
+    if file_name and DATAFRAME_STORE:
+        captured_df = next(iter(DATAFRAME_STORE.values()))
+        captured_df.to_json(file_name, orient='records', indent=2)
+
+    return response
+
+
+if __name__ == "__main__":
+    path = 'excel_file.xlsx'
+    user_prompt = f"Load the Excel file located at {path} and assign the result to a variable named df."
+    result = run_agent(user_prompt)
+    print(result)  # the agent's textual answer (a string), as before
+
+    # FIX: retrieve the *actual* DataFrame object created during the agent
+    # run -- not just the summary dictionary returned by invoke().
+    df = DATAFRAME_STORE.get(path)
+    if df is None:
+        raise RuntimeError(
+            f"No DataFrame was captured for {path!r} -- "
+            "the agent never called load_excel_response."
+        )
+
+    # Real DataFrame operations now work in the main script's scope.
+    print(type(df))     # <class 'pandas.core.frame.DataFrame'>
+    print(df.shape)
+    print(df.head())
+
+--------------------------------------------------------------------------------

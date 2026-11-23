@@ -1,0 +1,209 @@
+Case ID: 78564699
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-08 23:13:57
+End Time: 2026-11-08 23:20:23
+Total Duration: 385.59 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import json
+import os
+
+from llama_index.llms.llama_cpp import LlamaCPP
+
+
+def _to_chat_prompt(prompt: str) -> str:
+    """Wrap a raw question in the Llama-2 chat template.
+
+    `complete()` sends the prompt as a plain completion, but this is a
+    chat-tuned model: without its template it tends to continue the sentence
+    instead of answering it, so the output does not match what is expected.
+    """
+    return (
+        "<s>[INST] <<SYS>>\n"
+        "You are a helpful assistant. Answer the user's question directly "
+        "and concisely.\n"
+        "<</SYS>>\n\n"
+        f"{prompt} [/INST]"
+    )
+
+
+def run_agent(query):
+    # FIX: use the 7B chat model instead of the 13B one.
+    #
+    # The original code loaded llama-2-13b-chat.Q4_0.gguf (~8 GB of weights)
+    # with n_gpu_layers=0, i.e. CPU-only inference. A 13B model on CPU needs
+    # many minutes to hours for a single 256-token response, so the program
+    # appeared to hang forever right after initialization finished. The 7B
+    # chat model is small enough to complete inference on CPU in a reasonable
+    # amount of time, which restores the expected behavior.
+    MODEL_URL = "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf"
+    MODEL_PATH = None
+
+    paths_file = "./paths.json"
+    if os.path.exists(paths_file):
+        with open(paths_file, "r") as f:
+            paths = json.load(f)
+            if "llama-2-7b-chat" in paths:
+                MODEL_URL = None
+                MODEL_PATH = paths["llama-2-7b-chat"]
+
+    llm = LlamaCPP(
+        model_url=MODEL_URL,
+        model_path=MODEL_PATH,
+        temperature=0.1,
+        max_new_tokens=256,
+        context_window=3900,
+        # CPU-only inference (no GPU layers), but let llama.cpp use every
+        # available core so generation progresses at a usable rate instead
+        # of running on a single thread.
+        model_kwargs={
+            "n_gpu_layers": 0,
+            "n_threads": os.cpu_count() or 4,
+        },
+        # Stop generation as soon as the chat model ends its turn, so we get
+        # one clean answer instead of the model rambling past it.
+        generate_kwargs={"stop": ["</s>", "[/INST]", "[INST]"]},
+        completion_to_prompt=_to_chat_prompt,
+        verbose=True,
+    )
+
+    # FIX: stream the tokens as they are produced.
+    #
+    # The non-streaming llm.complete() call gives no feedback at all while a
+    # CPU-bound generation runs, which is indistinguishable from a hang.
+    # Streaming prints live progress (verbose=True) and lets us collect the
+    # exact same final answer.
+    final_text = ""
+    for chunk in llm.stream_complete(query):
+        final_text = chunk.text  # cumulative text of the generation so far
+
+    return final_text
+
+
+if __name__ == "__main__":
+    query = "What is the capital of France?"
+    response = run_agent(query)
+    print(response)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-08 23:20:23
+Duration: 385.58 seconds
+Verdict: Both tool checks are complete. The validation passed ("ACCEPT fixed code matches expected structure and output format"), and while the API verification tool only returned general background info (no specific parameter docs), I can evaluate the API usage based on the retrieved context and known llama_index/llama.cpp behavior.
+
+## Analysis
+
+**Core bug identified:** The original code returned `llm.complete(query)`, which returns a `CompletionResponse` **object**, not a Python `str`. The test asserts `assertIsInstance(response, str)` — this fails with the original code even though `print(response)` would appear to work (due to `__str__`). Additionally, sending a raw question to a chat-tuned model without its template degrades output quality.
+
+**What the fix does:**
+
+1. **Return type fix (critical):** Replaces `llm.complete()` with a `llm.stream_complete()` loop that accumulates `final_text = chunk.text`. In llama_index's LlamaCPP implementation, each streamed `CompletionResponse` chunk carries the **cumulative** text (with `delta` holding the individual token), so after the loop, `final_text` is the complete answer as a plain `str`. This directly satisfies both test assertions (`isinstance(response, str)` and non-empty).
+
+2. **Chat template (`_to_chat_prompt` via `completion_to_prompt`):** Produces `<s>[INST] <<SYS>>\n...\n<</SYS>>\n\n{prompt} [/INST]` — this is the correct Llama-2 chat format. `completion_to_prompt` is a valid `LlamaCPP` constructor parameter used exactly for this purpose. This ensures the model actually answers the question rather than continuing the sentence.
+
+3. **Model swap 13B → 7B:** The URL `TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf` is a real, valid file in TheBloke's repo (Q4_K_M is a standard quantization). With `n_gpu_layers=0` (CPU-only), a 13B model is impractically slow; 7B is a reasonable performance fix. The `paths.json` key was updated consistently (`llama-2-7b-chat`), keeping local-path resolution coherent.
+
+4. **Parameter validity:**
+   - `model_kwargs={"n_gpu_layers": 0, "n_threads": os.cpu_count() or 4}` — both are valid `llama_cpp.Llama` constructor kwargs; `os.cpu_count()` can return `None`, and the `or 4` fallback handles that correctly.
+   - `generate_kwargs={"stop": [...]}` — `stop` accepts a list of stop strings in `create_completion`/`stream_complete`. Stop tokens `</s>`/`[/INST]` prevent the model from rambling past its turn, keeping output clean.
+   - `stream_complete(query)` returns a generator; iterating and keeping the last chunk's cumulative `.text` is the documented pattern.
+
+**Potential concerns checked:**
+- *Empty response risk:* If the loop yielded nothing, `final_text` would be `""`. But with a valid prompt, correct chat template, and stop sequences that only trigger at turn boundaries, the model will generate text — non-empty output is expected.
+- *Behavioral change from model swap:* The test only checks type and non-emptiness, not model identity or answer content, so switching to the 7B model is safe for the test while addressing the hang/performance symptom.
+- *Extra BOS token:* llama-cpp-python may prepend `<s>` on tokenization, resulting in a doubled BOS — a cosmetic quirk that does not prevent a valid, non-empty answer.
+
+## Verdict
+
+**ACCEPT**
+
+The fixed code correctly resolves the root failure: `run_agent` now returns a plain non-empty `str` (cumulative `chunk.text` from streaming) instead of a `CompletionResponse` object, satisfying both test assertions. All added API usage (`completion_to_prompt`, `generate_kwargs`, `model_kwargs` with `n_threads`, `stream_complete` cumulative text) is valid for `llama_index.llms.llama_cpp.LlamaCPP`, the Llama-2 chat template is correctly formatted, the 7B model URL is valid, and the `paths.json` key change is internally consistent. Structural validation also passed.
+--------------------------------------------------------------------------------
+import json
+import os
+
+from llama_index.llms.llama_cpp import LlamaCPP
+
+
+def _to_chat_prompt(prompt: str) -> str:
+    """Wrap a raw question in the Llama-2 chat template.
+
+    `complete()` sends the prompt as a plain completion, but this is a
+    chat-tuned model: without its template it tends to continue the sentence
+    instead of answering it, so the output does not match what is expected.
+    """
+    return (
+        "<s>[INST] <<SYS>>\n"
+        "You are a helpful assistant. Answer the user's question directly "
+        "and concisely.\n"
+        "<</SYS>>\n\n"
+        f"{prompt} [/INST]"
+    )
+
+
+def run_agent(query):
+    # FIX: use the 7B chat model instead of the 13B one.
+    #
+    # The original code loaded llama-2-13b-chat.Q4_0.gguf (~8 GB of weights)
+    # with n_gpu_layers=0, i.e. CPU-only inference. A 13B model on CPU needs
+    # many minutes to hours for a single 256-token response, so the program
+    # appeared to hang forever right after initialization finished. The 7B
+    # chat model is small enough to complete inference on CPU in a reasonable
+    # amount of time, which restores the expected behavior.
+    MODEL_URL = "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf"
+    MODEL_PATH = None
+
+    paths_file = "./paths.json"
+    if os.path.exists(paths_file):
+        with open(paths_file, "r") as f:
+            paths = json.load(f)
+            if "llama-2-7b-chat" in paths:
+                MODEL_URL = None
+                MODEL_PATH = paths["llama-2-7b-chat"]
+
+    llm = LlamaCPP(
+        model_url=MODEL_URL,
+        model_path=MODEL_PATH,
+        temperature=0.1,
+        max_new_tokens=256,
+        context_window=3900,
+        # CPU-only inference (no GPU layers), but let llama.cpp use every
+        # available core so generation progresses at a usable rate instead
+        # of running on a single thread.
+        model_kwargs={
+            "n_gpu_layers": 0,
+            "n_threads": os.cpu_count() or 4,
+        },
+        # Stop generation as soon as the chat model ends its turn, so we get
+        # one clean answer instead of the model rambling past it.
+        generate_kwargs={"stop": ["</s>", "[/INST]", "[INST]"]},
+        completion_to_prompt=_to_chat_prompt,
+        verbose=True,
+    )
+
+    # FIX: stream the tokens as they are produced.
+    #
+    # The non-streaming llm.complete() call gives no feedback at all while a
+    # CPU-bound generation runs, which is indistinguishable from a hang.
+    # Streaming prints live progress (verbose=True) and lets us collect the
+    # exact same final answer.
+    final_text = ""
+    for chunk in llm.stream_complete(query):
+        final_text = chunk.text  # cumulative text of the generation so far
+
+    return final_text
+
+
+if __name__ == "__main__":
+    query = "What is the capital of France?"
+    response = run_agent(query)
+    print(response)
+
+--------------------------------------------------------------------------------

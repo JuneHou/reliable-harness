@@ -1,0 +1,621 @@
+diff --git a/packages/ai/core/generate-object/output-strategy.ts b/packages/ai/core/generate-object/output-strategy.ts
+index e7c226b..a7b468d 100644
+--- a/packages/ai/core/generate-object/output-strategy.ts
++++ b/packages/ai/core/generate-object/output-strategy.ts
+@@ -50,6 +50,199 @@ export interface OutputStrategy<PARTIAL, RESULT, ELEMENT_STREAM> {
+   ): ELEMENT_STREAM;
+ }
+ 
++type JSONSchemaDefinition = JSONSchema7 | boolean;
++
++/**
++ * Minimal structural type for zod schemas. It allows inspecting a zod schema
++ * without depending on zod's internal typings.
++ */
++interface ZodSchemaLike {
++  description?: string;
++  shape?: unknown;
++  _def?: {
++    typeName?: string;
++    description?: string;
++    innerType?: ZodSchemaLike;
++    schema?: ZodSchemaLike;
++    in?: ZodSchemaLike;
++    type?: ZodSchemaLike;
++    items?: Array<ZodSchemaLike>;
++    options?: Array<ZodSchemaLike>;
++    left?: ZodSchemaLike;
++    right?: ZodSchemaLike;
++    valueType?: ZodSchemaLike;
++  };
++}
++
++function isZodSchema(value: unknown): value is ZodSchemaLike {
++  return (
++    value != null &&
++    typeof value === 'object' &&
++    (value as ZodSchemaLike)._def != null &&
++    typeof (value as ZodSchemaLike)._def === 'object'
++  );
++}
++
++function getZodDescription(zodSchema: ZodSchemaLike): string | undefined {
++  const description = zodSchema.description ?? zodSchema._def?.description;
++
++  return typeof description === 'string' ? description : undefined;
++}
++
++/**
++ * Unwraps zod wrappers that do not change the shape of the schema,
++ * e.g. `z.string().optional()` or `z.string().default('')`.
++ */
++function unwrapZodSchema(
++  zodSchema: ZodSchemaLike,
++): ZodSchemaLike | undefined {
++  let current: ZodSchemaLike | undefined = zodSchema;
++
++  // the level limit protects against recursive schemas:
++  for (let level = 0; level < 10 && current != null; level++) {
++    switch (current._def?.typeName) {
++      case 'ZodOptional':
++      case 'ZodNullable':
++      case 'ZodDefault':
++      case 'ZodCatch':
++      case 'ZodReadonly':
++        current = current._def?.innerType;
++        break;
++      case 'ZodBranded':
++        current = current._def?.innerType ?? current._def?.type;
++        break;
++      case 'ZodEffects':
++        current = current._def?.schema;
++        break;
++      case 'ZodPipeline':
++        current = current._def?.in;
++        break;
++      default:
++        return current;
++    }
++  }
++
++  return current;
++}
++
++function getZodObjectShape(
++  zodSchema: ZodSchemaLike,
++): Record<string, ZodSchemaLike> | undefined {
++  const shape = zodSchema.shape;
++  const resolvedShape =
++    typeof shape === 'function' ? (shape as () => unknown)() : shape;
++
++  return resolvedShape != null && typeof resolvedShape === 'object'
++    ? (resolvedShape as Record<string, ZodSchemaLike>)
++    : undefined;
++}
++
++/**
++ * `zod-to-json-schema` (which is used by `asSchema`) unwraps schemas such as
++ * `ZodOptional` without copying the metadata of the wrapper. Descriptions that
++ * are attached to the wrapper (e.g. `z.string().optional().describe('...')`)
++ * are therefore lost in the generated JSON schema.
++ *
++ * This function walks the zod schema and the generated JSON schema in parallel
++ * and restores the missing descriptions so they are not lost in the schema that
++ * is used for the generation.
++ */
++function addZodDescriptionsToJsonSchema(
++  jsonSchema: JSONSchemaDefinition | undefined,
++  zodSchema: unknown,
++): void {
++  if (jsonSchema == null || typeof jsonSchema === 'boolean') {
++    return;
++  }
++
++  if (!isZodSchema(zodSchema)) {
++    return;
++  }
++
++  // restore the description of the schema itself (it might be defined on a
++  // wrapper that was unwrapped during the JSON schema generation):
++  const description = getZodDescription(zodSchema);
++  if (description != null && jsonSchema.description == null) {
++    jsonSchema.description = description;
++  }
++
++  const unwrappedZodSchema = unwrapZodSchema(zodSchema);
++  if (unwrappedZodSchema == null) {
++    return;
++  }
++
++  switch (unwrappedZodSchema._def?.typeName) {
++    case 'ZodObject': {
++      const shape = getZodObjectShape(unwrappedZodSchema);
++      const properties = jsonSchema.properties;
++
++      if (shape == null || properties == null) {
++        return;
++      }
++
++      for (const propertyName of Object.keys(properties)) {
++        addZodDescriptionsToJsonSchema(
++          properties[propertyName],
++          shape[propertyName],
++        );
++      }
++
++      return;
++    }
++
++    case 'ZodArray': {
++      const items = jsonSchema.items;
++
++      // tuple schemas are represented as arrays of items:
++      if (items == null || Array.isArray(items)) {
++        return;
++      }
++
++      addZodDescriptionsToJsonSchema(items, unwrappedZodSchema._def?.type);
++      return;
++    }
++
++    case 'ZodRecord': {
++      addZodDescriptionsToJsonSchema(
++        jsonSchema.additionalProperties,
++        unwrappedZodSchema._def?.valueType,
++      );
++      return;
++    }
++
++    case 'ZodUnion':
++    case 'ZodDiscriminatedUnion': {
++      const options = unwrappedZodSchema._def?.options;
++      const anyOf = jsonSchema.anyOf;
++
++      if (!Array.isArray(options) || !Array.isArray(anyOf)) {
++        return;
++      }
++
++      for (let index = 0; index < Math.min(options.length, anyOf.length); index++) {
++        addZodDescriptionsToJsonSchema(anyOf[index], options[index]);
++      }
++
++      return;
++    }
++
++    case 'ZodIntersection': {
++      const allOf = jsonSchema.allOf;
++
++      if (!Array.isArray(allOf)) {
++        return;
++      }
++
++      addZodDescriptionsToJsonSchema(allOf[0], unwrappedZodSchema._def?.left);
++      addZodDescriptionsToJsonSchema(allOf[1], unwrappedZodSchema._def?.right);
++      return;
++    }
++
++    default:
++      return;
++  }
++}
++
+ const noSchemaOutputStrategy: OutputStrategy<JSONValue, JSONValue, never> = {
+   type: 'no-schema',
+   jsonSchema: undefined,
+@@ -88,40 +281,52 @@ const noSchemaOutputStrategy: OutputStrategy<JSONValue, JSONValue, never> = {
+ 
+ const objectOutputStrategy = <OBJECT>(
+   schema: Schema<OBJECT>,
+-): OutputStrategy<DeepPartial<OBJECT>, OBJECT, never> => ({
+-  type: 'object',
+-  jsonSchema: schema.jsonSchema,
++  zodSchema?: unknown,
++): OutputStrategy<DeepPartial<OBJECT>, OBJECT, never> => {
++  const jsonSchema = schema.jsonSchema;
+ 
+-  validatePartialResult({ value, textDelta }) {
+-    return {
+-      success: true,
+-      value: {
+-        // Note: currently no validation of partial results:
+-        partial: value as DeepPartial<OBJECT>,
+-        textDelta,
+-      },
+-    };
+-  },
++  // `asSchema` loses descriptions that are defined on zod wrappers
++  // (e.g. `z.string().optional().describe('...')`). restore them:
++  addZodDescriptionsToJsonSchema(jsonSchema, zodSchema);
+ 
+-  validateFinalResult(value: JSONValue | undefined): ValidationResult<OBJECT> {
+-    return safeValidateTypes({ value, schema });
+-  },
++  return {
++    type: 'object',
++    jsonSchema,
+ 
+-  createElementStream() {
+-    throw new UnsupportedFunctionalityError({
+-      functionality: 'element streams in object mode',
+-    });
+-  },
+-});
++    validatePartialResult({ value, textDelta }) {
++      return {
++        success: true,
++        value: {
++          // Note: currently no validation of partial results:
++          partial: value as DeepPartial<OBJECT>,
++          textDelta,
++        },
++      };
++    },
++
++    validateFinalResult(value: JSONValue | undefined): ValidationResult<OBJECT> {
++      return safeValidateTypes({ value, schema });
++    },
++
++    createElementStream() {
++      throw new UnsupportedFunctionalityError({
++        functionality: 'element streams in object mode',
++      });
++    },
++  };
++};
+ 
+ const arrayOutputStrategy = <ELEMENT>(
+   schema: Schema<ELEMENT>,
++  zodSchema?: unknown,
+ ): OutputStrategy<ELEMENT[], ELEMENT[], AsyncIterableStream<ELEMENT>> => {
++  addZodDescriptionsToJsonSchema(schema.jsonSchema, zodSchema);
++
+   // remove $schema from schema.jsonSchema:
+   const { $schema, ...itemSchema } = schema.jsonSchema;
+ 
+   return {
+-    type: 'enum',
++    type: 'array',
+ 
+     // wrap in object that contains array of elements, since most LLMs will not
+     // be able to generate an array directly:
+@@ -348,9 +553,11 @@ export function getOutputStrategy<SCHEMA>({
+ }): OutputStrategy<any, any, any> {
+   switch (output) {
+     case 'object':
+-      return objectOutputStrategy(asSchema(schema!));
++      // the original schema is passed in so that descriptions that are lost
++      // during the zod -> JSON schema conversion can be restored:
++      return objectOutputStrategy(asSchema(schema!), schema);
+     case 'array':
+-      return arrayOutputStrategy(asSchema(schema!));
++      return arrayOutputStrategy(asSchema(schema!), schema);
+     case 'enum':
+       return enumOutputStrategy(enumValues! as Array<string>);
+     case 'no-schema':
+diff --git a/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts b/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
+index a2b8e41..ccd2c4a 100644
+--- a/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
++++ b/packages/ai/core/prompt/prepare-tools-and-tool-choice.test.ts
+@@ -96,6 +96,88 @@ it('should correctly map tool properties', () => {
+   });
+ });
+ 
++it('should preserve the description of optional parameters', () => {
++  const result = prepareToolsAndToolChoice({
++    tools: {
++      tool1: tool({
++        description: 'Tool 1 description',
++        parameters: z.object({
++          city: z
++            .string()
++            .optional()
++            .describe('The city to get the weather for'),
++        }),
++      }),
++    },
++    toolChoice: undefined,
++    activeTools: undefined,
++  });
++
++  const parameters = result.tools?.[0].parameters as {
++    properties?: Record<string, { description?: string }>;
++  };
++
++  expect(parameters.properties?.city?.description).toBe(
++    'The city to get the weather for',
++  );
++});
++
++it('should preserve the description of optional parameters with defaults and nullables', () => {
++  const result = prepareToolsAndToolChoice({
++    tools: {
++      tool1: tool({
++        description: 'Tool 1 description',
++        parameters: z.object({
++          unit: z
++            .string()
++            .default('celsius')
++            .describe('The unit of temperature'),
++          note: z.string().nullable().describe('An optional note'),
++        }),
++      }),
++    },
++    toolChoice: undefined,
++    activeTools: undefined,
++  });
++
++  const parameters = result.tools?.[0].parameters as {
++    properties?: Record<string, { description?: string }>;
++  };
++
++  expect(parameters.properties?.unit?.description).toBe(
++    'The unit of temperature',
++  );
++  expect(parameters.properties?.note?.description).toBe('An optional note');
++});
++
++it('should preserve the descriptions of nested optional parameters', () => {
++  const result = prepareToolsAndToolChoice({
++    tools: {
++      tool1: tool({
++        description: 'Tool 1 description',
++        parameters: z.object({
++          location: z.object({
++            city: z.string().optional().describe('The city name'),
++          }),
++        }),
++      }),
++    },
++    toolChoice: undefined,
++    activeTools: undefined,
++  });
++
++  const parameters = result.tools?.[0].parameters as {
++    properties?: Record<
++      string,
++      { properties?: Record<string, { description?: string }> }
++    >;
++  };
++
++  expect(parameters.properties?.location?.properties?.city?.description).toBe(
++    'The city name',
++  );
++});
++
+ it('should handle provider-defined tool type', () => {
+   const result = prepareToolsAndToolChoice({
+     tools: mockToolsWithProviderDefined,
+diff --git a/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts b/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
+index 4cf62a2..f15d166 100644
+--- a/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
++++ b/packages/ai/core/prompt/prepare-tools-and-tool-choice.ts
+@@ -1,4 +1,5 @@
+ import {
++  JSONSchema7,
+   LanguageModelV1FunctionTool,
+   LanguageModelV1ProviderDefinedTool,
+   LanguageModelV1ToolChoice,
+@@ -8,6 +9,199 @@ import { CoreTool } from '../tool/tool';
+ import { CoreToolChoice } from '../types/language-model';
+ import { isNonEmptyObject } from '../util/is-non-empty-object';
+ 
++type JSONSchemaDefinition = JSONSchema7 | boolean;
++
++/**
++ * Minimal structural type for zod schemas. It allows inspecting a zod schema
++ * without depending on zod's internal typings.
++ */
++interface ZodSchemaLike {
++  description?: string;
++  shape?: unknown;
++  _def?: {
++    typeName?: string;
++    description?: string;
++    innerType?: ZodSchemaLike;
++    schema?: ZodSchemaLike;
++    in?: ZodSchemaLike;
++    type?: ZodSchemaLike;
++    items?: Array<ZodSchemaLike>;
++    options?: Array<ZodSchemaLike>;
++    left?: ZodSchemaLike;
++    right?: ZodSchemaLike;
++    valueType?: ZodSchemaLike;
++  };
++}
++
++function isZodSchema(value: unknown): value is ZodSchemaLike {
++  return (
++    value != null &&
++    typeof value === 'object' &&
++    (value as ZodSchemaLike)._def != null &&
++    typeof (value as ZodSchemaLike)._def === 'object'
++  );
++}
++
++function getZodDescription(zodSchema: ZodSchemaLike): string | undefined {
++  const description = zodSchema.description ?? zodSchema._def?.description;
++
++  return typeof description === 'string' ? description : undefined;
++}
++
++/**
++ * Unwraps zod wrappers that do not change the shape of the schema,
++ * e.g. `z.string().optional()` or `z.string().default('')`.
++ */
++function unwrapZodSchema(
++  zodSchema: ZodSchemaLike,
++): ZodSchemaLike | undefined {
++  let current: ZodSchemaLike | undefined = zodSchema;
++
++  // the level limit protects against recursive schemas:
++  for (let level = 0; level < 10 && current != null; level++) {
++    switch (current._def?.typeName) {
++      case 'ZodOptional':
++      case 'ZodNullable':
++      case 'ZodDefault':
++      case 'ZodCatch':
++      case 'ZodReadonly':
++        current = current._def?.innerType;
++        break;
++      case 'ZodBranded':
++        current = current._def?.innerType ?? current._def?.type;
++        break;
++      case 'ZodEffects':
++        current = current._def?.schema;
++        break;
++      case 'ZodPipeline':
++        current = current._def?.in;
++        break;
++      default:
++        return current;
++    }
++  }
++
++  return current;
++}
++
++function getZodObjectShape(
++  zodSchema: ZodSchemaLike,
++): Record<string, ZodSchemaLike> | undefined {
++  const shape = zodSchema.shape;
++  const resolvedShape =
++    typeof shape === 'function' ? (shape as () => unknown)() : shape;
++
++  return resolvedShape != null && typeof resolvedShape === 'object'
++    ? (resolvedShape as Record<string, ZodSchemaLike>)
++    : undefined;
++}
++
++/**
++ * `zod-to-json-schema` (which is used by `asSchema`) unwraps schemas such as
++ * `ZodOptional` without copying the metadata of the wrapper. Descriptions that
++ * are attached to the wrapper (e.g. `z.string().optional().describe('...')`)
++ * are therefore lost in the generated JSON schema.
++ *
++ * This function walks the zod schema and the generated JSON schema in parallel
++ * and restores the missing descriptions so they are not lost in the schema that
++ * is sent to the model.
++ */
++export function addZodDescriptionsToJsonSchema(
++  jsonSchema: JSONSchemaDefinition | undefined,
++  zodSchema: unknown,
++): void {
++  if (jsonSchema == null || typeof jsonSchema === 'boolean') {
++    return;
++  }
++
++  if (!isZodSchema(zodSchema)) {
++    return;
++  }
++
++  // restore the description of the schema itself (it might be defined on a
++  // wrapper that was unwrapped during the JSON schema generation):
++  const description = getZodDescription(zodSchema);
++  if (description != null && jsonSchema.description == null) {
++    jsonSchema.description = description;
++  }
++
++  const unwrappedZodSchema = unwrapZodSchema(zodSchema);
++  if (unwrappedZodSchema == null) {
++    return;
++  }
++
++  switch (unwrappedZodSchema._def?.typeName) {
++    case 'ZodObject': {
++      const shape = getZodObjectShape(unwrappedZodSchema);
++      const properties = jsonSchema.properties;
++
++      if (shape == null || properties == null) {
++        return;
++      }
++
++      for (const propertyName of Object.keys(properties)) {
++        addZodDescriptionsToJsonSchema(
++          properties[propertyName],
++          shape[propertyName],
++        );
++      }
++
++      return;
++    }
++
++    case 'ZodArray': {
++      const items = jsonSchema.items;
++
++      // tuple schemas are represented as arrays of items:
++      if (items == null || Array.isArray(items)) {
++        return;
++      }
++
++      addZodDescriptionsToJsonSchema(items, unwrappedZodSchema._def?.type);
++      return;
++    }
++
++    case 'ZodRecord': {
++      addZodDescriptionsToJsonSchema(
++        jsonSchema.additionalProperties,
++        unwrappedZodSchema._def?.valueType,
++      );
++      return;
++    }
++
++    case 'ZodUnion':
++    case 'ZodDiscriminatedUnion': {
++      const options = unwrappedZodSchema._def?.options;
++      const anyOf = jsonSchema.anyOf;
++
++      if (!Array.isArray(options) || !Array.isArray(anyOf)) {
++        return;
++      }
++
++      for (let index = 0; index < Math.min(options.length, anyOf.length); index++) {
++        addZodDescriptionsToJsonSchema(anyOf[index], options[index]);
++      }
++
++      return;
++    }
++
++    case 'ZodIntersection': {
++      const allOf = jsonSchema.allOf;
++
++      if (!Array.isArray(allOf)) {
++        return;
++      }
++
++      addZodDescriptionsToJsonSchema(allOf[0], unwrappedZodSchema._def?.left);
++      addZodDescriptionsToJsonSchema(allOf[1], unwrappedZodSchema._def?.right);
++      return;
++    }
++
++    default:
++      return;
++  }
++}
++
+ export function prepareToolsAndToolChoice<
+   TOOLS extends Record<string, CoreTool>,
+ >({
+@@ -44,13 +238,21 @@ export function prepareToolsAndToolChoice<
+       const toolType = tool.type;
+       switch (toolType) {
+         case undefined:
+-        case 'function':
++        case 'function': {
++          const parameters = asSchema(tool.parameters).jsonSchema;
++
++          // `asSchema` loses descriptions that are defined on zod wrappers
++          // (e.g. `z.string().optional().describe('...')`). restore them so
++          // they are not lost in the tool parameter schema:
++          addZodDescriptionsToJsonSchema(parameters, tool.parameters);
++
+           return {
+             type: 'function' as const,
+             name,
+             description: tool.description,
+-            parameters: asSchema(tool.parameters).jsonSchema,
++            parameters,
+           };
++        }
+         case 'provider-defined':
+           return {
+             type: 'provider-defined' as const,

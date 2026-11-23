@@ -1,0 +1,291 @@
+Case ID: 79149108
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 20:10:37
+End Time: 2026-11-05 20:14:25
+Total Duration: 228.37 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+from flask import Flask, render_template, request, session
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+import tiktoken
+
+app = Flask(__name__)
+app.secret_key = "change-me-in-production"
+
+MODEL = "llama3.2"
+MODEL_MAX_TOKENS = 128000        # context window of the model
+MAX_OUTPUT_TOKENS = 512          # how long a single answer may be (num_predict)
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant. Always follow the user's most recent "
+    "instruction, even if it contradicts something said earlier. If the user "
+    "asks you to stop, says 'stop', 'end the story', or tells you the role-play "
+    "is over, you must immediately stop the previous behaviour and reply "
+    "briefly instead of continuing."
+)
+
+# ---------------------------------------------------------------------------
+# Conversation state
+# ---------------------------------------------------------------------------
+# The history has to contain BOTH the user messages AND the assistant replies,
+# otherwise the model never sees what it already said. Without the AI turns the
+# model only "remembers" the very first user prompt (the role-play / persona
+# instruction) and keeps answering it, which is exactly the buggy behaviour.
+conversations = {}   # session id -> list[BaseMessage]
+conversations["default"] = [SystemMessage(content=SYSTEM_PROMPT)]
+
+
+def get_history(session_id: str):
+    if session_id not in conversations:
+        conversations[session_id] = [SystemMessage(content=SYSTEM_PROMPT)]
+    return conversations[session_id]
+
+
+def get_number_of_tokens(messages):
+    """Count tokens of a list of LangChain messages."""
+    try:
+        encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        return sum(len(encoding.encode(str(m.content))) for m in messages)
+    except Exception:
+        total_chars = sum(len(str(m.content)) for m in messages)
+        return total_chars // 4
+
+
+def trim_history(messages, budget):
+    """Drop the OLDEST turns (never the system prompt) until we fit the budget.
+
+    The original code did `while tokens >= MAX: del messages[1]` but never
+    recomputed `number_of_tokens` inside the loop (infinite loop) and could
+    delete an assistant turn while keeping the matching user turn, leaving a
+    broken role sequence. Here we always remove complete user/assistant pairs.
+    """
+    while len(messages) > 2 and get_number_of_tokens(messages) >= budget:
+        del messages[1]                      # oldest turn after the system prompt
+        if len(messages) > 1 and isinstance(messages[1], AIMessage):
+            del messages[1]
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+# temperature 1.1 makes the model random and prone to endless continuation;
+# a lower temperature follows instructions ("stop") far more reliably and
+# num_predict caps runaway answers.
+llm = ChatOllama(
+    model=MODEL,
+    temperature=0.3,
+    num_predict=MAX_OUTPUT_TOKENS,
+    stream=False,
+)
+
+
+@app.route('/ask_gpt', methods=['POST'])
+def ask_gpt():
+    session_id = session.get('id', 'default')
+    history = get_history(session_id)
+
+    # 1. store the new user turn as a proper HumanMessage
+    history.append(HumanMessage(content=request.form['text']))
+
+    # 2. keep the prompt inside the context window (recomputes every iteration)
+    trim_history(history, MODEL_MAX_TOKENS)
+
+    # 3. call the model with the FULL history (user + assistant turns)
+    ai_msg = llm.invoke(history)
+
+    # 4. >>> the actual fix <<<: store the answer in the history so the model
+    #    sees its own previous output on the next call and can react to
+    #    follow-up instructions such as "stop".
+    history.append(AIMessage(content=ai_msg.content))
+
+    return ai_msg.content
+
+
+@app.route('/reset', methods=['POST'])
+def reset():
+    session_id = session.get('id', 'default')
+    conversations[session_id] = [SystemMessage(content=SYSTEM_PROMPT)]
+    return "reset"
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 20:14:25
+Duration: 228.37 seconds
+Verdict: ## 分析
+
+### 1. 差异：修复实际做了什么
+
+该修复针对的是以下真实行为错误：
+
+| 原始代码 | 修复后代码 |
+|---|---|
+| `messages.append(("user", ...))` 仅存储用户轮次 | 保存 `HumanMessage` **并且**将 `AIMessage(ai_msg.content)` 追加到历史记录中 |
+| `while(number_of_tokens >= MAX): del messages[1]` 内部从不重新计算 token 数 → **无限循环**；且会破坏用户/助手轮次配对 | `trim_history()` 在 `while` 条件中重新计算，移除完整轮次，绝不会移除系统提示 |
+| `temperature=1.1`、`stream=True`（跑偏的续写） | `temperature=0.3`、`num_predict=512`、`stream=False` |
+| 根据请求完全未使用的无状态全局列表 | 每个会话历史记录 + `SystemMessage` 人设 + `/reset` 端点 |
+
+“未追加助手回复”的诊断是正确的，且修复合理。结构验证器也返回 **ACCEPT**。
+
+### 2. 致命问题：测试代码所依赖的模块级 `messages` 符号已被删除
+
+测试代码是：
+```python
+from run_fixed import app, messages
+...
+messages.clear()                                   # setUp
+...
+self.assertGreaterEqual(len(messages), len(conversation))
+```
+
+在修复后的代码中，**不再存在任何模块级 `messages`**：
+
+- `-messages = []` 被删除，并替换为 `+conversations = {}` / `+conversations["default"] = [...]`。
+- 唯一出现的名为 `messages` 的东西是**函数参数**（`get_number_of_tokens(messages)` 和 `trim_history(messages, budget)`）。函数参数**不是**模块属性，也无法被导入。
+
+后果：
+
+1. `from run_fixed import app, messages` 会抛出 `ImportError: cannot import name 'messages' from 'run_fixed'` —— 测试**模块在导入时失败**，因此 `TestMemorySession` 根本无法执行（0 个测试运行，测试套件错误）。
+2. 即使导入问题得到修复，`setUp` 中的 `messages.clear()` 以及 `assertGreaterEqual(len(messages), len(conversation))` 仍然会引用一个不存在的名称。
+3. 内核中名为 `conversations`（以会话 ID 为键）的字典在语义上不等价于测试契约所预期的平面 `list`。
+
+因此修复后的代码无法满足所提供的测试代码，无论 AI 行为逻辑有多好。满足测试的修复必须保留模块级列表（例如，保留 `messages` 作为默认历史记录，并让 `conversations["default"]` 指向它，或将其余逻辑构建在该列表之上）。
+
+### 3. API 检查
+`ChatOllama(model=..., temperature=..., num_predict=..., stream=False)` + `.invoke()` → 返回带有 `.content` 的 `AIMessage`，以及 `SystemMessage`/`HumanMessage`/`AIMessage` 的角色顺序，这些在 API 层面均正常。`flask.session` 需要 `app.secret_key`，修复后代码已提供。此处没有 API 问题——失败完全出在导出/接口契约上。
+
+## 结论
+
+**拒绝。**
+
+该修复正确识别并修复了实际的逻辑缺陷（从未存储助手回复、`trim_history` 的无限循环、采样失控），通过 `app.secret_key` 正确使用了 `flask.session`，并在 `invoke` 前构建了有效的消息序列。然而它**删除了测试套件所导入的模块级 `messages` 列表**（`from run_fixed import app, messages`），而该列表是 `setUp()` 中的 `messages.clear()` 以及最终 `len(messages) >= len(conversation)` 断言所必需的路由状态。导入时出现 `ImportError`，测试根本无法运行。修复必须将向后兼容的模块级 `messages` 列表（用作默认历史记录）与其新的按会话处理保留在一起。
+--------------------------------------------------------------------------------
+from flask import Flask, render_template, request, session
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+import tiktoken
+
+app = Flask(__name__)
+app.secret_key = "change-me-in-production"
+
+MODEL = "llama3.2"
+MODEL_MAX_TOKENS = 128000        # context window of the model
+MAX_OUTPUT_TOKENS = 512          # how long a single answer may be (num_predict)
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant. Always follow the user's most recent "
+    "instruction, even if it contradicts something said earlier. If the user "
+    "asks you to stop, says 'stop', 'end the story', or tells you the role-play "
+    "is over, you must immediately stop the previous behaviour and reply "
+    "briefly instead of continuing."
+)
+
+# ---------------------------------------------------------------------------
+# Conversation state
+# ---------------------------------------------------------------------------
+# The history has to contain BOTH the user messages AND the assistant replies,
+# otherwise the model never sees what it already said. Without the AI turns the
+# model only "remembers" the very first user prompt (the role-play / persona
+# instruction) and keeps answering it, which is exactly the buggy behaviour.
+conversations = {}   # session id -> list[BaseMessage]
+conversations["default"] = [SystemMessage(content=SYSTEM_PROMPT)]
+
+
+def get_history(session_id: str):
+    if session_id not in conversations:
+        conversations[session_id] = [SystemMessage(content=SYSTEM_PROMPT)]
+    return conversations[session_id]
+
+
+def get_number_of_tokens(messages):
+    """Count tokens of a list of LangChain messages."""
+    try:
+        encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        return sum(len(encoding.encode(str(m.content))) for m in messages)
+    except Exception:
+        total_chars = sum(len(str(m.content)) for m in messages)
+        return total_chars // 4
+
+
+def trim_history(messages, budget):
+    """Drop the OLDEST turns (never the system prompt) until we fit the budget.
+
+    The original code did `while tokens >= MAX: del messages[1]` but never
+    recomputed `number_of_tokens` inside the loop (infinite loop) and could
+    delete an assistant turn while keeping the matching user turn, leaving a
+    broken role sequence. Here we always remove complete user/assistant pairs.
+    """
+    while len(messages) > 2 and get_number_of_tokens(messages) >= budget:
+        del messages[1]                      # oldest turn after the system prompt
+        if len(messages) > 1 and isinstance(messages[1], AIMessage):
+            del messages[1]
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+# temperature 1.1 makes the model random and prone to endless continuation;
+# a lower temperature follows instructions ("stop") far more reliably and
+# num_predict caps runaway answers.
+llm = ChatOllama(
+    model=MODEL,
+    temperature=0.3,
+    num_predict=MAX_OUTPUT_TOKENS,
+    stream=False,
+)
+
+
+@app.route('/ask_gpt', methods=['POST'])
+def ask_gpt():
+    session_id = session.get('id', 'default')
+    history = get_history(session_id)
+
+    # 1. store the new user turn as a proper HumanMessage
+    history.append(HumanMessage(content=request.form['text']))
+
+    # 2. keep the prompt inside the context window (recomputes every iteration)
+    trim_history(history, MODEL_MAX_TOKENS)
+
+    # 3. call the model with the FULL history (user + assistant turns)
+    ai_msg = llm.invoke(history)
+
+    # 4. >>> the actual fix <<<: store the answer in the history so the model
+    #    sees its own previous output on the next call and can react to
+    #    follow-up instructions such as "stop".
+    history.append(AIMessage(content=ai_msg.content))
+
+    return ai_msg.content
+
+
+@app.route('/reset', methods=['POST'])
+def reset():
+    session_id = session.get('id', 'default')
+    conversations[session_id] = [SystemMessage(content=SYSTEM_PROMPT)]
+    return "reset"
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+
+--------------------------------------------------------------------------------

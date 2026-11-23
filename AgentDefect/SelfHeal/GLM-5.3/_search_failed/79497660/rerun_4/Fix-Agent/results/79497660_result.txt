@@ -1,0 +1,812 @@
+Case ID: 79497660
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 03:58:08
+End Time: 2026-11-09 05:10:33
+Total Duration: 4344.60 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Store metadata such as ``external_id`` in a dedicated PostgreSQL column of the
+table used by LlamaIndex's ``PGVectorStore`` instead of the ``metadata_``
+JSON(B) column.
+
+Why the original output is wrong
+--------------------------------
+``PGVectorStore`` creates a table with a fixed layout
+
+    id | source_id | text | metadata_ | node_id | embedding
+
+and serializes the whole ``Document.metadata`` dict into the single
+``metadata_`` JSON(B) column.  There is no constructor argument for extra
+columns, so ``metadata={"external_id": "ext_001"}`` ends up nested inside the
+JSON column instead of being a real ``external_id`` column of the table.
+
+How this is fixed
+-----------------
+1. ``PGVectorStore`` is subclassed.
+2. Once the store has been created (and its table exists), the extra columns
+   are added with ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` (idempotent).
+3. ``add()`` / ``async_add()`` are overridden so that, for every node, the
+   configured metadata keys are taken out of the node metadata (=> they are no
+   longer duplicated inside ``metadata_``) and written into their own columns.
+
+The result: ``external_id`` is a first class column of the table which can be
+indexed and filtered on with plain SQL.
+"""
+
+import os
+from typing import Any, Dict, Iterator, List, Sequence, Tuple
+
+import psycopg2
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy import text as sa_text
+
+from llama_index.core import Document, StorageContext, VectorStoreIndex
+from llama_index.core.schema import BaseNode
+from llama_index.vector_stores.postgres import PGVectorStore
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# connection settings (same values as in the original script)
+# ---------------------------------------------------------------------------
+PG_HOST = os.getenv("PG_HOST", "localhost")
+PG_PORT = int(os.getenv("PG_PORT", "5432"))
+PG_USER = os.getenv("PG_USER", "postgres")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "password")
+TABLE_NAME = "vectorstore"
+
+# metadata key -> SQL column type of the columns that become *real* table
+# columns instead of being nested inside the metadata_ JSON column
+CUSTOM_COLUMNS: Dict[str, str] = {
+    "external_id": "TEXT",
+}
+
+
+class PGVectorStoreWithCustomColumns(PGVectorStore):
+    """``PGVectorStore`` that stores selected metadata keys in their own columns."""
+
+    # plain class attribute on purpose (must NOT become a pydantic field)
+    custom_columns = dict(CUSTOM_COLUMNS)
+
+    # ------------------------------------------------------------------ #
+    # internal helpers                                                   #
+    # ------------------------------------------------------------------ #
+    def _physical_table_name(self) -> str:
+        """Name of the table PGVectorStore actually created for us."""
+        name: Any = None
+        table = getattr(self, "_table_class", None)
+        if table is not None:
+            # either an ORM mapped class (``__tablename__``) or a SQLAlchemy
+            # Core ``Table`` object (``.name``)
+            name = getattr(table, "__tablename__", None) or getattr(
+                table, "name", None
+            )
+        if not isinstance(name, str) or not name:
+            # PGVectorStore prefixes the configured table name with "data_"
+            name = f"data_{self.table_name}"
+        schema = getattr(self, "schema_name", None)
+        return f"{schema}.{name}" if schema else name
+
+    def _engine_or_new(self) -> Any:
+        """Reuse the store's engine when available, otherwise build one."""
+        engine = getattr(self, "_engine", None) or getattr(self, "_sync_engine", None)
+        return engine if engine is not None else create_engine(self.connection_string)
+
+    def _extract_custom_values(
+        self, nodes: Sequence[BaseNode]
+    ) -> List[Dict[str, Any]]:
+        """Take the custom-column values out of the node metadata dicts.
+
+        Removing them here guarantees they are *not* duplicated inside the
+        ``metadata_`` JSON(B) column when the parent ``add()`` runs.
+        """
+        extracted: List[Dict[str, Any]] = []
+        for node in nodes:
+            metadata = node.metadata if node.metadata else {}
+            values: Dict[str, Any] = {
+                column: metadata.pop(column, None) for column in self.custom_columns
+            }
+            values["node_id"] = node.node_id
+            extracted.append(values)
+        return extracted
+
+    def _restore_custom_values(
+        self, nodes: Sequence[BaseNode], extracted: List[Dict[str, Any]]
+    ) -> None:
+        """Put the values back into the metadata of the in-memory nodes."""
+        for node, values in zip(nodes, extracted):
+            for column, value in values.items():
+                if column != "node_id" and value is not None:
+                    node.metadata[column] = value
+
+    def _custom_column_updates(
+        self, extracted: List[Dict[str, Any]]
+    ) -> Iterator[Tuple[Any, Dict[str, Any]]]:
+        """Yield ``(statement, params)`` pairs filling the custom columns."""
+        table = self._physical_table_name()
+        for values in extracted:
+            columns = [c for c in self.custom_columns if values.get(c) is not None]
+            if not columns:
+                continue
+            set_clause = ", ".join(f"{column} = :{column}" for column in columns)
+            params: Dict[str, Any] = {column: values[column] for column in columns}
+            params["node_id"] = values["node_id"]
+            yield (
+                sa_text(f"UPDATE {table} SET {set_clause} WHERE node_id = :node_id"),
+                params,
+            )
+
+    def _apply_custom_columns(self, engine: Any) -> None:
+        """Add the custom columns to the table (idempotent).
+
+        No-op if PGVectorStore has not created its table yet (the columns are
+        then added on the first ``add()`` call).
+        """
+        table = self._physical_table_name()
+        with engine.begin() as connection:
+            exists = connection.execute(
+                sa_text("SELECT to_regclass(:table) IS NOT NULL"), {"table": table}
+            ).scalar()
+            if not exists:
+                return
+            for column, column_type in self.custom_columns.items():
+                connection.execute(
+                    sa_text(
+                        f"ALTER TABLE {table} "
+                        f"ADD COLUMN IF NOT EXISTS {column} {column_type}"
+                    )
+                )
+
+    async def _apply_custom_columns_async(self, engine: Any) -> None:
+        """Async version of :meth:`_apply_custom_columns`."""
+        table = self._physical_table_name()
+        async with engine.begin() as connection:
+            result = await connection.execute(
+                sa_text("SELECT to_regclass(:table) IS NOT NULL"), {"table": table}
+            )
+            if not result.scalar():
+                return
+            for column, column_type in self.custom_columns.items():
+                await connection.execute(
+                    sa_text(
+                        f"ALTER TABLE {table} "
+                        f"ADD COLUMN IF NOT EXISTS {column} {column_type}"
+                    )
+                )
+
+    # ------------------------------------------------------------------ #
+    # public API                                                         #
+    # ------------------------------------------------------------------ #
+    def ensure_custom_columns(self) -> None:
+        """Make sure the custom columns exist on the backing table."""
+        self._apply_custom_columns(self._engine_or_new())
+
+    def get_node_ids(self, **column_values: Any) -> List[str]:
+        """Look up node ids by custom column values.
+
+        Example::
+
+            vector_store.get_node_ids(external_id="ext_001")
+        """
+        if not column_values:
+            return []
+        table = self._physical_table_name()
+        conditions = " AND ".join(f"{column} = :{column}" for column in column_values)
+        statement = sa_text(f"SELECT node_id FROM {table} WHERE {conditions}")
+        with self._engine_or_new().connect() as connection:
+            result = connection.execute(statement, column_values)
+            return [row[0] for row in result.fetchall()]
+
+    def add(self, nodes: Sequence[BaseNode], **add_kwargs: Any) -> List[str]:
+        """Add nodes, storing the configured metadata keys in their own columns."""
+        nodes = list(nodes)
+        extracted = self._extract_custom_values(nodes)
+
+        try:
+            # the parent writes the standard columns (id, source_id, text,
+            # metadata_, node_id, embedding); the custom keys were removed
+            # from the metadata so they are not buried in the JSON column
+            ids = super().add(nodes, **add_kwargs)
+        finally:
+            self._restore_custom_values(nodes, extracted)
+
+        engine = self._engine_or_new()
+        # the table exists now -> make sure the custom columns exist ...
+        self._apply_custom_columns(engine)
+        # ... and fill them with the values of the nodes we just inserted
+        with engine.begin() as connection:
+            for statement, params in self._custom_column_updates(extracted):
+                connection.execute(statement, params)
+
+        return ids
+
+    async def async_add(
+        self, nodes: Sequence[BaseNode], **add_kwargs: Any
+    ) -> List[str]:
+        """Async flavour of :meth:`add`."""
+        nodes = list(nodes)
+        extracted = self._extract_custom_values(nodes)
+
+        try:
+            ids = await super().async_add(nodes, **add_kwargs)
+        finally:
+            self._restore_custom_values(nodes, extracted)
+
+        engine = getattr(self, "_async_engine", None)
+        if engine is None:
+            # fall back to creating an async engine ourselves
+            from sqlalchemy.ext.asyncio import create_async_engine
+
+            async_url = self.async_connection_string
+            if "+asyncpg" not in async_url:
+                async_url = async_url.replace("+psycopg2", "+asyncpg")
+            engine = create_async_engine(async_url)
+
+        await self._apply_custom_columns_async(engine)
+        async with engine.begin() as connection:
+            for statement, params in self._custom_column_updates(extracted):
+                await connection.execute(statement, params)
+
+        return ids
+
+
+# ---------------------------------------------------------------------------
+# application code (same structure as the original script)
+# ---------------------------------------------------------------------------
+def create_vector_store(request):
+    vector_store = PGVectorStoreWithCustomColumns.from_params(
+        database=request.tenant,
+        host=PG_HOST,
+        password=PG_PASSWORD,
+        port=PG_PORT,
+        user=PG_USER,
+        table_name=TABLE_NAME,
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+
+    # PGVectorStore has created its table (id, source_id, text, metadata_,
+    # node_id, embedding) -> extend the schema with the custom columns
+    vector_store.ensure_custom_columns()
+
+    return vector_store
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    # the documents are inserted through the overridden ``add()`` above, so
+    # ``external_id`` is written into its own column of the table instead of
+    # being nested inside the ``metadata_`` JSON column
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+
+    return index
+
+
+def verify_result(request):
+    """Print schema and rows, proving that external_id is a real table column."""
+    vector_store = create_vector_store(request)  # re-opens the existing table
+    table = vector_store._physical_table_name()
+
+    connection = psycopg2.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        dbname=request.tenant,
+        user=PG_USER,
+        password=PG_PASSWORD,
+    )
+    try:
+        with connection.cursor() as cursor:
+            # 1) the table schema now contains the custom column(s)
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            columns = [row[0] for row in cursor.fetchall()]
+            print(f"Table '{table}' columns: {columns}")
+            for column in CUSTOM_COLUMNS:
+                assert column in columns, f"column '{column}' missing on '{table}'"
+
+            # 2) the values live in the dedicated column and are no longer
+            #    duplicated inside the metadata_ JSON column
+            cursor.execute(
+                f"""
+                SELECT external_id,
+                       metadata_ ->> 'external_id' AS external_id_in_metadata
+                FROM {table}
+                WHERE external_id IS NOT NULL
+                ORDER BY external_id
+                """
+            )
+            rows = cursor.fetchall()
+            assert rows, "no rows with a populated external_id column were found"
+            print("\nRows stored through the fixed code:")
+            for external_id, external_id_in_metadata in rows:
+                print(
+                    f"  external_id column = {external_id!r} | "
+                    f"duplicated inside metadata_ JSON = {external_id_in_metadata!r}"
+                )
+                assert external_id_in_metadata is None, (
+                    "external_id leaked into the metadata_ JSON column"
+                )
+
+            # rows written by an earlier (buggy) run of the script, if any
+            cursor.execute(f"SELECT count(*) FROM {table} WHERE external_id IS NULL")
+            legacy_rows = cursor.fetchone()[0]
+            if legacy_rows:
+                print(
+                    f"\n({legacy_rows} older row(s) written before the fix still "
+                    "keep their external_id inside the metadata_ JSON column)"
+                )
+    finally:
+        connection.close()
+
+    # 3) the dedicated column can be used for plain SQL lookups
+    print("\nLookup by the custom column:")
+    for external_id in ("ext_001", "ext_002"):
+        node_ids = vector_store.get_node_ids(external_id=external_id)
+        print(f"  external_id={external_id!r} -> node_ids={node_ids}")
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+
+    verify_result(request)
+
+    print("\nFixed: 'external_id' is now stored as a separate column of the")
+    print("PostgreSQL table instead of the metadata_ JSON column.")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 05:10:33
+Duration: 4344.60 seconds
+Verdict: # Evaluation of Case 79497660
+
+## Summary of Results
+
+| Tool | Result |
+|------|--------|
+| `generate_diff` | Complete fix: subclassed `PGVectorStore` with custom column support |
+| `validate_fixed_code` | **ACCEPT** — matches expected structure and output format |
+| `verify_api_usage` | Search service returned timeouts/irrelevant results for all queries, so I verified APIs through knowledge of the libraries |
+
+## Detailed Analysis
+
+### The Bug
+The original code passes `metadata={"external_id": "ext_001"}` to `Document`. `PGVectorStore` has a fixed schema (`id, source_id, text, metadata_, node_id, embedding`) with no constructor hook for extra columns, so `external_id` was serialized inside the `metadata_` JSON(B) column. The test explicitly requires: (1) `external_id` as a real column on `data_vectorstore`, (2) `external_id` NOT present in `metadata_`, and (3) values `ext_001`/`ext_002` populated.
+
+### Why the Fix is Correct
+
+1. **Subclassing `PGVectorStore` with `from_params`**: `from_params` is a `@classmethod` that returns `cls(...)`, so `PGVectorStoreWithCustomColumns.from_params(...)` correctly instantiates the subclass. The `custom_columns` dict is an unannotated class attribute, which remains a plain class attribute (not a pydantic field) — correctly noted in the code comment.
+
+2. **Table name resolution**: The test queries `data_vectorstore`. The helper resolves the physical name via `_table_class.__tablename__` (which is `data_{table_name}`) with a correct fallback to `f"data_{self.table_name}"` — matches the actual table.
+
+3. **Removal from `metadata_` (key test assertion)**: `_extract_custom_values` uses `metadata.pop(column, None)` *before* calling `super().add(nodes)`. Since `PGVectorStore.add` serializes `node.metadata` into the `metadata_` column at that moment, `external_id` is genuinely absent from the JSON. Values are restored to in-memory nodes afterward in a `finally` block, avoiding side effects on the returned index.
+
+4. **Populating the column**: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS external_id TEXT` is idempotent; `UPDATE ... WHERE node_id = :node_id` matches rows because `PGVectorStore` stores `node.node_id` in the `node_id` column. SQLAlchemy `text()` with named parameters and `engine.begin()` is correct usage in both 1.4 and 2.0.
+
+5. **Robustness**: Defensive `getattr` fallbacks for `_engine`/`_sync_engine`/`_table_class` handle version differences and lazy initialization; `_apply_custom_columns` is re-run inside `add()` after the table is guaranteed to exist. Both sync (`add`) and async (`async_add`) paths are handled. `None` metadata on nodes is handled safely (restore skips `None` values).
+
+6. **Correct index wiring**: `StorageContext.from_defaults(vector_store=vector_store)` is the canonical pattern; `VectorStoreIndex.from_documents` routes node insertion through the overridden `add()` (sync, since `use_async=False`).
+
+### Test Determinism Check
+Running the tests alphabetically: `test_expected_external_ids` runs first (only 2 rows exist — both `ext_001` and `ext_002`, passes deterministically). `test_external_id_saved_in_column` runs second (4 rows after its own `run_agent` call), but `ORDER BY id DESC LIMIT 2` selects *any* two rows — and **all** rows written by the fixed code have non-null `external_id` and clean `metadata_`, so both assertions pass deterministically.
+
+### Minor Caveats (non-blocking)
+- Reliance on private attributes (`_table_class`, `_engine`) — mitigated by defensive fallbacks.
+- The fallback engine in `_engine_or_new()` isn't disposed — a minor resource concern, not exercised in practice.
+- An embedding model is required by `VectorStoreIndex.from_documents` — identical requirement to the buggy code, so no regression.
+
+## Verdict
+
+**ACCEPT**
+
+The fix correctly addresses the root cause: `external_id` is now a first-class, idempotently-created PostgreSQL column populated via `UPDATE ... WHERE node_id = :node_id`, and it is provably removed from the `metadata_` JSON payload (popped before the parent `add()` executes). It preserves the original `create_vector_store`/`run_agent` API contracts, passes structural validation, and satisfies both test methods deterministically against a fresh database.
+--------------------------------------------------------------------------------
+"""
+Store metadata such as ``external_id`` in a dedicated PostgreSQL column of the
+table used by LlamaIndex's ``PGVectorStore`` instead of the ``metadata_``
+JSON(B) column.
+
+Why the original output is wrong
+--------------------------------
+``PGVectorStore`` creates a table with a fixed layout
+
+    id | source_id | text | metadata_ | node_id | embedding
+
+and serializes the whole ``Document.metadata`` dict into the single
+``metadata_`` JSON(B) column.  There is no constructor argument for extra
+columns, so ``metadata={"external_id": "ext_001"}`` ends up nested inside the
+JSON column instead of being a real ``external_id`` column of the table.
+
+How this is fixed
+-----------------
+1. ``PGVectorStore`` is subclassed.
+2. Once the store has been created (and its table exists), the extra columns
+   are added with ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` (idempotent).
+3. ``add()`` / ``async_add()`` are overridden so that, for every node, the
+   configured metadata keys are taken out of the node metadata (=> they are no
+   longer duplicated inside ``metadata_``) and written into their own columns.
+
+The result: ``external_id`` is a first class column of the table which can be
+indexed and filtered on with plain SQL.
+"""
+
+import os
+from typing import Any, Dict, Iterator, List, Sequence, Tuple
+
+import psycopg2
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy import text as sa_text
+
+from llama_index.core import Document, StorageContext, VectorStoreIndex
+from llama_index.core.schema import BaseNode
+from llama_index.vector_stores.postgres import PGVectorStore
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# connection settings (same values as in the original script)
+# ---------------------------------------------------------------------------
+PG_HOST = os.getenv("PG_HOST", "localhost")
+PG_PORT = int(os.getenv("PG_PORT", "5432"))
+PG_USER = os.getenv("PG_USER", "postgres")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "password")
+TABLE_NAME = "vectorstore"
+
+# metadata key -> SQL column type of the columns that become *real* table
+# columns instead of being nested inside the metadata_ JSON column
+CUSTOM_COLUMNS: Dict[str, str] = {
+    "external_id": "TEXT",
+}
+
+
+class PGVectorStoreWithCustomColumns(PGVectorStore):
+    """``PGVectorStore`` that stores selected metadata keys in their own columns."""
+
+    # plain class attribute on purpose (must NOT become a pydantic field)
+    custom_columns = dict(CUSTOM_COLUMNS)
+
+    # ------------------------------------------------------------------ #
+    # internal helpers                                                   #
+    # ------------------------------------------------------------------ #
+    def _physical_table_name(self) -> str:
+        """Name of the table PGVectorStore actually created for us."""
+        name: Any = None
+        table = getattr(self, "_table_class", None)
+        if table is not None:
+            # either an ORM mapped class (``__tablename__``) or a SQLAlchemy
+            # Core ``Table`` object (``.name``)
+            name = getattr(table, "__tablename__", None) or getattr(
+                table, "name", None
+            )
+        if not isinstance(name, str) or not name:
+            # PGVectorStore prefixes the configured table name with "data_"
+            name = f"data_{self.table_name}"
+        schema = getattr(self, "schema_name", None)
+        return f"{schema}.{name}" if schema else name
+
+    def _engine_or_new(self) -> Any:
+        """Reuse the store's engine when available, otherwise build one."""
+        engine = getattr(self, "_engine", None) or getattr(self, "_sync_engine", None)
+        return engine if engine is not None else create_engine(self.connection_string)
+
+    def _extract_custom_values(
+        self, nodes: Sequence[BaseNode]
+    ) -> List[Dict[str, Any]]:
+        """Take the custom-column values out of the node metadata dicts.
+
+        Removing them here guarantees they are *not* duplicated inside the
+        ``metadata_`` JSON(B) column when the parent ``add()`` runs.
+        """
+        extracted: List[Dict[str, Any]] = []
+        for node in nodes:
+            metadata = node.metadata if node.metadata else {}
+            values: Dict[str, Any] = {
+                column: metadata.pop(column, None) for column in self.custom_columns
+            }
+            values["node_id"] = node.node_id
+            extracted.append(values)
+        return extracted
+
+    def _restore_custom_values(
+        self, nodes: Sequence[BaseNode], extracted: List[Dict[str, Any]]
+    ) -> None:
+        """Put the values back into the metadata of the in-memory nodes."""
+        for node, values in zip(nodes, extracted):
+            for column, value in values.items():
+                if column != "node_id" and value is not None:
+                    node.metadata[column] = value
+
+    def _custom_column_updates(
+        self, extracted: List[Dict[str, Any]]
+    ) -> Iterator[Tuple[Any, Dict[str, Any]]]:
+        """Yield ``(statement, params)`` pairs filling the custom columns."""
+        table = self._physical_table_name()
+        for values in extracted:
+            columns = [c for c in self.custom_columns if values.get(c) is not None]
+            if not columns:
+                continue
+            set_clause = ", ".join(f"{column} = :{column}" for column in columns)
+            params: Dict[str, Any] = {column: values[column] for column in columns}
+            params["node_id"] = values["node_id"]
+            yield (
+                sa_text(f"UPDATE {table} SET {set_clause} WHERE node_id = :node_id"),
+                params,
+            )
+
+    def _apply_custom_columns(self, engine: Any) -> None:
+        """Add the custom columns to the table (idempotent).
+
+        No-op if PGVectorStore has not created its table yet (the columns are
+        then added on the first ``add()`` call).
+        """
+        table = self._physical_table_name()
+        with engine.begin() as connection:
+            exists = connection.execute(
+                sa_text("SELECT to_regclass(:table) IS NOT NULL"), {"table": table}
+            ).scalar()
+            if not exists:
+                return
+            for column, column_type in self.custom_columns.items():
+                connection.execute(
+                    sa_text(
+                        f"ALTER TABLE {table} "
+                        f"ADD COLUMN IF NOT EXISTS {column} {column_type}"
+                    )
+                )
+
+    async def _apply_custom_columns_async(self, engine: Any) -> None:
+        """Async version of :meth:`_apply_custom_columns`."""
+        table = self._physical_table_name()
+        async with engine.begin() as connection:
+            result = await connection.execute(
+                sa_text("SELECT to_regclass(:table) IS NOT NULL"), {"table": table}
+            )
+            if not result.scalar():
+                return
+            for column, column_type in self.custom_columns.items():
+                await connection.execute(
+                    sa_text(
+                        f"ALTER TABLE {table} "
+                        f"ADD COLUMN IF NOT EXISTS {column} {column_type}"
+                    )
+                )
+
+    # ------------------------------------------------------------------ #
+    # public API                                                         #
+    # ------------------------------------------------------------------ #
+    def ensure_custom_columns(self) -> None:
+        """Make sure the custom columns exist on the backing table."""
+        self._apply_custom_columns(self._engine_or_new())
+
+    def get_node_ids(self, **column_values: Any) -> List[str]:
+        """Look up node ids by custom column values.
+
+        Example::
+
+            vector_store.get_node_ids(external_id="ext_001")
+        """
+        if not column_values:
+            return []
+        table = self._physical_table_name()
+        conditions = " AND ".join(f"{column} = :{column}" for column in column_values)
+        statement = sa_text(f"SELECT node_id FROM {table} WHERE {conditions}")
+        with self._engine_or_new().connect() as connection:
+            result = connection.execute(statement, column_values)
+            return [row[0] for row in result.fetchall()]
+
+    def add(self, nodes: Sequence[BaseNode], **add_kwargs: Any) -> List[str]:
+        """Add nodes, storing the configured metadata keys in their own columns."""
+        nodes = list(nodes)
+        extracted = self._extract_custom_values(nodes)
+
+        try:
+            # the parent writes the standard columns (id, source_id, text,
+            # metadata_, node_id, embedding); the custom keys were removed
+            # from the metadata so they are not buried in the JSON column
+            ids = super().add(nodes, **add_kwargs)
+        finally:
+            self._restore_custom_values(nodes, extracted)
+
+        engine = self._engine_or_new()
+        # the table exists now -> make sure the custom columns exist ...
+        self._apply_custom_columns(engine)
+        # ... and fill them with the values of the nodes we just inserted
+        with engine.begin() as connection:
+            for statement, params in self._custom_column_updates(extracted):
+                connection.execute(statement, params)
+
+        return ids
+
+    async def async_add(
+        self, nodes: Sequence[BaseNode], **add_kwargs: Any
+    ) -> List[str]:
+        """Async flavour of :meth:`add`."""
+        nodes = list(nodes)
+        extracted = self._extract_custom_values(nodes)
+
+        try:
+            ids = await super().async_add(nodes, **add_kwargs)
+        finally:
+            self._restore_custom_values(nodes, extracted)
+
+        engine = getattr(self, "_async_engine", None)
+        if engine is None:
+            # fall back to creating an async engine ourselves
+            from sqlalchemy.ext.asyncio import create_async_engine
+
+            async_url = self.async_connection_string
+            if "+asyncpg" not in async_url:
+                async_url = async_url.replace("+psycopg2", "+asyncpg")
+            engine = create_async_engine(async_url)
+
+        await self._apply_custom_columns_async(engine)
+        async with engine.begin() as connection:
+            for statement, params in self._custom_column_updates(extracted):
+                await connection.execute(statement, params)
+
+        return ids
+
+
+# ---------------------------------------------------------------------------
+# application code (same structure as the original script)
+# ---------------------------------------------------------------------------
+def create_vector_store(request):
+    vector_store = PGVectorStoreWithCustomColumns.from_params(
+        database=request.tenant,
+        host=PG_HOST,
+        password=PG_PASSWORD,
+        port=PG_PORT,
+        user=PG_USER,
+        table_name=TABLE_NAME,
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+
+    # PGVectorStore has created its table (id, source_id, text, metadata_,
+    # node_id, embedding) -> extend the schema with the custom columns
+    vector_store.ensure_custom_columns()
+
+    return vector_store
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    # the documents are inserted through the overridden ``add()`` above, so
+    # ``external_id`` is written into its own column of the table instead of
+    # being nested inside the ``metadata_`` JSON column
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+
+    return index
+
+
+def verify_result(request):
+    """Print schema and rows, proving that external_id is a real table column."""
+    vector_store = create_vector_store(request)  # re-opens the existing table
+    table = vector_store._physical_table_name()
+
+    connection = psycopg2.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        dbname=request.tenant,
+        user=PG_USER,
+        password=PG_PASSWORD,
+    )
+    try:
+        with connection.cursor() as cursor:
+            # 1) the table schema now contains the custom column(s)
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            columns = [row[0] for row in cursor.fetchall()]
+            print(f"Table '{table}' columns: {columns}")
+            for column in CUSTOM_COLUMNS:
+                assert column in columns, f"column '{column}' missing on '{table}'"
+
+            # 2) the values live in the dedicated column and are no longer
+            #    duplicated inside the metadata_ JSON column
+            cursor.execute(
+                f"""
+                SELECT external_id,
+                       metadata_ ->> 'external_id' AS external_id_in_metadata
+                FROM {table}
+                WHERE external_id IS NOT NULL
+                ORDER BY external_id
+                """
+            )
+            rows = cursor.fetchall()
+            assert rows, "no rows with a populated external_id column were found"
+            print("\nRows stored through the fixed code:")
+            for external_id, external_id_in_metadata in rows:
+                print(
+                    f"  external_id column = {external_id!r} | "
+                    f"duplicated inside metadata_ JSON = {external_id_in_metadata!r}"
+                )
+                assert external_id_in_metadata is None, (
+                    "external_id leaked into the metadata_ JSON column"
+                )
+
+            # rows written by an earlier (buggy) run of the script, if any
+            cursor.execute(f"SELECT count(*) FROM {table} WHERE external_id IS NULL")
+            legacy_rows = cursor.fetchone()[0]
+            if legacy_rows:
+                print(
+                    f"\n({legacy_rows} older row(s) written before the fix still "
+                    "keep their external_id inside the metadata_ JSON column)"
+                )
+    finally:
+        connection.close()
+
+    # 3) the dedicated column can be used for plain SQL lookups
+    print("\nLookup by the custom column:")
+    for external_id in ("ext_001", "ext_002"):
+        node_ids = vector_store.get_node_ids(external_id=external_id)
+        print(f"  external_id={external_id!r} -> node_ids={node_ids}")
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+
+    verify_result(request)
+
+    print("\nFixed: 'external_id' is now stored as a separate column of the")
+    print("PostgreSQL table instead of the metadata_ JSON column.")
+
+--------------------------------------------------------------------------------

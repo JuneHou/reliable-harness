@@ -1,0 +1,196 @@
+diff --git a/agixt/Agent.py b/agixt/Agent.py
+index fcab9d5..8697797 100644
+--- a/agixt/Agent.py
++++ b/agixt/Agent.py
+@@ -32,6 +32,33 @@ logging.basicConfig(
+ )
+ 
+ 
++def to_bool(value):
++    """Normalize values coming from API payloads into a real boolean."""
++    if isinstance(value, bool):
++        return value
++    if value is None:
++        return False
++    if isinstance(value, str):
++        return value.strip().lower() in ("true", "1", "yes", "on", "enabled")
++    return bool(value)
++
++
++def get_or_create_command(session, command_name):
++    """Make sure the command exists in the database before relating it to an agent."""
++    command = session.query(Command).filter_by(name=command_name).first()
++    if command:
++        return command
++    try:
++        command = Command(name=command_name)
++        session.add(command)
++        session.flush()
++        return command
++    except Exception as e:
++        session.rollback()
++        logging.error(f"Error creating command {command_name}: {str(e)}")
++        return session.query(Command).filter_by(name=command_name).first()
++
++
+ def add_agent(agent_name, provider_settings=None, commands=None, user=DEFAULT_USER):
+     if not agent_name:
+         return {"message": "Agent name cannot be empty."}
+@@ -79,10 +106,12 @@ def add_agent(agent_name, provider_settings=None, commands=None, user=DEFAULT_US
+         session.add(agent_setting)
+     if commands:
+         for command_name, enabled in commands.items():
+-            command = session.query(Command).filter_by(name=command_name).first()
++            command = get_or_create_command(session=session, command_name=command_name)
+             if command:
+                 agent_command = AgentCommand(
+-                    agent_id=agent.id, command_id=command.id, state=enabled
++                    agent_id=agent.id,
++                    command_id=command.id,
++                    state=to_bool(enabled),
+                 )
+                 session.add(agent_command)
+     session.commit()
+@@ -341,20 +370,15 @@ class Agent:
+             )
+             agent_commands = (
+                 session.query(AgentCommand)
+-                .join(Command)
+-                .filter(
+-                    AgentCommand.agent_id == agent.id,
+-                    AgentCommand.state == True,
+-                )
++                .filter(AgentCommand.agent_id == agent.id)
+                 .all()
+             )
++            enabled_commands = set()
++            for agent_command in agent_commands:
++                if agent_command.command is not None and agent_command.state:
++                    enabled_commands.add(agent_command.command.name)
+             for command in all_commands:
+-                config["commands"].update(
+-                    {
+-                        command.name: command.name
+-                        in [ac.command.name for ac in agent_commands]
+-                    }
+-                )
++                config["commands"][command.name] = command.name in enabled_commands
+             for setting in agent_settings:
+                 config["settings"][setting.name] = setting.value
+             session.commit()
+@@ -449,18 +473,18 @@ class Agent:
+             .first()
+         )
+         if not agent:
+-            if self.user == DEFAULT_USER:
+-                return f"Agent {self.agent_name} not found."
+             # Check if it is a global agent.
+             global_user = session.query(User).filter(User.email == DEFAULT_USER).first()
+-            global_agent = (
+-                session.query(AgentModel)
+-                .filter(
+-                    AgentModel.name == self.agent_name,
+-                    AgentModel.user_id == global_user.id,
++            global_agent = None
++            if global_user:
++                global_agent = (
++                    session.query(AgentModel)
++                    .filter(
++                        AgentModel.name == self.agent_name,
++                        AgentModel.user_id == global_user.id,
++                    )
++                    .first()
+                 )
+-                .first()
+-            )
+             # if it is a global agent, copy it to the user's agents.
+             if global_agent:
+                 agent = AgentModel(
+@@ -482,25 +506,29 @@ class Agent:
+                         value=setting.value,
+                     )
+                     session.add(agent_setting)
+-                session.commit()
+                 agent_commands = (
+                     session.query(AgentCommand)
+                     .filter_by(agent_id=global_agent.id)
+                     .all()
+                 )
+-                for agent_command in agent_commands:
++                for global_agent_command in agent_commands:
+                     agent_command = AgentCommand(
+                         agent_id=agent.id,
+-                        command_id=agent_command.command_id,
+-                        state=agent_command.state,
++                        command_id=global_agent_command.command_id,
++                        state=global_agent_command.state,
+                     )
+                     session.add(agent_command)
+                 session.commit()
++            else:
+                 session.close()
+-                return f"Agent {self.agent_name} configuration updated successfully."
++                return f"Agent {self.agent_name} not found."
++        # Apply the new configuration to the agent (even when it was just copied
++        # from a global agent, so the requested changes are actually persisted).
+         if config_key == "commands":
+             for command_name, enabled in new_config.items():
+-                command = session.query(Command).filter_by(name=command_name).first()
++                command = get_or_create_command(
++                    session=session, command_name=command_name
++                )
+                 if command:
+                     agent_command = (
+                         session.query(AgentCommand)
+@@ -508,10 +536,12 @@ class Agent:
+                         .first()
+                     )
+                     if agent_command:
+-                        agent_command.state = enabled
++                        agent_command.state = to_bool(enabled)
+                     else:
+                         agent_command = AgentCommand(
+-                            agent_id=agent.id, command_id=command.id, state=enabled
++                            agent_id=agent.id,
++                            command_id=command.id,
++                            state=to_bool(enabled),
+                         )
+                         session.add(agent_command)
+         else:
+diff --git a/agixt/endpoints/Agent.py b/agixt/endpoints/Agent.py
+index 9f351b6..d19c272 100644
+--- a/agixt/endpoints/Agent.py
++++ b/agixt/endpoints/Agent.py
+@@ -115,9 +115,20 @@ async def update_agent_settings(
+     for key in settings.settings:
+         if settings.settings[key] != "HIDDEN":
+             new_settings[key] = settings.settings[key]
+-    update_config = Agent(
+-        agent_name=agent_name, user=user, ApiClient=ApiClient
+-    ).update_agent_config(new_config=settings.settings, config_key="settings")
++    agent = Agent(agent_name=agent_name, user=user, ApiClient=ApiClient)
++    update_config = None
++    if new_settings:
++        update_config = agent.update_agent_config(
++            new_config=new_settings, config_key="settings"
++        )
++    # Persist any command selections sent along with the settings so they do not
++    # revert after the page is refreshed.
++    if settings.commands:
++        update_config = agent.update_agent_config(
++            new_config=settings.commands, config_key="commands"
++        )
++    if update_config is None:
++        update_config = f"Agent {agent_name} configuration updated."
+     return ResponseMessage(message=update_config)
+ 
+ 
+@@ -358,7 +369,7 @@ async def toggle_command(
+         else:
+             agent.AGENT_CONFIG["commands"][payload.command_name] = payload.enable
+             agent.update_agent_config(
+-                new_config=agent.AGENT_CONFIG["commands"], config_key="commands"
++                new_config={payload.command_name: payload.enable}, config_key="commands"
+             )
+             return ResponseMessage(
+                 message=f"Command '{payload.command_name}' toggled for agent '{agent_name}'."

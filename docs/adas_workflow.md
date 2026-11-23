@@ -1,0 +1,90 @@
+# ADAS workflow
+
+This note describes how the ADAS (Automated Design of Agentic Systems) Meta Agent Search method (arXiv 2408.08435) and its repository run. A repository statement cites the file and line at commit 2702bee of `/data/wang/junh/githubs/method-repos/ADAS`, and a paper statement cites the section, table, figure or appendix. The search loop and the two model call functions of `_mgsm/search.py` are the same code in `_drop/search.py`, `_mmlu/search.py` and `_gpqa/search.py`, at line numbers that differ by at most one.
+
+## 1. What the method takes as input
+
+- Algorithm 1 takes the target domain validation data and a maximum number of iterations N. It returns the archive of discovered agents (App. H).
+- The archive is optionally initialized with baseline agents (§3). The paper uses all baselines as initial seeds (§4.1) and reports a search from an empty archive in App. I (Table 6).
+- Each domain folder holds its own `search.py`, launched as `python {DOMAIN}/search.py` (`README.md:45` to `:51`). Its main block runs `search(args)` and then `evaluate(args)` (`_mgsm/search.py:335` to `:360`, `_arc/search.py:421` to `:446`).
+- When no archive file exists, `search` starts from `get_init_archive()` (`_mgsm/search.py:154` to `:156`). When the file exists, it loads it and resumes after the last generation number (`:146` to `:153`). An option to start from an empty archive is not found in the code.
+- The initial archive for DROP, MGSM, MMLU and GPQA holds seven agents named Chain-of-Thought, Self-Consistency with Chain-of-Thought, Self-Refine (Reflexion), LLM Debate, Step-back Abstraction, Quality-Diversity and Dynamic Assignment of Roles (`_mgsm/mgsm_prompt.py:526` to `:527`, `_drop/drop_prompt.py:528`, `_mmlu/mmlu_prompt.py:531`, `_gpqa/gpqa_prompt.py:537`). The paper calls the last of these baselines Role Assignment (§4.2, App. F).
+- The initial ARC archive holds five agents (`_arc/arc_prompt.py:663` to `:664`). These are the five baselines of §4.1.
+- Each archive entry is a JSON object with `thought`, `name` and `code`. The `code` value is a Python `forward(self, taskInfo)` function (`_mgsm/mgsm_prompt.py:12` to `:15`). The paper defines a new agent by such a `forward` function written against a small framework (§3, App. C).
+- Before the first generation, every initial agent without `fitness` runs on the validation split and receives `fitness` and `generation` set to `"initial"` (`_mgsm/search.py:158` to `:177`). An initial agent whose run raises an error stays in the archive without `fitness` (`:164` to `:169`).
+- The domain enters the meta agent's prompt as a short description with an example question (`_mgsm/mgsm_prompt.py:226` to `:233`). The paper states that this descriptive text is the only variation of the algorithm across domains (§4).
+- MGSM, DROP and MMLU. The question list is shuffled with `random.seed(args.shuffle_seed)`, default `0`. The first 128 questions form the validation split and the next 800 form the test split (`_mgsm/search.py:292` to `:299`, `:337` to `:339`, `_drop/search.py:292` to `:299`, `_mmlu/search.py:294` to `:302`). DROP drops the first and the last record (`_drop/search.py:292`) and puts a worked example before each question (`_drop/utils.py:228` to `:239`). The paper gives 128 validation and 800 test questions and calls the DROP questions one shot (App. E).
+- GPQA. Questions keep the order of `dataset/gpqa_diamond.csv`, and only the answer choices are shuffled (`_gpqa/utils.py:18` to `:30`). The first 32 questions form the validation split and all remaining questions form the test split (`_gpqa/search.py:292` to `:296`, `:358`). The shipped CSV holds 198 questions. The paper uses 32 validation and 166 test questions from GPQA diamond (App. E).
+- ARC. The search reads `sampled_arc_val_data.pkl` and the test step reads `sampled_arc_test_data.pkl` (`_arc/search.py:382` to `:388`, `:423` to `:424`). The repository ships these files under `dataset/`. They hold 20 and 60 tasks.
+- `_arc/data_select.py` builds these files from `dataset/ARC-800-tasks/training` (`:8`). It keeps a task when the first training input and the first training output each have at most five rows (`:25` to `:29`). It samples up to 100 kept tasks (`:32` to `:34`). It puts the first 20 in the validation file and the rest in the test file (`:37` to `:47`).
+- The paper samples ARC questions with grid dimensions ≤5×5 from the Public Training Set (Easy) and uses 20 validation and 60 test questions (§4.1). In the shipped validation file, 14 of the 20 tasks contain a grid larger than 5×5 in rows or columns. In the shipped test file, 41 of the 60 tasks do.
+
+## 2. How it proposes a change
+
+- Conditioned on the archive, the meta agent describes a new idea for an agent and then implements it in code (§3). Its reply is JSON with the keys `thought`, `name` and `code` (App. B). Two self-reflection rounds by the meta agent follow (§3, App. B, App. H).
+- Design step (`_mgsm/search.py:181` to `:187`). The meta agent reads a fixed system prompt that asks for well formed JSON (`_mgsm/mgsm_prompt.py:224`) and a main prompt built from the whole archive (`:530` to `:536`). The main prompt holds the domain description (`:226` to `:233`), the framework code (`:235` to `:410`), every archive entry as JSON with its fitness (`:411` to `:416`), the output format with an example (`:418` to `:429`), the WRONG Implementation examples (`:431` to `:482`) and the task text (`:484` to `:489`). The meta agent writes `thought`, `name` and `code` (`:419` to `:421`). The paper shows the same prompt parts (App. B).
+- Self-reflection round 1 (`_mgsm/search.py:189` to `:193`). The meta agent reads the same conversation with its previous reply appended and then `Reflexion_prompt_1`. When `n > 0`, this prompt starts with the last archive entry as the previous agent it tried (`_mgsm/mgsm_prompt.py:539` to `:542`, `_mgsm/search.py:189`). In the first generation of a fresh run that part is empty. The prompt asks the meta agent to judge interestingness against the archive, implementation mistakes and improvement (`_mgsm/mgsm_prompt.py:492` to `:507`). The meta agent writes `reflection`, `thought`, `name` and `code` (`:509` to `:517`). The paper prompt for round 1 has the same three points (App. B).
+- Self-reflection round 2 (`_mgsm/search.py:195` to `:197`). The meta agent reads the conversation with its round 1 reply appended and then `Reflexion_prompt_2`. This prompt asks it to revise the code using the WRONG Implementation examples (`_mgsm/mgsm_prompt.py:520` to `:523`). The meta agent writes `reflection`, `thought`, `name` and `code`. The paper prompt for round 2 asks the same (App. B).
+- The paper gives the purpose of the two rounds as making the agent novel (§3) and novel and error free (App. B).
+- All three calls go to `get_json_response_from_gpt_reflect` with the meta agent model `args.model`, temperature 0.8, `max_tokens=4096` and a JSON object response format (`_mgsm/search.py:52` to `:66`). The default model is `gpt-4o-2024-05-13` (`:348` to `:351`). The paper names `gpt-4o-2024-05-13` for the meta agent (App. D, App. E) and calls it GPT-4 in §4.1 and §4.2. The paper does not state the meta agent's temperature.
+- If any of the three calls raises an error, the generation adds no agent (`_mgsm/search.py:198` to `:202`, `_arc/search.py:290` to `:293`). In the DROP, MGSM, MMLU and GPQA scripts this branch also runs `n -= 1` (`_mgsm/search.py:201`). The loop is `for n in range(start, args.n_generation)` (`:179`), so the next pass still takes the next value of `n`.
+
+## 3. How it decides to keep or reject a change
+
+- The new agent is evaluated on validation data from the target domain. It is then added to the archive with its evaluation metrics, and the loop continues until the maximum number of iterations (§3, App. H).
+- ARC runs 25 iterations (§4.1), and the code default is `--n_generation 25` (`_arc/search.py:431`). DROP, MGSM, MMLU and GPQA run 30 iterations (§4.2), and the code default is `--n_generation 30` (`_mgsm/search.py:346`, `_drop/search.py:347`, `_mmlu/search.py:374`, `_gpqa/search.py:365`).
+- After the debug loop, the new agent receives `fitness` and `generation` set to `n + 1`. Its `debug_thought` and `reflection` fields are deleted. It is appended to the archive, and the archive is written to `<save_dir>/<expr_name>_run_archive.json` (`_mgsm/search.py:146`, `:227` to `:240`).
+- An agent enters the archive whenever `acc_list` is not empty after the debug loop (`_mgsm/search.py:223` to `:235`).
+- The paper repeats a self-reflection on errors up to five times (§3, App. B, App. H). The code allows at most three evaluation attempts, set by `--debug_max` with `default=3` (`_mgsm/search.py:205`, `:347`, `_arc/search.py:296`, `:433`).
+- An attempt fails when the evaluation raises an error or when the mean score is below 0.01 (`_mgsm/search.py:207` to `:209`). The paper describes this step for errors during evaluation (§3). The 0.01 rule is not found in the paper.
+- After a failed attempt the meta agent receives the error text with a prompt to debug the same thought, and writes a new version with a `debug_thought` field (`_mgsm/search.py:214` to `:217`). The paper gives the same prompt (App. B).
+- The meta agent writes a new version after every failed attempt, the last one included, and that last version is not evaluated (`_mgsm/search.py:205` to `:222`). `acc_list` keeps the last score list that an evaluation returned (`:204`, `:207`). When the loop ends without success after an attempt that returned scores, the archive receives the last version with those scores as its fitness (`:223` to `:235`). When no attempt returned scores, the generation adds no agent (`:223` to `:225`).
+- Inside an agent, `LLMAgentBase.query` turns a failed model call or a reply with the wrong number of fields into a reply with empty strings for the missing fields and without the extra fields (`_mgsm/search.py:112` to `:126`). During search a context length error is raised with a message that asks for a shorter context (`:118` to `:119`).
+- ARC scores a new agent on the 20 validation tasks. Each task is run five times (`_arc/search.py:393` to `:397`, `:425`). The paper evaluates ARC agents five times on the validation and test sets (§4.1).
+- GPQA scores a new agent on the first 32 questions. Each question is run five times (`_gpqa/search.py:294`, `:358` to `:359`). DROP, MGSM and MMLU score a new agent on the first 128 shuffled questions, each run once (`_mgsm/search.py:297`, `:337`, `:340`). The paper evaluates GPQA agents five times and the other domains once (App. E).
+- `bootstrap_confidence_interval` draws 100000 bootstrap resamples of the per run scores. It returns the 95% confidence interval and the median of the resample means, in percent (`_mgsm/utils.py:88` to `:133`). The prompt tells the meta agent that fitness is the median and 95% bootstrap confidence interval of the correct rate on a validation question set (`_mgsm/mgsm_prompt.py:416`). The paper names performance such as success rate or F1 score as the metric the meta agent maximizes (§3).
+
+## 4. What it executes
+
+- The meta agent programs new agents and tests their performance on tasks (Figure 1). The generated agent is evaluated on validation data (§3).
+- During search every new agent runs on the validation tasks. `evaluate_forward_fn` passes the `code` string to `exec`, requires exactly one defined name and binds it as `AgentSystem.forward` (`_mgsm/search.py:278` to `:289`). It then calls `forward` on every validation task in a thread pool (`:305` to `:316`). Agents call their FM modules through `LLMAgentBase` (`:69` to `:137`), the class shown in the framework code of the prompt (`_mgsm/mgsm_prompt.py:235` to `:410`).
+- An exception raised by `forward` on any task leaves `evaluate_forward_fn` as an error (`_mgsm/search.py:315` to `:316`, `_arc/search.py:399` to `:401`, `:414` to `:415`).
+- In ARC each agent also has two tool functions. They run the `transform` code written by the agent's FM modules with `exec` on the example grids or on the test input (`_arc/search.py:161` to `:234`). The paper describes these two tool functions (App. D).
+- A fixed scoring function per domain decides the score of each run.
+  - ARC. `eval_solution` returns 1 when the answer equals the first test output of the task and 0 otherwise (`_arc/utils.py:104` to `:113`, called at `_arc/search.py:408`). The paper uses exact match (App. D).
+  - MGSM. `score_mgsm` compares the strings after removing commas from both and trailing zeros and a trailing point from the prediction (`_mgsm/utils.py:50` to `:57`).
+  - DROP. `drop_metric` returns the best F1 over the reference answers, and this F1 is the run score (`_drop/utils.py:213` to `:221`, `_drop/search.py:325`, `:330`).
+  - MMLU and GPQA. The answer letter is mapped to a choice index, and the score is 1 when it equals the correct index (`_mmlu/search.py:321` to `:357`, `_gpqa/search.py:314` to `:350`).
+  - A scoring error gives 0 for that run (`_mgsm/search.py:326` to `:328`, `_arc/search.py:410` to `:412`).
+- The paper states that all generated code ran in containers in secure, isolated environments (§6). The repository runs the generated `forward` with `exec` inside the search process (`_mgsm/search.py:282`). A container definition is not found in the repository. The README warns that the code executes untrusted model generated code (`README.md:65` to `:67`).
+- After the search, `evaluate(args)` runs every archive agent, the initial ones included, on the test split and writes `test_fitness` to a separate file (`_mgsm/search.py:243` to `:275`, `:358` to `:360`). The paper evaluates all discovered agents on the held out test set (§4.1).
+
+## 5. Models by step
+
+| step | model in the paper | model in the code | source |
+|---|---|---|---|
+| meta agent, design step | GPT-4 (§4.1, §4.2), `gpt-4o-2024-05-13` (App. D, App. E). Temperature not stated | `args.model`, default `gpt-4o-2024-05-13`, choices `gpt-4-turbo-2024-04-09`, `gpt-3.5-turbo-0125`, `gpt-4o-2024-05-13`. Temperature 0.8, `max_tokens=4096`, `response_format={"type": "json_object"}` | `_mgsm/search.py:52` to `:66`, `:187`, `:348` to `:351`. `_arc/search.py:53` to `:67`, `:434` to `:437` |
+| meta agent, self-reflection rounds 1 and 2 | same meta agent (App. B) | same function and settings | `_mgsm/search.py:193`, `:197` |
+| meta agent, self-reflection after an evaluation error | same meta agent (§3, App. B) | same function and settings | `_mgsm/search.py:217` |
+| FM modules of an agent, during search and test | GPT-3.5 (§4.1, §4.2), `gpt-3.5-turbo-0125` (App. D, App. E). Framework default temperature 0.5 (App. C, Code 1) | `LLMAgentBase` default `gpt-3.5-turbo-0125` and temperature 0.5, unless the agent code passes other values. The prompt says to keep the model at its default. `max_tokens=4096`, in ARC `max_tokens=1024`. JSON object response format | `_mgsm/search.py:30` to `:49`, `:74` to `:75`. `_arc/search.py:31` to `:50`, `:75` to `:76`. `_mgsm/mgsm_prompt.py:296`, `:428` |
+| FM modules in the transfer to other domains (Table 2, Table 4, Table 5) | not named in §4.3 or App. A | `LLMAgentBase` default `gpt-3.5-turbo-0125`. `--model` is parsed and not used | `_transfer_math/evaluation_gsm8k.py:71`, `:225` to `:228`. No match for `args.model` in `_transfer_math/` |
+| FM modules in the transfer of ARC agents to other models (Table 3) | `gpt-4o-2024-05-13`, `claude-3-haiku-20240307`, `claude-3-5-sonnet-20240620` (App. A) | not found in the code | no match for `claude` or `anthropic` in the repository |
+
+- The paper's `FM_Module` (App. C) is `LLMAgentBase` in the code (`_mgsm/search.py:69`). The paper states that it renamed some variables in its appendix code (App. C).
+- The code uses the `openai` Python package (`requirements.txt:4`, no version pin). Each search script creates `client = openai.OpenAI()` with no arguments (`_mgsm/search.py:16`, `_arc/search.py:16`, `_drop/search.py:16`, `_mmlu/search.py:17`, `_gpqa/search.py:15`). Both call functions use `client.chat.completions.create` (`_mgsm/search.py:37`, `:58`) and retry on `openai.RateLimitError` with exponential backoff (`:30`, `:52`).
+- The README asks the user to `export OPENAI_API_KEY` (`README.md:37` to `:38`). A base URL and a key are not found in the code. A search for `base_url` and `api_key` returns no match.
+
+## 6. Embedding model
+
+- The paper names no embedding model. A search for "embed" in the paper text returns no match.
+- The code calls no embedding model. A search for "embed" in the repository's `.py`, `.md` and `.txt` files returns no match.
+
+## 7. How the paper scores the method
+
+- The paper reports accuracy in percent for ARC, MGSM, MMLU and GPQA and F1 score for DROP (Figure 3, Table 1). Table 1 gives test scores on held out test sets with a 95% bootstrap confidence interval. For ARC the paper reports the median accuracy and the 95% bootstrap confidence interval on a held out test set over five evaluations (Figure 3, §4.1).
+- ARC is compared with five hand designed baselines (§4.1, Figure 3).
+- DROP, MGSM, MMLU and GPQA are each searched separately and compared with seven hand designed baselines and the prompt optimization baseline OPRO (§4.2, Table 1).
+- The top three agents searched on MGSM are transferred to GSM8K, GSM-Hard, MMLU and DROP (§4.3, Table 2), to SVAMP and ASDiv (App. A, Table 4) and to the three domains beyond math of §4.2 (App. A, Table 5).
+- The top three ARC agents found with GPT-3.5 are transferred to Claude-Haiku, GPT-4 and Claude-Sonnet (§4.3, Table 3).
+- A search from an empty archive is compared with the seeded search (App. I, Table 6).
+- In the code, the test step writes `test_fitness` for every archive agent (`_mgsm/search.py:243` to `:275`). The scripts in `_transfer_math/` score every agent in the file given by `--eval_file_path` (`_transfer_math/evaluation_gsm8k.py:139` to `:154`, `:224`). A step that picks the top three agents, an OPRO baseline and code for the transfer to other models are not found in the repository.

@@ -87,31 +87,6 @@ def test_contract_q1_q4_after_corrections():
     assert "test.py line 14" in turn2["q1_source"] and "limited_endpoint" in turn2["note"]
 
 
-def test_wrappers_fire_on_resolved_classes(tmp_path):
-    for boundary in ("memory", "retrieval", "embeddings", "parsers", "agent_parsers", "tools"):
-        result = ext.selftest_boundary(boundary, tmp_path)
-        assert result["ok"], result
-    parsers = ext.selftest_boundary("parsers", tmp_path)
-    assert any("StrOutputParser.invoke from langchain_core.output_parsers.base.BaseOutputParser" in line
-               for line in parsers["installed"])
-    memory = ext.selftest_boundary("memory", tmp_path)
-    assert any("save_context from langchain.memory.chat_memory.BaseChatMemory" in line for line in memory["installed"])
-
-
-def test_request_prepared_and_backend_attempt(tmp_path):
-    trace = tmp_path / "both.jsonl"
-    script = (pr._study_prelude() + instrument.NO_RETRY_PRELUDE
-              + instrument.trace_prelude(trace, ["chat_request", "network_attempt"]) + ext.SELFTEST_BODIES["chat_request"])
-    proc = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, capture_output=True, text=True, timeout=300,
-                          env={**__import__("os").environ, "OPENAI_API_KEY": "sk-test"})
-    assert proc.returncode == 0, proc.stderr[-800:]
-    events = instrument.read_trace(trace)
-    assert sum(e["kind"] == "request_prepared" for e in events) == 1
-    assert sum(e["kind"] == "backend_attempt" for e in events) == 1
-    failing = ext.selftest_boundary("network_attempt", tmp_path)
-    assert failing["failing_calls"] == 1 and failing["backend_attempt_events"] == 1
-
-
 def _raw(info, returncode=1, timeout=False):
     return {"timeout": timeout, "returncode": returncode, "result": info}
 

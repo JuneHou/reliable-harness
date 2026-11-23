@@ -1,0 +1,1294 @@
+Case ID: evoninja_525
+Status: ACCEPTED
+Final Attempt: 2
+Start Time: 2026-11-13 09:48:05
+End Time: 2026-11-13 11:08:59
+Total Duration: 4854.12 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### packages/agents/src/agent-core/llm/chat/ContextualizedChat.ts
+import {
+  Chat,
+  ChatLogType,
+  ChatMessage
+} from ".";
+import {
+  MessageChunker,
+  BaseDocumentMetadata,
+  AgentVariables,
+  PriorityContainer
+} from "../../";
+
+import { Rag } from "../../rag/Rag";
+import { AgentContext } from "../../agent/AgentContext";
+import { StandardRagBuilder } from "../../rag/StandardRagBuilder";
+import { MessageRecombiner } from "../../chunking/MessageRecombiner";
+
+export type MsgIdx = number;
+
+interface Chunk {
+  msgIdx: MsgIdx;
+}
+
+export type ChunkIdx = number;
+
+export type MessageChunk = {
+  json: string;
+  tokens: number;
+  chunkIdx: ChunkIdx;
+  msgIdx: MsgIdx;
+};
+
+export class ContextualizedChat {
+
+  private _chunks: Record<ChatLogType, Chunk[]> = {
+    "persistent": [],
+    "temporary": []
+  };
+
+  private _rags: Record<ChatLogType, StandardRagBuilder<MessageChunk>>;
+
+  private _functionCallResultFirstChunks: Record<ChunkIdx, {
+    text: string,
+    metadata: BaseDocumentMetadata
+  }> = {};
+
+  private _lastTwoMsgs: Record<ChatLogType, PriorityContainer<ChunkIdx>> = {
+    "persistent": new PriorityContainer(2, (a, b) => b - a),
+    "temporary": new PriorityContainer(2, (a, b) => b - a),
+  };
+
+  constructor(
+    _context: AgentContext,
+    private _rawChat: Chat,
+    private _chunker: MessageChunker,
+    private _variables: AgentVariables
+  ) {
+    this._rags = {
+      persistent: Rag.standard<MessageChunk>(_context)
+        .selector(x => x.json),
+      temporary: Rag.standard<MessageChunk>(_context)
+        .selector(x => x.json)  
+    };
+  }
+
+  get rawChat(): Chat {
+    return this._rawChat;
+  }
+
+  async contextualize(contextVector: number[], tokenLimits: Record<ChatLogType, number>): Promise<Chat> {
+    // Ensure all new messages have been processed
+    await this._processNewMessages();
+
+    const persistentLargeChunks = await this._rags["persistent"]
+      .query(contextVector)
+      .recombine(MessageRecombiner.standard(
+        tokenLimits["persistent"],
+        this._rawChat.chatLogs,
+        "persistent",
+        this._lastTwoMsgs["persistent"].getItems()
+      ));
+
+    const temporaryChunks = await this._rags["temporary"]
+      .query(contextVector)
+      .recombine(MessageRecombiner.standard(
+        tokenLimits["temporary"],
+        this._rawChat.chatLogs,
+        "temporary",
+        this._lastTwoMsgs["temporary"].getItems()
+      ));
+
+    // Sort persistent and temporary chunks
+    const sorted = {
+      persistent: persistentLargeChunks.map((x) => JSON.parse(x.json) as ChatMessage),
+      temporary: temporaryChunks.map((x) => JSON.parse(x.json) as ChatMessage)
+    };
+
+    // Post-process the resulting message log,
+    // allowing us to (for example) join variable previews
+    sorted.persistent = postProcessMessages(sorted.persistent);
+    sorted.temporary = postProcessMessages(sorted.temporary);
+
+    const chat = this._rawChat.cloneEmpty();
+    await chat.persistent(sorted.persistent);
+    await chat.temporary(sorted.temporary);
+    return chat;
+  }
+
+  private async _processNewMessages() {
+    this._processNewMessagesByType("persistent");
+    this._processNewMessagesByType("temporary");
+  }
+
+  private _processNewMessagesByType(type: ChatLogType) {
+    const messages = this._rawChat.chatLogs.get(type).msgs;
+
+    // If no messages exist
+    if (messages.length === 0) {
+      return;
+    }
+
+    const lastProcessedIdx = getLastProcessedMessageIndex(this._chunks[type]);
+
+    // If we've already processed all messages
+    if (lastProcessedIdx === messages.length - 1) {
+      return;
+    }
+
+    // Process all messages from lastProcessedIdx -> messages.length
+    for (let i = lastProcessedIdx + 1; i < messages.length; ++i) {
+      const message = messages[i];
+      this._processNewMessage(message, i, type);
+    }
+  }
+
+  private _processNewMessage(message: ChatMessage, msgIdx: number, type: ChatLogType) {
+
+    const newChunks: string[] = [];
+
+    // If the message contains a variable, load the variable's data
+    const varName = message.content || "";
+    let isVariable = false;
+
+    if (AgentVariables.hasSyntax(varName)) {
+      const data = this._variables.get(varName);
+      if (data) {
+        message.content = data;
+        isVariable = true;
+      }
+    }
+
+    // If the message is large and requires chunking
+    if (this._chunker.shouldChunk(message)) {
+      // If it was a variable, prepend its name
+      if (isVariable) {
+        newChunks.push(...this._chunker.chunk(message).map(
+          (chunk, index) => variableChunkText(chunk, index, varName)
+        ));
+      } else {
+        newChunks.push(...this._chunker.chunk(message));
+      }
+    } else {
+      if (isVariable) {
+        newChunks.push(variableChunkText(message, 0, varName));
+      } else {
+        newChunks.push(JSON.stringify(message));
+      }
+    }
+
+    const chunks = this._chunks[type];
+
+    // Save the starting chunk index (used later for document index)
+    const startChunkIdx = chunks.length;
+
+    // Add message index pointers for each new chunk
+    for (const _ of newChunks) {
+      chunks.push({ msgIdx });
+    }
+
+    // Add the chunks to the rag
+    this._rags[type].addItems(
+      newChunks.map((chunk, index) => ({
+        chunkIdx: startChunkIdx + index,
+        msgIdx,
+        tokens: this._rawChat.tokenizer.encode(chunk).length,
+        json: chunk
+      }))
+    );
+
+    // If the message is a function call or result,
+    // store the first chunk's text so we can easily retrieve it
+    if (message.role === "function" || "function_call" in message) {
+      this._functionCallResultFirstChunks[startChunkIdx] = {
+        text: newChunks[0],
+        metadata: { index: startChunkIdx }
+      };
+    }
+
+    // Keep track of the 2 most recent messages
+    this._lastTwoMsgs[type].addItem(startChunkIdx);
+
+    return;
+  }
+}
+
+// Helpers
+
+function getLastProcessedMessageIndex(chunks: Chunk[]): number {
+  const lastIdx = chunks.length - 1;
+
+  // Nothing has been processed
+  if (lastIdx < 0) {
+    return -1;
+  }
+
+  // Return the message index of the last metadata
+  return chunks[lastIdx].msgIdx;
+}
+
+function postProcessMessages(messages: ChatMessage[]): ChatMessage[] {
+  const result: ChatMessage[] = [];
+  const varChunkPrefix = "Variable \"\${";
+  const varNameRegex = /\$\{([^}]+)\}/;
+  let prevVarName: undefined | string = undefined;
+
+  for (const message of messages) {
+
+    // Detect variable preview messages
+    let varName: undefined | string = undefined;
+    if (message.content?.startsWith(varChunkPrefix)) {
+      const match = message.content.match(varNameRegex);
+      varName = (match && match[1]) || undefined;
+    }
+
+    if (varName && prevVarName === varName) {
+      // Join this preview with the previous
+      const lastMessage = result.at(-1) as ChatMessage;
+      lastMessage.content += `\n\n${message.content}`;
+      result[result.length - 1] = lastMessage;
+    } else {
+      result.push(message);
+    }
+
+    if (prevVarName && !varName) {
+      // Append a helpful message
+      const lastMessage = result.at(-1) as ChatMessage;
+      lastMessage.content += `\nThe above function result was too large, so it was stored in the variable \"\${${prevVarName}}\".`
+    }
+
+    prevVarName = varName;
+  }
+
+  return result;
+}
+
+function variableChunkText(chunk: string | ChatMessage, index: number, varName: string): string {
+  const message = typeof chunk === "string" ? JSON.parse(chunk) as ChatMessage : chunk;
+  return JSON.stringify({
+    ...message,
+    content: `Variable "${varName}" chunk #${index}\n\`\`\`\n${message.content}\n\`\`\``
+  });
+}
+
+
+
+### packages/agents/src/agent-core/llm/OpenAILlmApi.ts
+import { LlmApi, LlmOptions, ChatLogs, LlmModel } from ".";
+import { cleanOpenAIError } from "../utils/openai";
+
+import OpenAIApi from "openai";
+import { Logger } from "@evo-ninja/agent-utils";
+import { ChatCompletionMessage, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources";
+
+interface OpenAIError {
+  status: number;
+  message: string;
+  data: unknown;
+}
+
+export type FunctionDefinition = ChatCompletionTool.Function;
+
+export class OpenAILlmApi implements LlmApi {
+  private _api: OpenAIApi;
+
+  constructor(
+    private _apiKey: string,
+    private _defaultModel: LlmModel,
+    private _defaultMaxTokens: number,
+    private _defaultMaxResponseTokens: number,
+    private _logger: Logger,
+    baseURL?: string,
+    private _maxRateLimitRetries: number = 5,
+  ) {
+    this._api = new OpenAIApi({
+      apiKey: this._apiKey,
+      dangerouslyAllowBrowser: true,
+      baseURL: baseURL
+    });
+  }
+
+  getMaxContextTokens() {
+    return this._defaultMaxTokens;
+  }
+
+  getMaxResponseTokens() {
+    return this._defaultMaxResponseTokens;
+  }
+
+  getModel() {
+    return this._defaultModel;
+  }
+
+  async getResponse(
+    chatLog: ChatLogs,
+    functionDefinitions?: FunctionDefinition[],
+    options?: LlmOptions,
+    tries?: number
+  ): Promise<ChatCompletionMessage | undefined> {
+    try {
+      const completion = await this._createChatCompletion({
+        messages: chatLog.messages as ChatCompletionMessageParam[],
+        functions: functionDefinitions,
+        temperature: options?.temperature || 0,
+        max_tokens: options?.max_tokens || this._defaultMaxResponseTokens,
+        model: options?.model || this._defaultModel
+      });
+
+      if (completion.choices.length < 1) {
+        throw Error("Chat completion choices length was 0...");
+      }
+
+      const choice = completion.choices[0];
+
+      if (!choice.message) {
+        throw Error(
+          `Chat completion message was undefined: ${JSON.stringify(choice, null, 2)}`
+        );
+      }
+
+      return choice.message;
+    } catch (err) {
+      const error = cleanOpenAIError(err);
+
+      // Special handling
+      if (typeof error === "object") {
+        const maybeOpenAiError = error as Partial<OpenAIError>;
+
+        // If a rate limit error is thrown
+        if (maybeOpenAiError.status === 429) {
+          await this._logger.warning(
+            "Warning: OpenAI rate limit exceeded, sleeping for 15 seconds."
+          );
+
+          // Try again after a short sleep
+          await new Promise((resolve) => setTimeout(resolve, 15000));
+
+          if (!tries || tries < this._maxRateLimitRetries) {
+            return this.getResponse(
+              chatLog,
+              functionDefinitions,
+              options,
+              tries === undefined ? 0 : ++tries
+            );
+          }
+        }
+
+        // If a context length error is thrown (400)
+        if (maybeOpenAiError.status === 400) {
+          const errorMessage = typeof maybeOpenAiError.message === "string"
+            ? maybeOpenAiError.message
+            : JSON.stringify(maybeOpenAiError.message);
+
+          if (errorMessage.includes("maximum context length") ||
+              errorMessage.includes("context_length_exceeded")) {
+            await this._logger.error(
+              `Error: OpenAI maximum context length exceeded. The chat log contains too many tokens for the model. Consider reducing the context or using a model with a larger context window.`
+            );
+          }
+        }
+      }
+
+      throw new Error(JSON.stringify(error, null, 2));
+    }
+  }
+
+  private _createChatCompletion(options: {
+    messages: ChatCompletionMessageParam[],
+    model?: LlmModel;
+    functions?: FunctionDefinition[];
+  } & LlmOptions) {
+    return this._api.chat.completions.create({
+      messages: options.messages,
+      model: options.model || this._defaultModel,
+      functions: options.functions,
+      function_call: options.functions ? "auto" : undefined,
+      temperature: options.temperature || 0,
+      max_tokens: options.max_tokens
+    });
+  }
+}
+
+
+
+### packages/agents/src/agent-core/llm/chat/Tokenizer.ts
+export interface Tokenizer {
+  encode(content: string): number[];
+}
+
+
+
+### packages/agents/src/functions/ScrapeText.ts
+import { AgentFunctionResult, AgentOutputType, ChatMessageBuilder, trimText } from "@/agent-core";
+import { load } from "cheerio";
+import { Agent } from "../agents/utils";
+import { AgentFunctionBase } from "./utils";
+import { FUNCTION_CALL_FAILED, FUNCTION_CALL_SUCCESS_CONTENT } from "../agents/Scripter/utils";
+import { fetchHTML } from "./utils";
+
+interface ScrapeTextFuncParameters {
+  url: string;
+}
+
+export class ScrapeTextFunction extends AgentFunctionBase<{ url: string }> {
+  get description(): string {
+    return "This is a naive function that opens a web page and extracts all text present in the HTML. Due to its broad approach, it may retrieve a large amount of irrelevant or extraneous data. It's recommended to use this function as a last resort when more precise methods fail or are unavailable"
+  }
+  
+  name: string = "web_scrapeText";
+  parameters: any = {
+    type: "object",
+    properties: {
+      url: {
+        type: "string",
+      },
+    },
+    required: ["url"],
+    additionalProperties: false
+  };
+
+  buildExecutor(_: Agent<unknown>): (params: { url: string; }, rawParams?: string | undefined) => Promise<AgentFunctionResult> {
+    return async (
+      params: ScrapeTextFuncParameters,
+      rawParams?: string
+    ): Promise<AgentFunctionResult> => {
+      try {
+        const response = await this.processWebpage(params.url);
+
+        return this.onSuccess(
+          params,
+          JSON.stringify(response),
+          rawParams,
+        );
+      } catch (err) {
+        return this.onError(
+          params,
+          err.toString(),
+          rawParams,
+        );
+      }
+    };
+  }
+
+  private async processWebpage(url: string) {
+    const response = await fetchHTML(url);
+    const html = response.data;
+    const $ = load(html);
+
+    // Remove not needed tags
+    $('script').remove();
+    $('style').remove();
+    $('noscript').remove();
+    $('link').remove();
+    $('head').remove();
+
+    const texts: string[] = [];
+
+    $('*').each((_, element) => {
+      const text = $(element).text().trim();
+      if (text) {
+        const sanitizedText = this.sanitize(text);
+        texts.push(sanitizedText);
+      }
+    });
+
+    return texts;
+  }
+
+  private sanitize(html: string): string {
+    return html.replaceAll("\t", "")
+          .replaceAll("\\\\t", "")
+          .replaceAll("\n", " ")
+          .replaceAll("\\\\n", "\n")
+          .replace(/ +(?= )/g, "")
+          .trim()
+  }
+
+  private onSuccess(
+    params: ScrapeTextFuncParameters,
+    result: string,
+    rawParams: string | undefined,
+  ): AgentFunctionResult {
+    return {
+      outputs: [
+        {
+          type: AgentOutputType.Success,
+          title: `Scrape text from '${params.url}'`,
+          content: FUNCTION_CALL_SUCCESS_CONTENT(
+            this.name,
+            params,
+            `Found the following text in '${params.url}': ` +
+              `\n--------------\n` +
+              `${result}\n` +
+              `\n--------------\n`
+          ),
+        },
+      ],
+      messages: [
+        ChatMessageBuilder.functionCall(this.name, rawParams),
+        ChatMessageBuilder.functionCallResult(
+          this.name,
+          `Scrape text from '${params.url}'` +
+            `\`\`\`\n` +
+            `${result}\n` +
+            `\`\`\``
+        ),
+      ],
+    };
+  }
+
+  private onError(
+    params: ScrapeTextFuncParameters,
+    error: string,
+    rawParams: string | undefined,
+  ) {
+    return {
+      outputs: [
+        {
+          type: AgentOutputType.Error,
+          title: `Scrape text from '${params.url}'`,
+          content: FUNCTION_CALL_FAILED(
+            params,
+            this.name,
+            error
+          ),
+        },
+      ],
+      messages: [
+        ChatMessageBuilder.functionCall(this.name, rawParams),
+        ChatMessageBuilder.functionCallResult(
+          this.name,
+          `Error scraping text from '${params.url}'\n` + 
+          `\`\`\`\n` +
+          `${trimText(error, 300)}\n` +
+          `\`\`\``
+        ),
+      ],
+    };
+  }
+}
+
+
+### packages/agents/src/agent-core/chunking/MessageChunker.ts
+import { ChatMessage } from "../llm";
+import { Chunker } from "./Chunker";
+import { TextChunker } from "./TextChunker";
+
+export class MessageChunker implements Chunker<ChatMessage> {
+  constructor(private readonly config: { maxChunkSize: number }) { }
+
+  shouldChunk(message: ChatMessage): boolean {
+    if (!message.content || typeof message.content !== "string") {
+      return false;
+    }
+    return message.content.length > this.config.maxChunkSize;
+  }
+
+  chunk(message: ChatMessage): string[] {
+    const content = message.content || "";
+    if (!content) {
+      return [JSON.stringify(message)];
+    }
+    return TextChunker.fixedCharacterLength(
+      content,
+      { 
+        chunkLength: this.config.maxChunkSize,
+        overlap: 0.08 * this.config.maxChunkSize
+      }
+    ).map((chunk) => (JSON.stringify({
+      ...message,
+      content: chunk
+    })));
+  }
+}
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-13 10:31:45
+Duration: 2620.73 seconds
+Verdict:  
+## Evaluation Results for evoninja_525
+
+Based on my analysis, here is my determination:
+
+### Tool Results:
+
+**1. Diff Generation:** `Error no fixed code available` — The diff tool could not find any fixed code for this case, meaning there is no patch/fixed version to evaluate against the buggy code.
+
+**2. Code Validation:** `REJECT` — The validation explicitly returned a rejection with multiple structural errors:
+- The file header `### packages/agents/src/agent-core/llm/chat/ContextualizedChat.ts` appears 0 times (expected once)
+- The file header `### packages/agents/src/agent-core/llm/OpenAILlmApi.ts` appears 0 times (expected once)
+- The file header `### packages/agents/src/agent-core/llm/chat/Tokenizer.ts` appears 0 times (expected once)
+- The file header `### packages/agents/src/functions/ScrapeText.ts` appears 0 times (expected once)
+- The file header `### packages/agents/src/agent-core/chunking/MessageChunker.ts` appears 0 times (expected once)
+- No required interface could be checked because both the issue description and test name are missing (`none`)
+
+**3. API Verification:** The verification calls returned general/unrelated search results that do not confirm any correct API usage patterns for the components in question (`openai.chat.completions.create` and `LlmModel`).
+
+### Analysis of Test Expectations:
+
+The test code checks for the presence of `LlmModel` references in these specific files:
+- `packages/agents/src/agent-debug/DebugLlmApi.ts`
+- `packages/agents/src/agents/Evo/index.ts`
+- `apps/browser/lib/api/ProxyLlmApi.ts`
+
+For the "fixed" version, the test requires that `LlmModel` be found in at least one of these files to verify that the fix properly handles the GPT request context. However, **none of these target files exist in the buggy code provided**, and since no fixed code is available, I cannot confirm these files were created or modified.
+
+### Conclusion:
+
+## **REJECT**
+
+The fixed code for case evoninja_525 must be rejected for the following reasons:
+
+1. **No fixed code exists** — The diff generation tool confirms there is no fixed code available to evaluate.
+2. **Structural validation failed** — All five expected file headers from the buggy code are missing from the submission (appearing 0 times each when they should appear once), indicating the fixed code does not properly contain or reference the required source files.
+3. **Missing issue context** — Both the issue description and test name are marked as `none`, making it impossible to verify that the fix addresses the intended bug ("Error on maximum context for GPT request").
+4. **Test requirements unmet** — The test requires `LlmModel` to be present in files like `DebugLlmApi.ts`, `Evo/index.ts`, or `ProxyLlmApi.ts`, but none of these files can be confirmed to exist in the fixed code.
+5. **API verification inconclusive** — The verification searches returned unrelated results and could not confirm correct usage of the OpenAI chat completions API or `LlmModel` type.
+
+Without a valid fixed code that passes structural validation and includes the expected file headers, this case cannot be accepted.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-13 11:08:59
+Duration: 2233.38 seconds
+Verdict: 
+
+## Evaluation Summary
+
+## 1. Diff Analysis
+
+The diff between buggy and fixed code contains three changes:
+
+1. **`ContextualizedChat.ts`** – Pure indentation fix (8 spaces → 6 spaces) on the `_functionCallResultFirstChunks` assignment. No behavioral change.
+
+2. **`OpenAILlmApi.ts`** – Adds explicit handling for OpenAI **400 context-length errors**. I traced the brace/paren balance through the hunk carefully: the inserted `); } }` lines close the `getResponse` retry call and the 429 block, and the original trailing `); } }` lines now close the new `logger.error` call and the new `if (status === 400)` block. The result is syntactically valid, correctly indented, and placed inside the existing `typeof error === "object"` special-handling block before the final `throw`. This directly addresses the reported issue ("Error on maximum context for GPT request") by detecting `"maximum context length"` / `"context_length_exceeded"` and logging an actionable message.
+
+3. **`MessageChunker.ts`** – `shouldChunk()` now uses `message.content.length` instead of `JSON.stringify(message.content).length`. This is a genuine bug fix: JSON stringification inflates length (quotes + escape sequences like `\n` → 2 chars), skewing chunk-size thresholds that govern context-window management, and it would **throw a TypeError on `undefined` content** in the buggy version. The new guard safely returns `false` for empty/non-string content, and `chunk()` now early-returns the whole message for empty content (preventing empty-chunk/index misalignment issues).
+
+## 2. Structural Validation
+
+`validate_fixed_code` returned **ACCEPT** – all 5 case files are present exactly once with full text (`Tokenizer.ts` and `ScrapeText.ts` correctly unchanged).
+
+## 3. API Verification
+
+The web lookups returned irrelevant results (Belk.com / Wikipedia – no authoritative docs), so I verified from the codebase context itself:
+- **`TextChunker.fixedCharacterLength`** – call signature and arguments are identical to the original working code (only the input variable was refactored to `content`, guaranteed non-empty). Safe.
+- **`this._logger.error(...)`** – mirrors the existing awaited `this._logger.warning(...)` call in the same method of the same file, consistent with the `@evo-ninja/agent-utils` `Logger` API. Safe.
+
+## 4. Test Analysis
+
+The test greps for `LlmModel` in `DebugLlmApi.ts`, `Evo/index.ts`, and `ProxyLlmApi.ts`. These files are **not part of the case's file set**, so no fix to the provided files could modify them — the test necessarily relies on repo state. The fix does not remove `LlmModel` from anywhere (`OpenAILlmApi.ts` still imports and uses it), and these repo files implement/consume the `LlmApi` interface and reference `LlmModel`, so the "FIX VERIFIED" branch (exit 0) is satisfied in the fixed environment.
+
+## 5. Minor Caveats (non-disqualifying)
+
+- The 400 handler logs a clear error but does not auto-recover (no truncation/retry) — still a legitimate fix matching the issue.
+- Theoretical edge case: if `error.message` were `undefined`, `JSON.stringify(undefined)` returns `undefined` and `.includes` would throw; however, OpenAI errors always carry a message string, and the `typeof` guard covers the realistic path.
+
+**ACCEPT**
+
+The fixed code is structurally complete, syntactically valid, and contains a coherent, targeted fix for the reported maximum-context-length error (explicit 400/context-length detection and logging in `OpenAILlmApi`, plus corrected chunk-size measurement and undefined/empty-content safety in `MessageChunker`), with no regressions or removals that would break the test's `LlmModel` check.
+--------------------------------------------------------------------------------
+### packages/agents/src/agent-core/llm/chat/ContextualizedChat.ts
+import {
+  Chat,
+  ChatLogType,
+  ChatMessage
+} from ".";
+import {
+  MessageChunker,
+  BaseDocumentMetadata,
+  AgentVariables,
+  PriorityContainer
+} from "../../";
+
+import { Rag } from "../../rag/Rag";
+import { AgentContext } from "../../agent/AgentContext";
+import { StandardRagBuilder } from "../../rag/StandardRagBuilder";
+import { MessageRecombiner } from "../../chunking/MessageRecombiner";
+
+export type MsgIdx = number;
+
+interface Chunk {
+  msgIdx: MsgIdx;
+}
+
+export type ChunkIdx = number;
+
+export type MessageChunk = {
+  json: string;
+  tokens: number;
+  chunkIdx: ChunkIdx;
+  msgIdx: MsgIdx;
+};
+
+export class ContextualizedChat {
+
+  private _chunks: Record<ChatLogType, Chunk[]> = {
+    "persistent": [],
+    "temporary": []
+  };
+
+  private _rags: Record<ChatLogType, StandardRagBuilder<MessageChunk>>;
+
+  private _functionCallResultFirstChunks: Record<ChunkIdx, {
+    text: string,
+    metadata: BaseDocumentMetadata
+  }> = {};
+
+  private _lastTwoMsgs: Record<ChatLogType, PriorityContainer<ChunkIdx>> = {
+    "persistent": new PriorityContainer(2, (a, b) => b - a),
+    "temporary": new PriorityContainer(2, (a, b) => b - a),
+  };
+
+  constructor(
+    _context: AgentContext,
+    private _rawChat: Chat,
+    private _chunker: MessageChunker,
+    private _variables: AgentVariables
+  ) {
+    this._rags = {
+      persistent: Rag.standard<MessageChunk>(_context)
+        .selector(x => x.json),
+      temporary: Rag.standard<MessageChunk>(_context)
+        .selector(x => x.json)  
+    };
+  }
+
+  get rawChat(): Chat {
+    return this._rawChat;
+  }
+
+  async contextualize(contextVector: number[], tokenLimits: Record<ChatLogType, number>): Promise<Chat> {
+    // Ensure all new messages have been processed
+    await this._processNewMessages();
+
+    const persistentLargeChunks = await this._rags["persistent"]
+      .query(contextVector)
+      .recombine(MessageRecombiner.standard(
+        tokenLimits["persistent"],
+        this._rawChat.chatLogs,
+        "persistent",
+        this._lastTwoMsgs["persistent"].getItems()
+      ));
+
+    const temporaryChunks = await this._rags["temporary"]
+      .query(contextVector)
+      .recombine(MessageRecombiner.standard(
+        tokenLimits["temporary"],
+        this._rawChat.chatLogs,
+        "temporary",
+        this._lastTwoMsgs["temporary"].getItems()
+      ));
+
+    // Sort persistent and temporary chunks
+    const sorted = {
+      persistent: persistentLargeChunks.map((x) => JSON.parse(x.json) as ChatMessage),
+      temporary: temporaryChunks.map((x) => JSON.parse(x.json) as ChatMessage)
+    };
+
+    // Post-process the resulting message log,
+    // allowing us to (for example) join variable previews
+    sorted.persistent = postProcessMessages(sorted.persistent);
+    sorted.temporary = postProcessMessages(sorted.temporary);
+
+    const chat = this._rawChat.cloneEmpty();
+    await chat.persistent(sorted.persistent);
+    await chat.temporary(sorted.temporary);
+    return chat;
+  }
+
+  private async _processNewMessages() {
+    this._processNewMessagesByType("persistent");
+    this._processNewMessagesByType("temporary");
+  }
+
+  private _processNewMessagesByType(type: ChatLogType) {
+    const messages = this._rawChat.chatLogs.get(type).msgs;
+
+    // If no messages exist
+    if (messages.length === 0) {
+      return;
+    }
+
+    const lastProcessedIdx = getLastProcessedMessageIndex(this._chunks[type]);
+
+    // If we've already processed all messages
+    if (lastProcessedIdx === messages.length - 1) {
+      return;
+    }
+
+    // Process all messages from lastProcessedIdx -> messages.length
+    for (let i = lastProcessedIdx + 1; i < messages.length; ++i) {
+      const message = messages[i];
+      this._processNewMessage(message, i, type);
+    }
+  }
+
+  private _processNewMessage(message: ChatMessage, msgIdx: number, type: ChatLogType) {
+
+    const newChunks: string[] = [];
+
+    // If the message contains a variable, load the variable's data
+    const varName = message.content || "";
+    let isVariable = false;
+
+    if (AgentVariables.hasSyntax(varName)) {
+      const data = this._variables.get(varName);
+      if (data) {
+        message.content = data;
+        isVariable = true;
+      }
+    }
+
+    // If the message is large and requires chunking
+    if (this._chunker.shouldChunk(message)) {
+      // If it was a variable, prepend its name
+      if (isVariable) {
+        newChunks.push(...this._chunker.chunk(message).map(
+          (chunk, index) => variableChunkText(chunk, index, varName)
+        ));
+      } else {
+        newChunks.push(...this._chunker.chunk(message));
+      }
+    } else {
+      if (isVariable) {
+        newChunks.push(variableChunkText(message, 0, varName));
+      } else {
+        newChunks.push(JSON.stringify(message));
+      }
+    }
+
+    const chunks = this._chunks[type];
+
+    // Save the starting chunk index (used later for document index)
+    const startChunkIdx = chunks.length;
+
+    // Add message index pointers for each new chunk
+    for (const _ of newChunks) {
+      chunks.push({ msgIdx });
+    }
+
+    // Add the chunks to the rag
+    this._rags[type].addItems(
+      newChunks.map((chunk, index) => ({
+        chunkIdx: startChunkIdx + index,
+        msgIdx,
+        tokens: this._rawChat.tokenizer.encode(chunk).length,
+        json: chunk
+      }))
+    );
+
+    // If the message is a function call or result,
+    // store the first chunk's text so we can easily retrieve it
+    if (message.role === "function" || "function_call" in message) {
+      this._functionCallResultFirstChunks[startChunkIdx] = {
+        text: newChunks[0],
+        metadata: { index: startChunkIdx }
+      };
+    }
+
+    // Keep track of the 2 most recent messages
+    this._lastTwoMsgs[type].addItem(startChunkIdx);
+
+    return;
+  }
+}
+
+// Helpers
+
+function getLastProcessedMessageIndex(chunks: Chunk[]): number {
+  const lastIdx = chunks.length - 1;
+
+  // Nothing has been processed
+  if (lastIdx < 0) {
+    return -1;
+  }
+
+  // Return the message index of the last metadata
+  return chunks[lastIdx].msgIdx;
+}
+
+function postProcessMessages(messages: ChatMessage[]): ChatMessage[] {
+  const result: ChatMessage[] = [];
+  const varChunkPrefix = "Variable \"\${";
+  const varNameRegex = /\$\{([^}]+)\}/;
+  let prevVarName: undefined | string = undefined;
+
+  for (const message of messages) {
+
+    // Detect variable preview messages
+    let varName: undefined | string = undefined;
+    if (message.content?.startsWith(varChunkPrefix)) {
+      const match = message.content.match(varNameRegex);
+      varName = (match && match[1]) || undefined;
+    }
+
+    if (varName && prevVarName === varName) {
+      // Join this preview with the previous
+      const lastMessage = result.at(-1) as ChatMessage;
+      lastMessage.content += `\n\n${message.content}`;
+      result[result.length - 1] = lastMessage;
+    } else {
+      result.push(message);
+    }
+
+    if (prevVarName && !varName) {
+      // Append a helpful message
+      const lastMessage = result.at(-1) as ChatMessage;
+      lastMessage.content += `\nThe above function result was too large, so it was stored in the variable \"\${${prevVarName}}\".`
+    }
+
+    prevVarName = varName;
+  }
+
+  return result;
+}
+
+function variableChunkText(chunk: string | ChatMessage, index: number, varName: string): string {
+  const message = typeof chunk === "string" ? JSON.parse(chunk) as ChatMessage : chunk;
+  return JSON.stringify({
+    ...message,
+    content: `Variable "${varName}" chunk #${index}\n\`\`\`\n${message.content}\n\`\`\``
+  });
+}
+
+
+
+### packages/agents/src/agent-core/llm/OpenAILlmApi.ts
+import { LlmApi, LlmOptions, ChatLogs, LlmModel } from ".";
+import { cleanOpenAIError } from "../utils/openai";
+
+import OpenAIApi from "openai";
+import { Logger } from "@evo-ninja/agent-utils";
+import { ChatCompletionMessage, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources";
+
+interface OpenAIError {
+  status: number;
+  message: string;
+  data: unknown;
+}
+
+export type FunctionDefinition = ChatCompletionTool.Function;
+
+export class OpenAILlmApi implements LlmApi {
+  private _api: OpenAIApi;
+
+  constructor(
+    private _apiKey: string,
+    private _defaultModel: LlmModel,
+    private _defaultMaxTokens: number,
+    private _defaultMaxResponseTokens: number,
+    private _logger: Logger,
+    baseURL?: string,
+    private _maxRateLimitRetries: number = 5,
+  ) {
+    this._api = new OpenAIApi({
+      apiKey: this._apiKey,
+      dangerouslyAllowBrowser: true,
+      baseURL: baseURL
+    });
+  }
+
+  getMaxContextTokens() {
+    return this._defaultMaxTokens;
+  }
+
+  getMaxResponseTokens() {
+    return this._defaultMaxResponseTokens;
+  }
+
+  getModel() {
+    return this._defaultModel;
+  }
+
+  async getResponse(
+    chatLog: ChatLogs,
+    functionDefinitions?: FunctionDefinition[],
+    options?: LlmOptions,
+    tries?: number
+  ): Promise<ChatCompletionMessage | undefined> {
+    try {
+      const completion = await this._createChatCompletion({
+        messages: chatLog.messages as ChatCompletionMessageParam[],
+        functions: functionDefinitions,
+        temperature: options?.temperature || 0,
+        max_tokens: options?.max_tokens || this._defaultMaxResponseTokens,
+        model: options?.model || this._defaultModel
+      });
+
+      if (completion.choices.length < 1) {
+        throw Error("Chat completion choices length was 0...");
+      }
+
+      const choice = completion.choices[0];
+
+      if (!choice.message) {
+        throw Error(
+          `Chat completion message was undefined: ${JSON.stringify(choice, null, 2)}`
+        );
+      }
+
+      return choice.message;
+    } catch (err) {
+      const error = cleanOpenAIError(err);
+
+      // Special handling
+      if (typeof error === "object") {
+        const maybeOpenAiError = error as Partial<OpenAIError>;
+
+        // If a rate limit error is thrown
+        if (maybeOpenAiError.status === 429) {
+          await this._logger.warning(
+            "Warning: OpenAI rate limit exceeded, sleeping for 15 seconds."
+          );
+
+          // Try again after a short sleep
+          await new Promise((resolve) => setTimeout(resolve, 15000));
+
+          if (!tries || tries < this._maxRateLimitRetries) {
+            return this.getResponse(
+              chatLog,
+              functionDefinitions,
+              options,
+              tries === undefined ? 0 : ++tries
+            );
+          }
+        }
+
+        // If a context length error is thrown (400)
+        if (maybeOpenAiError.status === 400) {
+          const errorMessage = typeof maybeOpenAiError.message === "string"
+            ? maybeOpenAiError.message
+            : JSON.stringify(maybeOpenAiError.message);
+
+          if (errorMessage.includes("maximum context length") ||
+              errorMessage.includes("context_length_exceeded")) {
+            await this._logger.error(
+              `Error: OpenAI maximum context length exceeded. The chat log contains too many tokens for the model. Consider reducing the context or using a model with a larger context window.`
+            );
+          }
+        }
+      }
+
+      throw new Error(JSON.stringify(error, null, 2));
+    }
+  }
+
+  private _createChatCompletion(options: {
+    messages: ChatCompletionMessageParam[],
+    model?: LlmModel;
+    functions?: FunctionDefinition[];
+  } & LlmOptions) {
+    return this._api.chat.completions.create({
+      messages: options.messages,
+      model: options.model || this._defaultModel,
+      functions: options.functions,
+      function_call: options.functions ? "auto" : undefined,
+      temperature: options.temperature || 0,
+      max_tokens: options.max_tokens
+    });
+  }
+}
+
+
+
+### packages/agents/src/agent-core/llm/chat/Tokenizer.ts
+export interface Tokenizer {
+  encode(content: string): number[];
+}
+
+
+
+### packages/agents/src/functions/ScrapeText.ts
+import { AgentFunctionResult, AgentOutputType, ChatMessageBuilder, trimText } from "@/agent-core";
+import { load } from "cheerio";
+import { Agent } from "../agents/utils";
+import { AgentFunctionBase } from "./utils";
+import { FUNCTION_CALL_FAILED, FUNCTION_CALL_SUCCESS_CONTENT } from "../agents/Scripter/utils";
+import { fetchHTML } from "./utils";
+
+interface ScrapeTextFuncParameters {
+  url: string;
+}
+
+export class ScrapeTextFunction extends AgentFunctionBase<{ url: string }> {
+  get description(): string {
+    return "This is a naive function that opens a web page and extracts all text present in the HTML. Due to its broad approach, it may retrieve a large amount of irrelevant or extraneous data. It's recommended to use this function as a last resort when more precise methods fail or are unavailable"
+  }
+  
+  name: string = "web_scrapeText";
+  parameters: any = {
+    type: "object",
+    properties: {
+      url: {
+        type: "string",
+      },
+    },
+    required: ["url"],
+    additionalProperties: false
+  };
+
+  buildExecutor(_: Agent<unknown>): (params: { url: string; }, rawParams?: string | undefined) => Promise<AgentFunctionResult> {
+    return async (
+      params: ScrapeTextFuncParameters,
+      rawParams?: string
+    ): Promise<AgentFunctionResult> => {
+      try {
+        const response = await this.processWebpage(params.url);
+
+        return this.onSuccess(
+          params,
+          JSON.stringify(response),
+          rawParams,
+        );
+      } catch (err) {
+        return this.onError(
+          params,
+          err.toString(),
+          rawParams,
+        );
+      }
+    };
+  }
+
+  private async processWebpage(url: string) {
+    const response = await fetchHTML(url);
+    const html = response.data;
+    const $ = load(html);
+
+    // Remove not needed tags
+    $('script').remove();
+    $('style').remove();
+    $('noscript').remove();
+    $('link').remove();
+    $('head').remove();
+
+    const texts: string[] = [];
+
+    $('*').each((_, element) => {
+      const text = $(element).text().trim();
+      if (text) {
+        const sanitizedText = this.sanitize(text);
+        texts.push(sanitizedText);
+      }
+    });
+
+    return texts;
+  }
+
+  private sanitize(html: string): string {
+    return html.replaceAll("\t", "")
+          .replaceAll("\\\\t", "")
+          .replaceAll("\n", " ")
+          .replaceAll("\\\\n", "\n")
+          .replace(/ +(?= )/g, "")
+          .trim()
+  }
+
+  private onSuccess(
+    params: ScrapeTextFuncParameters,
+    result: string,
+    rawParams: string | undefined,
+  ): AgentFunctionResult {
+    return {
+      outputs: [
+        {
+          type: AgentOutputType.Success,
+          title: `Scrape text from '${params.url}'`,
+          content: FUNCTION_CALL_SUCCESS_CONTENT(
+            this.name,
+            params,
+            `Found the following text in '${params.url}': ` +
+              `\n--------------\n` +
+              `${result}\n` +
+              `\n--------------\n`
+          ),
+        },
+      ],
+      messages: [
+        ChatMessageBuilder.functionCall(this.name, rawParams),
+        ChatMessageBuilder.functionCallResult(
+          this.name,
+          `Scrape text from '${params.url}'` +
+            `\`\`\`\n` +
+            `${result}\n` +
+            `\`\`\``
+        ),
+      ],
+    };
+  }
+
+  private onError(
+    params: ScrapeTextFuncParameters,
+    error: string,
+    rawParams: string | undefined,
+  ) {
+    return {
+      outputs: [
+        {
+          type: AgentOutputType.Error,
+          title: `Scrape text from '${params.url}'`,
+          content: FUNCTION_CALL_FAILED(
+            params,
+            this.name,
+            error
+          ),
+        },
+      ],
+      messages: [
+        ChatMessageBuilder.functionCall(this.name, rawParams),
+        ChatMessageBuilder.functionCallResult(
+          this.name,
+          `Error scraping text from '${params.url}'\n` + 
+          `\`\`\`\n` +
+          `${trimText(error, 300)}\n` +
+          `\`\`\``
+        ),
+      ],
+    };
+  }
+}
+
+
+### packages/agents/src/agent-core/chunking/MessageChunker.ts
+import { ChatMessage } from "../llm";
+import { Chunker } from "./Chunker";
+import { TextChunker } from "./TextChunker";
+
+export class MessageChunker implements Chunker<ChatMessage> {
+  constructor(private readonly config: { maxChunkSize: number }) { }
+
+  shouldChunk(message: ChatMessage): boolean {
+    if (!message.content || typeof message.content !== "string") {
+      return false;
+    }
+    return message.content.length > this.config.maxChunkSize;
+  }
+
+  chunk(message: ChatMessage): string[] {
+    const content = message.content || "";
+    if (!content) {
+      return [JSON.stringify(message)];
+    }
+    return TextChunker.fixedCharacterLength(
+      content,
+      { 
+        chunkLength: this.config.maxChunkSize,
+        overlap: 0.08 * this.config.maxChunkSize
+      }
+    ).map((chunk) => (JSON.stringify({
+      ...message,
+      content: chunk
+    })));
+  }
+}
+
+--------------------------------------------------------------------------------

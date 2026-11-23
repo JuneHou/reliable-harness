@@ -1,0 +1,1676 @@
+Case ID: evoninja_515
+Status: FAILED
+Final Attempt: 3
+Start Time: 2026-11-09 23:02:32
+End Time: 2026-11-09 23:17:17
+Total Duration: 885.07 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### packages/agents/src/agents/Evo/findBestAgent.ts
+import { FunctionDefinition, Rag, ArrayRecombiner } from "@/agent-core";
+import { AgentContext } from "@/agent-core";
+import { AgentFunctionBase } from "../../functions/utils";
+import { Agent, GoalRunArgs } from "../utils/Agent";
+import { CsvAnalystAgent } } from "../CsvAnalyst";
+import { DeveloperAgent } from "../Developer";
+import { ResearcherAgent } from "../Researcher";
+import { SynthesizerAgent } from "../Synthesizer";
+import { InMemoryWorkspace } from "@evo-ninja/agent-utils";
+
+type AgentWithPrompts = {
+  expertise: string;
+  persona: string;
+  agent: Agent<GoalRunArgs>;
+};
+
+const workspace = new InMemoryWorkspace();
+const AGENT_COLLECTION_NAME = "agents-for-prediction";
+let isDbInitialized = false;
+
+export const findBestAgent = async (
+  queryOrVector: string | number[], 
+  context: AgentContext
+): Promise<[
+  Agent<unknown>,
+  FunctionDefinition[],
+  string,
+  AgentFunctionBase<unknown>[]
+]> => {
+  const allAgents: Agent[] = [
+    DeveloperAgent,
+    CsvAnalystAgent,
+    ResearcherAgent,
+    SynthesizerAgent,
+  ].map(agentClass => new agentClass(context.cloneEmpty()));
+
+  const agentsWithPrompts = allAgents.map(agent => {
+    return {
+      expertise: agent.config.prompts.expertise + "\n" + agent.config.functions.map(x => x.name).join("\n"),
+      persona: agent.config.prompts.initialMessages({ goal: "" })[0].content ?? "",
+      agent,
+    };
+  });
+
+  let rag;
+
+  if (!isDbInitialized) {
+    rag = await Rag.standard<AgentWithPrompts>(context, AGENT_COLLECTION_NAME, workspace)
+      .selector(x => x.expertise)
+      .addItems(agentsWithPrompts)
+      .forceAddItemsToCollection();
+    
+    isDbInitialized = true;
+  } else {
+    rag = Rag.standard<AgentWithPrompts>(context, AGENT_COLLECTION_NAME, workspace, agentsWithPrompts)
+      .selector(x => x.expertise);
+  }
+
+  const agents = await rag
+    .query(queryOrVector)
+    .recombine(ArrayRecombiner.standard({
+      limit: 1,
+    }));
+
+    await context.logger.info(
+      "### Selected agent:\n-> " +
+        agents.map((x) => x.agent.config.prompts.name)[0]
+    );
+
+  const agentWithPrompt = agents[0];
+
+  return [
+    agentWithPrompt.agent,
+    agentWithPrompt.agent.config.functions.map(f => f.getDefinition()),
+    agentWithPrompt.persona,
+    agentsWithPrompts.map(x => x.agent.config.functions).flat()
+  ];
+};
+
+### packages/agents/src/agents/Evo/index.ts
+import {
+  AgentFunction,
+  ChatLogs,
+  ChatMessage,
+  FunctionDefinition,
+  MessageChunker,
+  Tokenizer,
+  ContextualizedChat,
+  Chat,
+  agentFunctionBaseToAgentFunction,
+  tokensToChars,
+  AgentOutput,
+  AgentContext,
+  Prompt,
+  AgentFunctionBase
+} from "@/agent-core";
+import { agentPrompts, prompts } from "./prompts";
+import { Agent, AgentConfig, GoalRunArgs } from "../../agents/utils";
+import { findBestAgent } from "./findBestAgent";
+import { Timeout, Workspace } from "@evo-ninja/agent-utils";
+
+export class Evo extends Agent<GoalRunArgs> {
+  private _cChat: ContextualizedChat;
+  private _chunker: MessageChunker;
+  private previousPrediction: string | undefined;
+  private loopCounter: number = 0;
+  private previousAgent: Agent<unknown> | undefined;
+  private initializedAgents: Set<string> = new Set();
+  private goal: string = "";
+
+  constructor(context: AgentContext, timeout?: Timeout) {
+    super(new AgentConfig(agentPrompts, [], context.scripts, timeout), context);
+    this._chunker = new MessageChunker({
+      maxChunkSize: context.variables.saveThreshold,
+    });
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      context.variables
+    );
+  }
+
+  public reset() {
+    this.previousPrediction = undefined;
+    this.loopCounter = 0;
+    this.previousAgent = undefined;
+    this.initializedAgents = new Set();
+    this.goal = "";
+    this.context.chat = this.context.chat.cloneEmpty();
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      this.context.variables
+    );
+  }
+
+  protected async initializeChat(args: GoalRunArgs): Promise<void> {
+    const { chat } = this.context;
+
+    const initialMessages: ChatMessage[] = [
+      await buildDirectoryPreviewMsg(this.context.workspace),
+      { role: "user", content: prompts.exhaustAllApproaches },
+      { role: "user", content: prompts.variablesExplainer },
+      { role: "user", content: args.goal },
+    ];
+
+    await chat.persistent(initialMessages);
+    this.goal = args.goal;
+  }
+
+  /**
+   * Detect if a prediction is a self‑introspection query.
+   */
+  private isIntrospectionQuery(prediction: string): boolean {
+    const lower = prediction.toLowerCase();
+    return (
+      lower.includes("what can you do") ||
+      lower.includes("what are your capabilities") ||
+      lower.includes("what can i ask you") ||
+      lower.includes("self introspect")
+    );
+  }
+
+  protected async beforeLlmResponse(): Promise<{
+    logs: ChatLogs;
+    agentFunctions: FunctionDefinition[];
+    allFunctions: AgentFunction<AgentContext>[];
+    finalOutput?: AgentOutput;
+  }> {
+    const { chat } = this.context;
+    const { messages } = chat.chatLogs;
+
+    const prediction =
+      !this.previousPrediction || this.loopCounter % 2 === 0
+        ? await this.predictBestNextStep(
+            messages,
+            this.previousAgent,
+            this.previousPrediction ? "SUCCESS" : undefined
+          )
+        : this.previousPrediction;
+
+    this.loopCounter += 1;
+
+    // ------------------------------------------------------------------
+    // Handle self‑introspection directly without delegating to another agent.
+    // ------------------------------------------------------------------
+    if (this.isIntrospectionQuery(prediction)) {
+      const introspectionAnswer = `I am Evo, an evolving assistant capable of achieving user goals by delegating tasks to specialized sub‑agents, using functions that interact with external tools (internet, file system, etc.). I can understand goals, break them into steps, call other agents, and use variables to handle large data.\n\nYou can ask me to perform actions like searching the web, reading or writing files, running code, or coordinating other agents to accomplish complex tasks.\n\nIf you need a concrete capability list, just ask!`;
+      // Clone current logs and add the answer as an assistant message.
+      const newLogs = chat.chatLogs.clone();
+      newLogs.append({ role: "assistant", content: introspectionAnswer } as ChatMessage);
+      return {
+        logs: newLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        // No finalOutput – let the normal flow continue with the supplied logs.
+      };
+    }
+
+    if (
+      prediction === "SUCCESS" ||
+      prediction.includes('"SUCCESS"') ||
+      prediction.includes("goal has been achieved")
+    ) {
+      return {
+        logs: chat.chatLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        finalOutput: {
+          type: "success",
+          title: "SUCCESS",
+        },
+      };
+    }
+
+    const predictionVector = await this.createEmbeddingVector(prediction);
+
+    await this.context.logger.info("### Prediction:\n-> " + prediction);
+
+    const [agent, agentFunctions, persona, allFunctions] = await findBestAgent(
+      predictionVector,
+      this.context
+    );
+
+    if (!this.initializedAgents.has(agent.config.prompts.name)) {
+      this.initializedAgents.add(agent.config.prompts.name);
+      await agent.onFirstRun({ goal: this.goal }, chat);
+    }
+
+    this.previousPrediction = prediction;
+    this.previousAgent = agent;
+
+    const contextualizedChat = await this.contextualizeChat(
+      await this.createEmbeddingVector(`${persona}\n${prediction}`)
+    );
+
+    const logs = insertPersonaAsFirstMsg(
+      persona,
+      contextualizedChat.chatLogs,
+      chat.tokenizer
+    );
+
+    return {
+      logs,
+      agentFunctions,
+      allFunctions: allFunctions.map(agentFunctionBaseToAgentFunction(agent)),
+    };
+  }
+
+  private async contextualizeChat(predictionVector: number[]): Promise<Chat> {
+    const maxContextTokens = this.context.llm.getMaxContextTokens();
+    const maxResponseTokens = this.context.llm.getMaxResponseTokens();
+    // TODO: remove this once we properly track function definition tokens
+    const fuzz = 500;
+    const maxChatTokens = maxContextTokens - maxResponseTokens - fuzz;
+
+    return await this._cChat.contextualize(predictionVector, {
+      persistent: maxChatTokens * 0.25,
+      temporary: maxChatTokens * 0.75,
+    });
+  }
+
+  private async predictBestNextStep(
+    messages: ChatMessage[],
+    previousAgent: Agent<unknown> | undefined,
+    terminationStr?: string
+  ): Promise<string> {
+    const agentPersona = previousAgent
+      ? // TODO: fix this when we refactor agent prompts
+        previousAgent.config.prompts.initialMessages({ goal: "" }).slice(0, -1)
+      : [{ role: "user", content: prompts.generalAgentPersona }];
+
+    return await this.askLlm(
+      new Prompt().json([...agentPersona, ...messages]).line(`
+          Consider the above chat between a user and assistant.
+          Consider that if information needs to be used, and it is not in the chat, it must be searched or read.
+          In your expert opinion, what is the best next step for the assistant?
+          ${
+            terminationStr && this.goal.length < 350
+              ? `If you are 100% sure the user's goal has been achieved, simply respond with "${terminationStr}". The user's goal is: "${this.goal}". If the user asks for an output file, has it been written?`
+              : ""
+          }`),
+      {
+        model: "gpt-3.5-turbo-16k",
+      }
+    );
+  }
+
+  private maxContextChars(): number {
+    return tokensToChars(this.maxContextTokens());
+  }
+
+  private maxContextTokens(): number {
+    return this.context.llm.getMaxContextTokens() ?? 8000;
+  }
+
+  isLargeMsg = (message: ChatMessage): boolean => {
+    return (
+      !!message.content &&
+      message.content.length > this.maxContextChars() * 0.0625
+    );
+  };
+}
+
+const insertPersonaAsFirstMsg = (
+  persona: string,
+  logs: ChatLogs,
+  tokenizer: Tokenizer
+): ChatLogs => {
+  const newLogs = logs.clone();
+  newLogs.insert(
+    "persistent",
+    [
+      {
+        role: "user",
+        content: persona,
+      } as ChatMessage,
+    ],
+    [tokenizer.encode(persona).length],
+    0
+  );
+
+  return newLogs;
+};
+
+const buildDirectoryPreviewMsg = async (
+  workspace: Workspace
+): Promise<ChatMessage> => {
+  const files = await workspace.readdir("./");
+  return {
+    role: "user",
+    content: `Current directory: './'\nFiles: ${files
+      .filter((x) => x.type === "file")
+      .map((x) => x.name)
+      .join(", ")}\nDirectories: ${files
+      .filter((x) => x.type === "directory")
+      .map((x) => x.name)
+      .join(", ")}`,
+  };
+};
+
+### packages/agents/src/agents/Evo/prompts.ts
+import { ChatMessage } from "@/agent-core";
+import { GoalRunArgs } from "../../agents/utils";
+import { AgentPrompts } from "../../agents/utils";
+
+export const agentPrompts = (): AgentPrompts<GoalRunArgs> => ({
+  name: "Evo",
+  expertise: `an expert evolving assistant that achieves user goals`,
+  initialMessages: ({ goal }: GoalRunArgs): ChatMessage[] => [],
+  loopPreventionPrompt: `Assistant, you seem to be looping. Try delegating a task or calling agent_onGoalAchieved or agent_onGoalFailed`,
+});
+
+export const prompts = {
+  generalAgentPersona:
+    "You are an expert assistant capable of accomplishing a multitude of tasks using functions that use external tools (like internet, file system, etc.).",
+  exhaustAllApproaches:
+    "If you can not achieve a goal, first try to exhaust different approaches before giving up.",
+  variablesExplainer:
+    "Function results will be stored in variables if they are very large. Variables are declared using the syntax ${variable-name}. Variables are created as needed, DO NOT use variable names that are not previously stated. When using variables within function arguments, YOU MUST use the ${variable-name} syntax. Relevant chunks of variable data will be shown to you as needed.",
+};
+
+### packages/agents/src/agent-core/agent/prompts.ts
+export const UNDEFINED_FUNCTION_NAME =
+  "Function call name was undefined.";
+
+export const FUNCTION_NOT_FOUND = (name: string) =>
+  `Function ${name} does not exist. Only use the functions you have been provided with`;
+
+export const UNPARSABLE_FUNCTION_ARGS = (name: string, args: string, err: any) =>
+  `Could not parse JSON arguments for function: ${name}. Error: ${err.toString()}\nJSON Arguments:\n\`\`\`\n${args}\n\`\`\`\nTry using different arguments instead.`;
+
+export const UNDEFINED_FUNCTION_ARGS = (name: string) =>
+  `Function call argument for '${name}' were undefined.`;
+
+export const UNKNOWN_VARIABLE_NAME = (variable: string) =>
+  `The variable named ${variable} does not exist.`;
+
+export const AGENT_SPEAK_RESPONSE =
+  "If you think you've achieved the goal, call agent_onGoalAchieved.\nIf you think you've failed, call agent_onGoalFailed.";
+
+### apps/browser/lib/hooks/useEvo.ts
+import {
+  AgentContext,
+  ConsoleLogger,
+  EmbeddingApi,
+  Env,
+  Evo,
+  InMemoryWorkspace,
+  LlmApi,
+  LlmModel,
+  Logger,
+  OpenAIEmbeddingAPI,
+  OpenAILlmApi,
+  Scripts,
+  Chat as EvoChat,
+  SubWorkspace,
+} from "@evo-ninja/agents";
+import { useEffect, useState } from "react";
+import { BrowserLogger } from "../sys/logger";
+import { createInBrowserScripts } from "../scripts";
+import { ProxyEmbeddingApi, ProxyLlmApi } from "../api";
+import cl100k_base from "gpt-tokenizer/esm/encoding/cl100k_base";
+import { atom, useAtom } from "jotai";
+import { ChatMessage } from "@/components/Chat";
+import { capReachedAtom, localOpenAiApiKeyAtom } from "@/lib/store";
+
+export const userWorkspaceAtom = atom<InMemoryWorkspace | undefined>(undefined);
+
+export function useEvo(onMessage: (message: ChatMessage) => void, setError: (msg: string) => void) {
+  const [localOpenAiApiKey] = useAtom(localOpenAiApiKeyAtom);
+  const [evo, setEvo] = useState<Evo | undefined>();
+  const [proxyEmbeddingApi, setProxyEmbeddingApi] = useState<
+    ProxyEmbeddingApi | undefined
+  >(undefined);
+  const [proxyLlmApi, setProxyLlmApi] = useState<ProxyLlmApi | undefined>(
+    undefined
+  );
+  const [, setCapReached] = useAtom(capReachedAtom);
+  const [userWorkspace, setUserWorkspace] = useAtom(userWorkspaceAtom);
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    (async () => {
+      try {
+        const browserLogger = new BrowserLogger({
+          onLog: async (message: string) => {
+            onMessage({
+              user: "evo",
+              title: message,
+            });
+          },
+        });
+        const logger = new Logger([browserLogger, new ConsoleLogger()], {
+          promptUser: () => Promise.resolve("N/A"),
+        });
+
+        const scriptsWorkspace = await createInBrowserScripts();
+        const scripts = new Scripts(scriptsWorkspace);
+
+        const env = new Env({
+          OPENAI_API_KEY: localOpenAiApiKey || " ",
+          GPT_MODEL: "gpt-4-1106-preview",
+          CONTEXT_WINDOW_TOKENS: "128000",
+          MAX_RESPONSE_TOKENS: "4096",
+        });
+
+        let llm: LlmApi;
+        let embedding: EmbeddingApi;
+
+        if (localOpenAiApiKey) {
+          llm = new OpenAILlmApi(
+            env.OPENAI_API_KEY,
+            env.GPT_MODEL as LlmModel,
+            env.CONTEXT_WINDOW_TOKENS,
+            env.MAX_RESPONSE_TOKENS,
+            logger,
+            env.OPENAI_API_BASE_URL,
+          );
+          embedding = new OpenAIEmbeddingAPI(
+            env.OPENAI_API_KEY,
+            logger,
+            cl100k_base,
+            env.OPENAI_API_BASE_URL,
+          );
+        } else {
+          llm = new ProxyLlmApi(
+            env.GPT_MODEL as LlmModel,
+            env.CONTEXT_WINDOW_TOKENS,
+            env.MAX_RESPONSE_TOKENS,
+            () => setCapReached(true)
+          );
+          setProxyLlmApi(llm as ProxyLlmApi);
+          embedding = new ProxyEmbeddingApi(cl100k_base, () =>
+            setCapReached(true)
+          );
+          setProxyEmbeddingApi(embedding as ProxyEmbeddingApi);
+        }
+
+        let workspace = userWorkspace;
+
+        if (!workspace) {
+          workspace = new InMemoryWorkspace();
+          setUserWorkspace(workspace);
+        }
+
+        const internals = new SubWorkspace(".evo", workspace);
+
+        const chat = new EvoChat(cl100k_base);
+        setEvo(
+          new Evo(
+            new AgentContext(
+              llm,
+              embedding,
+              chat,
+              logger,
+              workspace,
+              internals,
+              env,
+              scripts
+            )
+          )
+        );
+      } catch (e: any) {
+        setError(e.message);
+      }
+    })();
+  }, [localOpenAiApiKey]);
+
+  return { evo, proxyEmbeddingApi, proxyLlmApi };
+}
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 23:05:33
+Duration: 181.09 seconds
+Verdict: **REJECT**
+
+**Reasoning**
+
+1. **Missing Files / Sections**  
+   The generated diff deletes the entire contents of several critical source files:
+   * `packages/agents/src/agents/Evo/findBestAgent.ts` – completely removed.  
+   * `packages/agents/src/agents/Evo/prompts.ts` – removed.  
+   * `packages/agents/src/agent-core/agent/prompts.ts` – removed.  
+   * `apps/browser/lib/hooks/useEvo.ts` – removed.
+
+   The validation tool reports that each of these “### …” sections appears **0 times** while the test harness expects each to appear at least once. Consequently the project’s source tree is now incomplete and will not compile.
+
+2. **Test Expectations Not Met**  
+   The test script checks `packages/agents/src/agents/Evo/prompts.ts` for an `evoExplainer` prompt and for lines describing the expertise of the `CsvAnalyst`, `Researcher`, and `Synthesizer` personas. Since the entire `prompts.ts` file has been deleted, both patterns will be absent, causing the test to fail for the *fixed* version.
+
+3. **Structural Integrity**  
+   Removing these modules breaks imports throughout the codebase (e.g., `import { prompts } from "./prompts"` in `Evo/index.ts`). The project would raise module‑not‑found errors at compile time.
+
+4. **No Suspicious API Calls to Verify**  
+   Because the primary issue is the wholesale removal of essential files, further API‑usage verification is unnecessary.
+
+Given these critical regressions, the fixed code does **not** satisfy the required functionality nor the structural correctness checks. Therefore, the patch must be rejected.
+--------------------------------------------------------------------------------
+### packages/agents/src/agents/Evo/index.ts
+import {
+  AgentFunction,
+  ChatLogs,
+  ChatMessage,
+  FunctionDefinition,
+  MessageChunker,
+  Tokenizer,
+  ContextualizedChat,
+  Chat,
+  agentFunctionBaseToAgentFunction,
+  tokensToChars,
+  AgentOutput,
+  AgentContext,
+  Prompt,
+} from "@/agent-core";
+import { agentPrompts, prompts } from "./prompts";
+import { Agent, AgentConfig, GoalRunArgs } from "../../agents/utils";
+import { findBestAgent } from "./findBestAgent";
+import { Timeout, Workspace } from "@evo-ninja/agent-utils";
+
+export class Evo extends Agent<GoalRunArgs> {
+  private _cChat: ContextualizedChat;
+  private _chunker: MessageChunker;
+  private previousPrediction: string | undefined;
+  private loopCounter: number = 0;
+  private previousAgent: Agent<unknown> | undefined;
+  private initializedAgents: Set<string> = new Set();
+  private goal: string = "";
+
+  constructor(context: AgentContext, timeout?: Timeout) {
+    super(new AgentConfig(agentPrompts, [], context.scripts, timeout), context);
+    this._chunker = new MessageChunker({
+      maxChunkSize: context.variables.saveThreshold,
+    });
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      context.variables
+    );
+  }
+
+  public reset() {
+    this.previousPrediction = undefined;
+    this.loopCounter = 0;
+    this.previousAgent = undefined;
+    this.initializedAgents = new Set();
+    this.goal = "";
+    this.context.chat = this.context.chat.cloneEmpty();
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      this.context.variables
+    );
+  }
+
+  protected async initializeChat(args: GoalRunArgs): Promise<void> {
+    const { chat } = this.context;
+
+    const initialMessages: ChatMessage[] = [
+      await buildDirectoryPreviewMsg(this.context.workspace),
+      { role: "user", content: prompts.exhaustAllApproaches },
+      { role: "user", content: prompts.variablesExplainer },
+      { role: "user", content: args.goal },
+    ];
+
+    await chat.persistent(initialMessages);
+    this.goal = args.goal;
+  }
+
+  /**
+   * Detect simple self‑introspection queries and answer them directly.
+   * This avoids delegating such queries to sub‑agents.
+   */
+  private isIntrospectionQuery(message: string): boolean {
+    const lowered = message.toLowerCase().trim();
+    // Common phrasing – can be extended as needed.
+    return (
+      lowered.startsWith("what can you do") ||
+      lowered.startsWith("what are you capable of") ||
+      lowered.startsWith("what can you help with") ||
+      lowered.includes("your capabilities") ||
+      lowered.includes("your abilities")
+    );
+  }
+
+  private getIntrospectionAnswer(): string {
+    // Provide a concise list of Evo's capabilities.
+    // This mirrors the information advertised in prompts.generalAgentPersona
+    // and other documentation.
+    return `I am Evo, an evolving assistant capable of:
+- Reading and writing files in the workspace.
+- Accessing the internet via provided tools.
+- Running code, performing searches, and analyzing data.
+- Calling specialized sub‑agents (e.g., Developer, Researcher, CsvAnalyst, Synthesizer) to accomplish complex goals.
+- Managing large data using variables.
+You can invoke these abilities through function calls defined for the current session.`;
+  }
+
+  protected async beforeLlmResponse(): Promise<{
+    logs: ChatLogs;
+    agentFunctions: FunctionDefinition[];
+    allFunctions: AgentFunction<AgentContext>[];
+    finalOutput?: AgentOutput;
+  }> {
+    const { chat } = this.context;
+    const { messages } = chat.chatLogs;
+
+    // Check the most recent user message for an introspection request.
+    const lastUserMsg = messages
+      .filter((m) => m.role === "user")
+      .pop()?.content;
+    if (lastUserMsg && this.isIntrospectionQuery(lastUserMsg)) {
+      const answer = this.getIntrospectionAnswer();
+      const newLogs = chat.chatLogs.clone();
+      newLogs.append([
+        {
+          role: "assistant",
+          content: answer,
+        } as ChatMessage,
+      ]);
+      return {
+        logs: newLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        // No finalOutput means the normal loop continues, but the assistant already replied.
+      };
+    }
+
+    const prediction =
+      !this.previousPrediction || this.loopCounter % 2 === 0
+        ? await this.predictBestNextStep(
+            messages,
+            this.previousAgent,
+            this.previousPrediction ? "SUCCESS" : undefined
+          )
+        : this.previousPrediction;
+
+    this.loopCounter += 1;
+
+    if (
+      prediction === "SUCCESS" ||
+      prediction.includes('"SUCCESS"') ||
+      prediction.includes("goal has been achieved")
+    ) {
+      return {
+        logs: chat.chatLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        finalOutput: {
+          type: "success",
+          title: "SUCCESS",
+        },
+      };
+    }
+
+    const predictionVector = await this.createEmbeddingVector(prediction);
+
+    await this.context.logger.info("### Prediction:\n-> " + prediction);
+
+    const [agent, agentFunctions, persona, allFunctions] = await findBestAgent(
+      predictionVector,
+      this.context
+    );
+
+    if (!this.initializedAgents.has(agent.config.prompts.name)) {
+      this.initializedAgents.add(agent.config.prompts.name);
+      await agent.onFirstRun({ goal: this.goal }, chat);
+    }
+
+    this.previousPrediction = prediction;
+    this.previousAgent = agent;
+
+    const contextualizedChat = await this.contextualizeChat(
+      await this.createEmbeddingVector(`${persona}\n${prediction}`)
+    );
+
+    const logs = insertPersonaAsFirstMsg(
+      persona,
+      contextualizedChat.chatLogs,
+      chat.tokenizer
+    );
+
+    return {
+      logs,
+      agentFunctions,
+      allFunctions: allFunctions.map(agentFunctionBaseToAgentFunction(agent)),
+    };
+  }
+
+  private async contextualizeChat(predictionVector: number[]): Promise<Chat> {
+    const maxContextTokens = this.context.llm.getMaxContextTokens();
+    const maxResponseTokens = this.context.llm.getMaxResponseTokens();
+    // TODO: remove this once we properly track function definition tokens
+    const fuzz = 500;
+    const maxChatTokens = maxContextTokens - maxResponseTokens - fuzz;
+
+    return await this._cChat.contextualize(predictionVector, {
+      persistent: maxChatTokens * 0.25,
+      temporary: maxChatTokens * 0.75,
+    });
+  }
+
+  private async predictBestNextStep(
+    messages: ChatMessage[],
+    previousAgent: Agent<unknown> | undefined,
+    terminationStr?: string
+  ): Promise<string> {
+    const agentPersona = previousAgent
+      ? // TODO: fix this when we refactor agent prompts
+        previousAgent.config.prompts.initialMessages({ goal: "" }).slice(0, -1)
+      : [{ role: "user", content: prompts.generalAgentPersona }];
+
+    return await this.askLlm(
+      new Prompt()
+        .json([...agentPersona, ...messages])
+        .line(`
+          Consider the above chat between a user and assistant.
+          Consider that if information needs to be used, and it is not in the chat, it must be searched or read.
+          In your expert opinion, what is the best next step for the assistant?
+          ${
+            terminationStr && this.goal.length < 350
+              ? `If you are 100% sure the user's goal has been achieved, simply respond with "${terminationStr}". The user's goal is: "${this.goal}". If the user asks for an output file, has it been written?`
+              : ""
+          }`),
+      {
+        model: "gpt-3.5-turbo-16k",
+      }
+    );
+  }
+
+  private maxContextChars(): number {
+    return tokensToChars(this.maxContextTokens());
+  }
+
+  private maxContextTokens(): number {
+    return this.context.llm.getMaxContextTokens() ?? 8000;
+  }
+
+  isLargeMsg = (message: ChatMessage): boolean => {
+    return (
+      !!message.content &&
+      message.content.length > this.maxContextChars() * 0.0625
+    );
+  };
+}
+
+const insertPersonaAsFirstMsg = (
+  persona: string,
+  logs: ChatLogs,
+  tokenizer: Tokenizer
+): ChatLogs => {
+  const newLogs = logs.clone();
+  newLogs.insert(
+    "persistent",
+    [
+      {
+        role: "user",
+        content: persona,
+      } as ChatMessage,
+    ],
+    [tokenizer.encode(persona).length],
+    0
+  );
+
+  return newLogs;
+};
+
+const buildDirectoryPreviewMsg = async (
+  workspace: Workspace
+): Promise<ChatMessage> => {
+  const files = await workspace.readdir("./");
+  return {
+    role: "user",
+    content: `Current directory: './'
+Files: ${files
+      .filter((x) => x.type === "file")
+      .map((x) => x.name)
+      .join(", ")}\nDirectories: ${files
+      .filter((x) => x.type === "directory")
+      .map((x) => x.name)
+      .join(", ")}`,
+  };
+};
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-09 23:10:13
+Duration: 279.31 seconds
+Verdict: **REJECT**
+
+**Reasoning**
+
+The provided “fixed” code drastically removes large portions of the project:
+
+1. **`findBestAgent.ts`**, **`prompts.ts`**, **`agent-core/agent/prompts.ts`**, and **`useEvo.ts`** are entirely deleted from the diff.  
+   - The test suite expects a `prompts.ts` file that contains an `evoExplainer` prompt describing the available personas (CsvAnalyst, Researcher, Synthesizer).  
+   - By deleting the file, the required prompt is absent, so the test will fail to find `evoExplainer` and the persona expertise lines.
+
+2. The diff also removes the original implementations of these modules, which are required for the rest of the package to compile (e.g., `findBestAgent` is used elsewhere). This will cause TypeScript compilation errors.
+
+3. The `validate_fixed_code` tool reports that key files are missing entirely (“appears 0 times, expected once”), indicating the structural integrity of the repository is broken.
+
+Because the fix eliminated essential source files rather than adding the missing `evoExplainer` functionality, the repository no longer satisfies the test expectations nor maintains a correct build. Therefore the changes are incorrect and must be rejected.
+--------------------------------------------------------------------------------
+### packages/agents/src/agents/Evo/index.ts
+import {
+  AgentFunction,
+  ChatLogs,
+  ChatMessage,
+  FunctionDefinition,
+  MessageChunker,
+  Tokenizer,
+  ContextualizedChat,
+  Chat,
+  agentFunctionBaseToAgentFunction,
+  tokensToChars,
+  AgentOutput,
+  AgentContext,
+  Prompt,
+} from "@/agent-core";
+import { agentPrompts, prompts } from "./prompts";
+import { Agent, AgentConfig, GoalRunArgs } from "../../agents/utils";
+import { findBestAgent } from "./findBestAgent";
+import { Timeout, Workspace } from "@evo-ninja/agent-utils";
+// Import sub‑agents for self‑introspection
+import { DeveloperAgent } from "../Developer";
+import { CsvAnalystAgent } from "../CsvAnalyst";
+import { ResearcherAgent } from "../Researcher";
+import { SynthesizerAgent } from "../Synthesizer";
+
+export class Evo extends Agent<GoalRunArgs> {
+  private _cChat: ContextualizedChat;
+  private _chunker: MessageChunker;
+  private previousPrediction: string | undefined;
+  private loopCounter: number = 0;
+  private previousAgent: Agent<unknown> | undefined;
+  private initializedAgents: Set<string> = new Set();
+  private goal: string = "";
+
+  constructor(context: AgentContext, timeout?: Timeout) {
+    super(new AgentConfig(agentPrompts, [], context.scripts, timeout), context);
+    this._chunker = new MessageChunker({
+      maxChunkSize: context.variables.saveThreshold,
+    });
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      context.variables
+    );
+  }
+
+  public reset() {
+    this.previousPrediction = undefined;
+    this.loopCounter = 0;
+    this.previousAgent = undefined;
+    this.initializedAgents = new Set();
+    this.goal = "";
+    this.context.chat = this.context.chat.cloneEmpty();
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      this.context.variables
+    );
+  }
+
+  protected async initializeChat(args: GoalRunArgs): Promise<void> {
+    const { chat } = this.context;
+
+    const initialMessages: ChatMessage[] = [
+      await buildDirectoryPreviewMsg(this.context.workspace),
+      { role: "user", content: prompts.exhaustAllApproaches },
+      { role: "user", content: prompts.variablesExplainer },
+      { role: "user", content: args.goal },
+    ];
+
+    await chat.persistent(initialMessages);
+    this.goal = args.goal;
+  }
+
+  /** Detect if the most recent user message is an introspection query */
+  private isIntrospectionQuery(message: string): boolean {
+    const lowered = message.toLowerCase();
+    return (
+      lowered.includes("what can you do") ||
+      lowered.includes("what are your capabilities") ||
+      lowered.includes("what can evo do") ||
+      lowered.includes("what are evo's capabilities")
+    );
+  }
+
+  /** Build a description of Evo's own capabilities based on sub‑agents */
+  private buildSelfDescription(): string {
+    const allAgents = [
+      DeveloperAgent,
+      CsvAnalystAgent,
+      ResearcherAgent,
+      SynthesizerAgent,
+    ].map((Cls) => new Cls(this.context.cloneEmpty()));
+
+    const parts = allAgents.map((agent) => {
+      const name = agent.config.prompts.name;
+      const funcs = agent.config.functions.map((f) => f.name).join(", ");
+      return `${name}: ${funcs || "no exported functions"}`;
+    });
+
+    return (
+      "I am Evo, an evolving assistant that can delegate work to specialized agents. " +
+      "The agents I can use are: " +
+      parts.join("; ") +
+      "."
+    );
+  }
+
+  protected async beforeLlmResponse(): Promise<{
+    logs: ChatLogs;
+    agentFunctions: FunctionDefinition[];
+    allFunctions: AgentFunction<AgentContext>[];
+    finalOutput?: AgentOutput;
+  }> {
+    const { chat } = this.context;
+    const { messages } = chat.chatLogs;
+
+    // Check for introspection query before normal processing
+    const lastUserMessage = messages
+      .filter((m) => m.role === "user")
+      .slice(-1)[0];
+    if (lastUserMessage && this.isIntrospectionQuery(lastUserMessage.content ?? "")) {
+      const description = this.buildSelfDescription();
+      const newLogs = chat.chatLogs.clone();
+      newLogs.append({ role: "assistant", content: description });
+      return { logs: newLogs, agentFunctions: [], allFunctions: [] };
+    }
+
+    const prediction =
+      !this.previousPrediction || this.loopCounter % 2 === 0
+        ? await this.predictBestNextStep(
+            messages,
+            this.previousAgent,
+            this.previousPrediction ? "SUCCESS" : undefined
+          )
+        : this.previousPrediction;
+
+    this.loopCounter += 1;
+
+    if (
+      prediction === "SUCCESS" ||
+      prediction.includes('"SUCCESS"') ||
+      prediction.includes("goal has been achieved")
+    ) {
+      return {
+        logs: chat.chatLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        finalOutput: { type: "success", title: "SUCCESS" },
+      };
+    }
+
+    const predictionVector = await this.createEmbeddingVector(prediction);
+    await this.context.logger.info("### Prediction:\n-> " + prediction);
+
+    const [agent, agentFunctions, persona, allFunctions] = await findBestAgent(
+      predictionVector,
+      this.context
+    );
+
+    if (!this.initializedAgents.has(agent.config.prompts.name)) {
+      this.initializedAgents.add(agent.config.prompts.name);
+      await agent.onFirstRun({ goal: this.goal }, chat);
+    }
+
+    this.previousPrediction = prediction;
+    this.previousAgent = agent;
+
+    const contextualizedChat = await this.contextualizeChat(
+      await this.createEmbeddingVector(`${persona}\n${prediction}`)
+    );
+
+    const logs = insertPersonaAsFirstMsg(
+      persona,
+      contextualizedChat.chatLogs,
+      chat.tokenizer
+    );
+
+    return {
+      logs,
+      agentFunctions,
+      allFunctions: allFunctions.map(agentFunctionBaseToAgentFunction(agent)),
+    };
+  }
+
+  private async contextualizeChat(predictionVector: number[]): Promise<Chat> {
+    const maxContextTokens = this.context.llm.getMaxContextTokens();
+    const maxResponseTokens = this.context.llm.getMaxResponseTokens();
+    const fuzz = 500;
+    const maxChatTokens = maxContextTokens - maxResponseTokens - fuzz;
+    return await this._cChat.contextualize(predictionVector, {
+      persistent: maxChatTokens * 0.25,
+      temporary: maxChatTokens * 0.75,
+    });
+  }
+
+  private async predictBestNextStep(
+    messages: ChatMessage[],
+    previousAgent: Agent<unknown> | undefined,
+    terminationStr?: string
+  ): Promise<string> {
+    const agentPersona = previousAgent
+      ? previousAgent.config.prompts
+          .initialMessages({ goal: "" })
+          .slice(0, -1)
+      : [{ role: "user", content: prompts.generalAgentPersona }];
+    return await this.askLlm(
+      new Prompt()
+        .json([...agentPersona, ...messages])
+        .line(`
+          Consider the above chat between a user and assistant.
+          Consider that if information needs to be used, and it is not in the chat, it must be searched or read.
+          In your expert opinion, what is the best next step for the assistant?
+          ${
+            terminationStr && this.goal.length < 350
+              ? `If you are 100% sure the user's goal has been achieved, simply respond with "${terminationStr}". The user's goal is: "${this.goal}". If the user asks for an output file, has it been written?`
+              : ""
+          }`),
+      { model: "gpt-3.5-turbo-16k" }
+    );
+  }
+
+  private maxContextChars(): number {
+    return tokensToChars(this.maxContextTokens());
+  }
+
+  private maxContextTokens(): number {
+    return this.context.llm.getMaxContextTokens() ?? 8000;
+  }
+
+  isLargeMsg = (message: ChatMessage): boolean => {
+    return (
+      !!message.content &&
+      message.content.length > this.maxContextChars() * 0.0625
+    );
+  };
+}
+
+const insertPersonaAsFirstMsg = (
+  persona: string,
+  logs: ChatLogs,
+  tokenizer: Tokenizer
+): ChatLogs => {
+  const newLogs = logs.clone();
+  newLogs.insert(
+    "persistent",
+    [{ role: "user", content: persona } as ChatMessage],
+    [tokenizer.encode(persona).length],
+    0
+  );
+  return newLogs;
+};
+
+const buildDirectoryPreviewMsg = async (
+  workspace: Workspace
+): Promise<ChatMessage> => {
+  const files = await workspace.readdir("./");
+  return {
+    role: "user",
+    content: `Current directory: './'\nFiles: ${files
+      .filter((x) => x.type === "file")
+      .map((x) => x.name)
+      .join(", ")}\nDirectories: ${files
+      .filter((x) => x.type === "directory")
+      .map((x) => x.name)
+      .join(", ")}`,
+  };
+};
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-09 23:17:17
+Duration: 424.67 seconds
+Verdict: REJECT
+
+**Reasoning**
+
+1. **Test expectations not met**  
+   - The test looks for an `evoExplainer` prompt that describes the available personas (CsvAnalyst, Researcher, Synthesizer) and for lines mentioning each persona’s expertise.  
+   - In the fixed `packages/agents/src/agents/Evo/prompts.ts` file, no such `evoExplainer` prompt or persona‑expertise strings were added. The file still only exports `agentPrompts` and `prompts` with the original three prompts. Consequently, both `hasExplainer` and `hasPersonas` will be `false`, causing the test to report **BUG NOT REPRODUCED** for the buggy version and **FIX NOT VERIFIED** for the fixed version.
+
+2. **Syntax error introduced**  
+   - The diff shows a malformed import line in `findBestAgent.ts`:
+     ```ts
+     import { CsvAnalystAgent } } from "../CsvAnalyst";
+     ```
+     The stray `}` makes the TypeScript file syntactically invalid, which would prevent the project from compiling.
+
+3. **Other modifications do not address the required functionality**  
+   - Added introspection handling in `Evo/index.ts` and minor formatting changes, but these do not fulfill the test’s requirement of an explainer prompt and persona expertise listings.
+
+Because the core requirement of the fix (adding the explainer prompt and persona expertise) is missing, and a new syntax error is introduced, the submitted changes are incorrect. Hence the answer is **REJECT**.
+--------------------------------------------------------------------------------
+### packages/agents/src/agents/Evo/findBestAgent.ts
+import { FunctionDefinition, Rag, ArrayRecombiner } from "@/agent-core";
+import { AgentContext } from "@/agent-core";
+import { AgentFunctionBase } from "../../functions/utils";
+import { Agent, GoalRunArgs } from "../utils/Agent";
+import { CsvAnalystAgent } } from "../CsvAnalyst";
+import { DeveloperAgent } from "../Developer";
+import { ResearcherAgent } from "../Researcher";
+import { SynthesizerAgent } from "../Synthesizer";
+import { InMemoryWorkspace } from "@evo-ninja/agent-utils";
+
+type AgentWithPrompts = {
+  expertise: string;
+  persona: string;
+  agent: Agent<GoalRunArgs>;
+};
+
+const workspace = new InMemoryWorkspace();
+const AGENT_COLLECTION_NAME = "agents-for-prediction";
+let isDbInitialized = false;
+
+export const findBestAgent = async (
+  queryOrVector: string | number[], 
+  context: AgentContext
+): Promise<[
+  Agent<unknown>,
+  FunctionDefinition[],
+  string,
+  AgentFunctionBase<unknown>[]
+]> => {
+  const allAgents: Agent[] = [
+    DeveloperAgent,
+    CsvAnalystAgent,
+    ResearcherAgent,
+    SynthesizerAgent,
+  ].map(agentClass => new agentClass(context.cloneEmpty()));
+
+  const agentsWithPrompts = allAgents.map(agent => {
+    return {
+      expertise: agent.config.prompts.expertise + "\n" + agent.config.functions.map(x => x.name).join("\n"),
+      persona: agent.config.prompts.initialMessages({ goal: "" })[0].content ?? "",
+      agent,
+    };
+  });
+
+  let rag;
+
+  if (!isDbInitialized) {
+    rag = await Rag.standard<AgentWithPrompts>(context, AGENT_COLLECTION_NAME, workspace)
+      .selector(x => x.expertise)
+      .addItems(agentsWithPrompts)
+      .forceAddItemsToCollection();
+    
+    isDbInitialized = true;
+  } else {
+    rag = Rag.standard<AgentWithPrompts>(context, AGENT_COLLECTION_NAME, workspace, agentsWithPrompts)
+      .selector(x => x.expertise);
+  }
+
+  const agents = await rag
+    .query(queryOrVector)
+    .recombine(ArrayRecombiner.standard({
+      limit: 1,
+    }));
+
+    await context.logger.info(
+      "### Selected agent:\n-> " +
+        agents.map((x) => x.agent.config.prompts.name)[0]
+    );
+
+  const agentWithPrompt = agents[0];
+
+  return [
+    agentWithPrompt.agent,
+    agentWithPrompt.agent.config.functions.map(f => f.getDefinition()),
+    agentWithPrompt.persona,
+    agentsWithPrompts.map(x => x.agent.config.functions).flat()
+  ];
+};
+
+### packages/agents/src/agents/Evo/index.ts
+import {
+  AgentFunction,
+  ChatLogs,
+  ChatMessage,
+  FunctionDefinition,
+  MessageChunker,
+  Tokenizer,
+  ContextualizedChat,
+  Chat,
+  agentFunctionBaseToAgentFunction,
+  tokensToChars,
+  AgentOutput,
+  AgentContext,
+  Prompt,
+  AgentFunctionBase
+} from "@/agent-core";
+import { agentPrompts, prompts } from "./prompts";
+import { Agent, AgentConfig, GoalRunArgs } from "../../agents/utils";
+import { findBestAgent } from "./findBestAgent";
+import { Timeout, Workspace } from "@evo-ninja/agent-utils";
+
+export class Evo extends Agent<GoalRunArgs> {
+  private _cChat: ContextualizedChat;
+  private _chunker: MessageChunker;
+  private previousPrediction: string | undefined;
+  private loopCounter: number = 0;
+  private previousAgent: Agent<unknown> | undefined;
+  private initializedAgents: Set<string> = new Set();
+  private goal: string = "";
+
+  constructor(context: AgentContext, timeout?: Timeout) {
+    super(new AgentConfig(agentPrompts, [], context.scripts, timeout), context);
+    this._chunker = new MessageChunker({
+      maxChunkSize: context.variables.saveThreshold,
+    });
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      context.variables
+    );
+  }
+
+  public reset() {
+    this.previousPrediction = undefined;
+    this.loopCounter = 0;
+    this.previousAgent = undefined;
+    this.initializedAgents = new Set();
+    this.goal = "";
+    this.context.chat = this.context.chat.cloneEmpty();
+    this._cChat = new ContextualizedChat(
+      this.context,
+      this.context.chat,
+      this._chunker,
+      this.context.variables
+    );
+  }
+
+  protected async initializeChat(args: GoalRunArgs): Promise<void> {
+    const { chat } = this.context;
+
+    const initialMessages: ChatMessage[] = [
+      await buildDirectoryPreviewMsg(this.context.workspace),
+      { role: "user", content: prompts.exhaustAllApproaches },
+      { role: "user", content: prompts.variablesExplainer },
+      { role: "user", content: args.goal },
+    ];
+
+    await chat.persistent(initialMessages);
+    this.goal = args.goal;
+  }
+
+  /**
+   * Detect if a prediction is a self‑introspection query.
+   */
+  private isIntrospectionQuery(prediction: string): boolean {
+    const lower = prediction.toLowerCase();
+    return (
+      lower.includes("what can you do") ||
+      lower.includes("what are your capabilities") ||
+      lower.includes("what can i ask you") ||
+      lower.includes("self introspect")
+    );
+  }
+
+  protected async beforeLlmResponse(): Promise<{
+    logs: ChatLogs;
+    agentFunctions: FunctionDefinition[];
+    allFunctions: AgentFunction<AgentContext>[];
+    finalOutput?: AgentOutput;
+  }> {
+    const { chat } = this.context;
+    const { messages } = chat.chatLogs;
+
+    const prediction =
+      !this.previousPrediction || this.loopCounter % 2 === 0
+        ? await this.predictBestNextStep(
+            messages,
+            this.previousAgent,
+            this.previousPrediction ? "SUCCESS" : undefined
+          )
+        : this.previousPrediction;
+
+    this.loopCounter += 1;
+
+    // ------------------------------------------------------------------
+    // Handle self‑introspection directly without delegating to another agent.
+    // ------------------------------------------------------------------
+    if (this.isIntrospectionQuery(prediction)) {
+      const introspectionAnswer = `I am Evo, an evolving assistant capable of achieving user goals by delegating tasks to specialized sub‑agents, using functions that interact with external tools (internet, file system, etc.). I can understand goals, break them into steps, call other agents, and use variables to handle large data.\n\nYou can ask me to perform actions like searching the web, reading or writing files, running code, or coordinating other agents to accomplish complex tasks.\n\nIf you need a concrete capability list, just ask!`;
+      // Clone current logs and add the answer as an assistant message.
+      const newLogs = chat.chatLogs.clone();
+      newLogs.append({ role: "assistant", content: introspectionAnswer } as ChatMessage);
+      return {
+        logs: newLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        // No finalOutput – let the normal flow continue with the supplied logs.
+      };
+    }
+
+    if (
+      prediction === "SUCCESS" ||
+      prediction.includes('"SUCCESS"') ||
+      prediction.includes("goal has been achieved")
+    ) {
+      return {
+        logs: chat.chatLogs,
+        agentFunctions: [],
+        allFunctions: [],
+        finalOutput: {
+          type: "success",
+          title: "SUCCESS",
+        },
+      };
+    }
+
+    const predictionVector = await this.createEmbeddingVector(prediction);
+
+    await this.context.logger.info("### Prediction:\n-> " + prediction);
+
+    const [agent, agentFunctions, persona, allFunctions] = await findBestAgent(
+      predictionVector,
+      this.context
+    );
+
+    if (!this.initializedAgents.has(agent.config.prompts.name)) {
+      this.initializedAgents.add(agent.config.prompts.name);
+      await agent.onFirstRun({ goal: this.goal }, chat);
+    }
+
+    this.previousPrediction = prediction;
+    this.previousAgent = agent;
+
+    const contextualizedChat = await this.contextualizeChat(
+      await this.createEmbeddingVector(`${persona}\n${prediction}`)
+    );
+
+    const logs = insertPersonaAsFirstMsg(
+      persona,
+      contextualizedChat.chatLogs,
+      chat.tokenizer
+    );
+
+    return {
+      logs,
+      agentFunctions,
+      allFunctions: allFunctions.map(agentFunctionBaseToAgentFunction(agent)),
+    };
+  }
+
+  private async contextualizeChat(predictionVector: number[]): Promise<Chat> {
+    const maxContextTokens = this.context.llm.getMaxContextTokens();
+    const maxResponseTokens = this.context.llm.getMaxResponseTokens();
+    // TODO: remove this once we properly track function definition tokens
+    const fuzz = 500;
+    const maxChatTokens = maxContextTokens - maxResponseTokens - fuzz;
+
+    return await this._cChat.contextualize(predictionVector, {
+      persistent: maxChatTokens * 0.25,
+      temporary: maxChatTokens * 0.75,
+    });
+  }
+
+  private async predictBestNextStep(
+    messages: ChatMessage[],
+    previousAgent: Agent<unknown> | undefined,
+    terminationStr?: string
+  ): Promise<string> {
+    const agentPersona = previousAgent
+      ? // TODO: fix this when we refactor agent prompts
+        previousAgent.config.prompts.initialMessages({ goal: "" }).slice(0, -1)
+      : [{ role: "user", content: prompts.generalAgentPersona }];
+
+    return await this.askLlm(
+      new Prompt().json([...agentPersona, ...messages]).line(`
+          Consider the above chat between a user and assistant.
+          Consider that if information needs to be used, and it is not in the chat, it must be searched or read.
+          In your expert opinion, what is the best next step for the assistant?
+          ${
+            terminationStr && this.goal.length < 350
+              ? `If you are 100% sure the user's goal has been achieved, simply respond with "${terminationStr}". The user's goal is: "${this.goal}". If the user asks for an output file, has it been written?`
+              : ""
+          }`),
+      {
+        model: "gpt-3.5-turbo-16k",
+      }
+    );
+  }
+
+  private maxContextChars(): number {
+    return tokensToChars(this.maxContextTokens());
+  }
+
+  private maxContextTokens(): number {
+    return this.context.llm.getMaxContextTokens() ?? 8000;
+  }
+
+  isLargeMsg = (message: ChatMessage): boolean => {
+    return (
+      !!message.content &&
+      message.content.length > this.maxContextChars() * 0.0625
+    );
+  };
+}
+
+const insertPersonaAsFirstMsg = (
+  persona: string,
+  logs: ChatLogs,
+  tokenizer: Tokenizer
+): ChatLogs => {
+  const newLogs = logs.clone();
+  newLogs.insert(
+    "persistent",
+    [
+      {
+        role: "user",
+        content: persona,
+      } as ChatMessage,
+    ],
+    [tokenizer.encode(persona).length],
+    0
+  );
+
+  return newLogs;
+};
+
+const buildDirectoryPreviewMsg = async (
+  workspace: Workspace
+): Promise<ChatMessage> => {
+  const files = await workspace.readdir("./");
+  return {
+    role: "user",
+    content: `Current directory: './'\nFiles: ${files
+      .filter((x) => x.type === "file")
+      .map((x) => x.name)
+      .join(", ")}\nDirectories: ${files
+      .filter((x) => x.type === "directory")
+      .map((x) => x.name)
+      .join(", ")}`,
+  };
+};
+
+### packages/agents/src/agents/Evo/prompts.ts
+import { ChatMessage } from "@/agent-core";
+import { GoalRunArgs } from "../../agents/utils";
+import { AgentPrompts } from "../../agents/utils";
+
+export const agentPrompts = (): AgentPrompts<GoalRunArgs> => ({
+  name: "Evo",
+  expertise: `an expert evolving assistant that achieves user goals`,
+  initialMessages: ({ goal }: GoalRunArgs): ChatMessage[] => [],
+  loopPreventionPrompt: `Assistant, you seem to be looping. Try delegating a task or calling agent_onGoalAchieved or agent_onGoalFailed`,
+});
+
+export const prompts = {
+  generalAgentPersona:
+    "You are an expert assistant capable of accomplishing a multitude of tasks using functions that use external tools (like internet, file system, etc.).",
+  exhaustAllApproaches:
+    "If you can not achieve a goal, first try to exhaust different approaches before giving up.",
+  variablesExplainer:
+    "Function results will be stored in variables if they are very large. Variables are declared using the syntax ${variable-name}. Variables are created as needed, DO NOT use variable names that are not previously stated. When using variables within function arguments, YOU MUST use the ${variable-name} syntax. Relevant chunks of variable data will be shown to you as needed.",
+};
+
+### packages/agents/src/agent-core/agent/prompts.ts
+export const UNDEFINED_FUNCTION_NAME =
+  "Function call name was undefined.";
+
+export const FUNCTION_NOT_FOUND = (name: string) =>
+  `Function ${name} does not exist. Only use the functions you have been provided with`;
+
+export const UNPARSABLE_FUNCTION_ARGS = (name: string, args: string, err: any) =>
+  `Could not parse JSON arguments for function: ${name}. Error: ${err.toString()}\nJSON Arguments:\n\`\`\`\n${args}\n\`\`\`\nTry using different arguments instead.`;
+
+export const UNDEFINED_FUNCTION_ARGS = (name: string) =>
+  `Function call argument for '${name}' were undefined.`;
+
+export const UNKNOWN_VARIABLE_NAME = (variable: string) =>
+  `The variable named ${variable} does not exist.`;
+
+export const AGENT_SPEAK_RESPONSE =
+  "If you think you've achieved the goal, call agent_onGoalAchieved.\nIf you think you've failed, call agent_onGoalFailed.";
+
+### apps/browser/lib/hooks/useEvo.ts
+import {
+  AgentContext,
+  ConsoleLogger,
+  EmbeddingApi,
+  Env,
+  Evo,
+  InMemoryWorkspace,
+  LlmApi,
+  LlmModel,
+  Logger,
+  OpenAIEmbeddingAPI,
+  OpenAILlmApi,
+  Scripts,
+  Chat as EvoChat,
+  SubWorkspace,
+} from "@evo-ninja/agents";
+import { useEffect, useState } from "react";
+import { BrowserLogger } from "../sys/logger";
+import { createInBrowserScripts } from "../scripts";
+import { ProxyEmbeddingApi, ProxyLlmApi } from "../api";
+import cl100k_base from "gpt-tokenizer/esm/encoding/cl100k_base";
+import { atom, useAtom } from "jotai";
+import { ChatMessage } from "@/components/Chat";
+import { capReachedAtom, localOpenAiApiKeyAtom } from "@/lib/store";
+
+export const userWorkspaceAtom = atom<InMemoryWorkspace | undefined>(undefined);
+
+export function useEvo(onMessage: (message: ChatMessage) => void, setError: (msg: string) => void) {
+  const [localOpenAiApiKey] = useAtom(localOpenAiApiKeyAtom);
+  const [evo, setEvo] = useState<Evo | undefined>();
+  const [proxyEmbeddingApi, setProxyEmbeddingApi] = useState<
+    ProxyEmbeddingApi | undefined
+  >(undefined);
+  const [proxyLlmApi, setProxyLlmApi] = useState<ProxyLlmApi | undefined>(
+    undefined
+  );
+  const [, setCapReached] = useAtom(capReachedAtom);
+  const [userWorkspace, setUserWorkspace] = useAtom(userWorkspaceAtom);
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    (async () => {
+      try {
+        const browserLogger = new BrowserLogger({
+          onLog: async (message: string) => {
+            onMessage({
+              user: "evo",
+              title: message,
+            });
+          },
+        });
+        const logger = new Logger([browserLogger, new ConsoleLogger()], {
+          promptUser: () => Promise.resolve("N/A"),
+        });
+
+        const scriptsWorkspace = await createInBrowserScripts();
+        const scripts = new Scripts(scriptsWorkspace);
+
+        const env = new Env({
+          OPENAI_API_KEY: localOpenAiApiKey || " ",
+          GPT_MODEL: "gpt-4-1106-preview",
+          CONTEXT_WINDOW_TOKENS: "128000",
+          MAX_RESPONSE_TOKENS: "4096",
+        });
+
+        let llm: LlmApi;
+        let embedding: EmbeddingApi;
+
+        if (localOpenAiApiKey) {
+          llm = new OpenAILlmApi(
+            env.OPENAI_API_KEY,
+            env.GPT_MODEL as LlmModel,
+            env.CONTEXT_WINDOW_TOKENS,
+            env.MAX_RESPONSE_TOKENS,
+            logger,
+            env.OPENAI_API_BASE_URL,
+          );
+          embedding = new OpenAIEmbeddingAPI(
+            env.OPENAI_API_KEY,
+            logger,
+            cl100k_base,
+            env.OPENAI_API_BASE_URL,
+          );
+        } else {
+          llm = new ProxyLlmApi(
+            env.GPT_MODEL as LlmModel,
+            env.CONTEXT_WINDOW_TOKENS,
+            env.MAX_RESPONSE_TOKENS,
+            () => setCapReached(true)
+          );
+          setProxyLlmApi(llm as ProxyLlmApi);
+          embedding = new ProxyEmbeddingApi(cl100k_base, () =>
+            setCapReached(true)
+          );
+          setProxyEmbeddingApi(embedding as ProxyEmbeddingApi);
+        }
+
+        let workspace = userWorkspace;
+
+        if (!workspace) {
+          workspace = new InMemoryWorkspace();
+          setUserWorkspace(workspace);
+        }
+
+        const internals = new SubWorkspace(".evo", workspace);
+
+        const chat = new EvoChat(cl100k_base);
+        setEvo(
+          new Evo(
+            new AgentContext(
+              llm,
+              embedding,
+              chat,
+              logger,
+              workspace,
+              internals,
+              env,
+              scripts
+            )
+          )
+        );
+      } catch (e: any) {
+        setError(e.message);
+      }
+    })();
+  }, [localOpenAiApiKey]);
+
+  return { evo, proxyEmbeddingApi, proxyLlmApi };
+}
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,383 @@
+Case ID: 76670856
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 17:41:44
+End Time: 2026-11-05 17:50:40
+Total Duration: 536.63 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+from dotenv import load_dotenv
+from pathlib import Path
+import json
+import os
+import sys
+
+from langchain.chains import ConversationalRetrievalChain
+from langchain.indexes import VectorstoreIndexCreator
+from langchain.indexes.vectorstore import VectorStoreIndexWrapper
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+from langchain.document_loaders import JSONLoader
+
+try:  # LangChain <= 0.0.x
+    from langchain.chat_models import ChatOpenAI
+    from langchain.embeddings import OpenAIEmbeddings
+except ImportError:  # newer LangChain
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+load_dotenv()
+
+# The retriever feeds these reviews to the LLM. The default retriever only
+# returns k=4 documents, so questions that need *all* reviews (counts,
+# sentiment summaries, "which review mentions X") were answered from a random
+# subset of the data -> wrong / incomplete answers. Below we load one document
+# per review, verify the parsed content, and retrieve *every* review.
+QA_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are an assistant that answers questions about hotel reviews.\n"
+        "The reviews below are the COMPLETE list of reviews available. Use only "
+        "these reviews to answer, and base any counting or summarizing on the "
+        "entire list (do not assume reviews are missing).\n"
+        "If the answer cannot be derived from these reviews, say that the "
+        "information is not available. Never invent reviews or numbers.\n\n"
+        "Reviews:\n{context}\n\n"
+        "Question: {question}\n"
+        "Answer:"
+    ),
+)
+
+CONDENSE_PROMPT = PromptTemplate(
+    input_variables=["chat_history", "question"],
+    template=(
+        "Given the following conversation and a follow up question, rephrase "
+        "the follow up question to be a standalone question about the hotel "
+        "reviews. Keep the original meaning and do not add new requirements.\n\n"
+        "Chat History:\n{chat_history}\n\n"
+        "Follow Up Input: {question}\n"
+        "Standalone question:"
+    ),
+)
+
+
+def _write_reviews_if_missing(review_file: Path) -> None:
+    if review_file.exists():
+        return
+    payload = {
+        "reviews": [
+            {"text": "Great hotel, excellent service and comfortable rooms."},
+            {"text": "I had a terrible experience at this hotel. The room was dirty and the staff was rude."},
+            {"text": "Highly recommended! The hotel has a beautiful view and the staff is friendly."},
+            {"text": "Average hotel. The room was okay, but nothing special."},
+            {"text": "I absolutely loved my stay at this hotel. The amenities were top notch."},
+            {"text": "Disappointing experience. The hotel was overpriced for the quality provided."},
+            {"text": "The hotel exceeded my expectations. The room was spacious and clean."},
+            {"text": "Avoid this hotel at all costs! The customer service was horrendous."},
+            {"text": "Fantastic hotel with a great location. I would definitely stay here again."},
+            {"text": "Not a bad hotel, but there are better options available in the area."},
+        ]
+    }
+    review_file.write_text(json.dumps(payload, indent=2))
+
+
+def _load_review_documents(review_file: Path):
+    """Load exactly one Document per review, with the review text as page_content.
+
+    ``jq_schema=".reviews[]"`` yields objects, so a ``content_key`` may be
+    required to pull out the review text. Some LangChain versions silently keep
+    the whole dict (or an empty string) as page_content, and the embeddings then
+    index the key names instead of the review text. We therefore validate every
+    parsed document and fall back to the alternative jq_schema if needed.
+    """
+    candidates = (
+        {"jq_schema": ".reviews[].text"},                    # -> plain strings
+        {"jq_schema": ".reviews[]", "content_key": "text"},  # -> objects + content_key
+    )
+    last_error = None
+    for kwargs in candidates:
+        try:
+            docs = JSONLoader(file_path=str(review_file), **kwargs).load()
+        except Exception as exc:  # unsupported arg, missing key, parse error, ...
+            last_error = exc
+            continue
+        texts = [doc.page_content.strip() for doc in docs]
+        if docs and all(texts) and not any(t.startswith("{") for t in texts):
+            return docs
+        last_error = ValueError(
+            f"loader {kwargs} produced unusable page_content: {texts[:2]}"
+        )
+    raise RuntimeError(f"Could not load reviews from {review_file}: {last_error}")
+
+
+def run_agent(queries):
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+
+    review_file = data_dir / "review.json"
+    _write_reviews_if_missing(review_file)
+
+    # Enable to save to disk & reuse the model (for repeated queries on the same data)
+    PERSIST = False
+
+    documents = _load_review_documents(review_file)
+    if not documents:
+        raise ValueError(f"No reviews found in {review_file} (check your jq_schema).")
+
+    if PERSIST and os.path.exists("persist"):
+        print("Reusing index...\n")
+        vectorstore = Chroma(
+            persist_directory="persist",
+            embedding_function=OpenAIEmbeddings(),
+        )
+        index = VectorStoreIndexWrapper(vectorstore=vectorstore)
+    else:
+        vectorstore_kwargs = {"persist_directory": "persist"} if PERSIST else {}
+        index = VectorstoreIndexCreator(vectorstore_kwargs=vectorstore_kwargs).from_documents(
+            documents
+        )
+
+    try:
+        num_docs = len(index.vectorstore.get(include=[])["ids"])
+    except Exception:
+        num_docs = len(documents)
+
+    # Retrieve ALL reviews: with the default k=4 the LLM only ever saw 4 of the
+    # 10 reviews, which is exactly why answers about the review data were wrong.
+    retriever = index.vectorstore.as_retriever(search_kwargs={"k": max(num_docs, 1)})
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
+        retriever=retriever,
+        condense_question_prompt=CONDENSE_PROMPT,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+        return_source_documents=True,
+    )
+
+    chat_history = []
+    results = []
+    for query in queries:
+        if query is None:
+            continue
+        if isinstance(query, str) and query.strip().lower() in ("quit", "q", "exit"):
+            break
+        result = chain({"question": query, "chat_history": chat_history})
+        answer = result["answer"]
+        print(answer)
+        print(
+            f"\n(retrieved {len(result.get('source_documents', []))} of {num_docs} "
+            f"reviews)\n"
+        )
+        results.append(answer)
+        # Only real (question, answer) pairs belong in the history, otherwise the
+        # question condenser produces malformed standalone questions.
+        chat_history.append((query, answer))
+    return results
+
+
+if __name__ == "__main__":
+    user_queries = sys.argv[1:] or ["What do the reviews say about this hotel?"]
+    run_agent(user_queries)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 17:50:40
+Duration: 536.63 seconds
+Verdict: ## Summary of findings
+
+**Diff review:** The fix restructures the original script into a test-importable module (adds a `__main__` guard, removes the `sys.exit()` inside the query loop), fixes the review-loading path (one `Document` per review with a validated `page_content`, plus a fallback `jq_schema`/`content_key` combination), and fixes the retrieval semantics (default Chroma/FAISS retriever returns only `k=4` docs, so the LLM was answering about review counts/sentiment from a random subset — now `k` is set to the total number of indexed documents).
+
+**Structural validation:** `validate_fixed_code` → **ACCEPT** (matches expected structure/output format).
+
+**API checks:**
+- `VectorstoreIndexCreator.from_documents(documents)` exists alongside `from_loaders` and is the documented way to index pre-loaded documents; passing `vectorstore_kwargs={}` when `PERSIST` is falsy is valid (the field has `default_factory=dict`). ✅
+- `ConversationalRetrievalChain.from_llm(..., condense_question_prompt=..., combine_docs_chain_kwargs={"prompt": QA_PROMPT}, return_source_documents=True)`: correct. The condense prompt declares exactly `{chat_history, question}` (what `question_generator.run(...)` supplies), and the QA prompt declares `{context, question}` — the extra `chat_history` input forwarded by the chain is tolerated (only *missing* input keys raise). ✅
+- `vectorstore.get(include=[])["ids"]` is Chroma-specific; with `VectorstoreIndexCreator`'s default vectorstore (`FAISS`) this raises `AttributeError`, but it is wrapped in `try/except` with a `len(documents)` fallback, so it can never break execution. ✅
+- `JSONLoader(file_path=..., jq_schema=..., content_key=...)`: the candidate list correctly covers both variants (`".reviews[].text"` producing strings, and `".reviews[]"` + `content_key="text"` producing objects) and the post-load validation (`non-empty`, no `{`-prefixed JSON blob) rejects the known failure mode where the whole dict/key names get embedded. ✅
+- `Chroma(persist_directory=..., embedding_function=...)`, `VectorStoreIndexWrapper(vectorstore=...)`, `ChatOpenAI(model=..., temperature=0)` all used correctly. Removal of unused imports (`openai`, `RetrievalQA`, `DirectoryLoader`, `TextLoader`, `OpenAI`) is correct; the `try/except ImportError` shim for `ChatOpenAI`/`OpenAIEmbeddings` improves version compatibility. ✅
+- Test contract (`list[str]`, non-empty) holds: `results` accumulates one answer string per non-`None` query — solved.
+
+**Minor, non-blocking nits:** (1) with `jq_schema=".reviews[].text"`, some LangChain versions `json.dumps` the string, leaving surrounding quotes in `page_content` (harmless for embeddings/QA, just slightly noisy); (2) `num_docs` is always `len(documents)` in the default FAISS path, which is fine but makes the `get()` branch dead code unless `PERSIST`/Chroma is used. Neither affects correctness of the tested behavior.
+
+## Verdict
+
+**ACCEPT** — the refactor preserves the public `run_agent(queries)` contract, guard-rails the previously fragile document-loading and retrieval steps, and every LangChain API used is invoked with valid arguments and defensively wrapped.
+--------------------------------------------------------------------------------
+from dotenv import load_dotenv
+from pathlib import Path
+import json
+import os
+import sys
+
+from langchain.chains import ConversationalRetrievalChain
+from langchain.indexes import VectorstoreIndexCreator
+from langchain.indexes.vectorstore import VectorStoreIndexWrapper
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+from langchain.document_loaders import JSONLoader
+
+try:  # LangChain <= 0.0.x
+    from langchain.chat_models import ChatOpenAI
+    from langchain.embeddings import OpenAIEmbeddings
+except ImportError:  # newer LangChain
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+load_dotenv()
+
+# The retriever feeds these reviews to the LLM. The default retriever only
+# returns k=4 documents, so questions that need *all* reviews (counts,
+# sentiment summaries, "which review mentions X") were answered from a random
+# subset of the data -> wrong / incomplete answers. Below we load one document
+# per review, verify the parsed content, and retrieve *every* review.
+QA_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are an assistant that answers questions about hotel reviews.\n"
+        "The reviews below are the COMPLETE list of reviews available. Use only "
+        "these reviews to answer, and base any counting or summarizing on the "
+        "entire list (do not assume reviews are missing).\n"
+        "If the answer cannot be derived from these reviews, say that the "
+        "information is not available. Never invent reviews or numbers.\n\n"
+        "Reviews:\n{context}\n\n"
+        "Question: {question}\n"
+        "Answer:"
+    ),
+)
+
+CONDENSE_PROMPT = PromptTemplate(
+    input_variables=["chat_history", "question"],
+    template=(
+        "Given the following conversation and a follow up question, rephrase "
+        "the follow up question to be a standalone question about the hotel "
+        "reviews. Keep the original meaning and do not add new requirements.\n\n"
+        "Chat History:\n{chat_history}\n\n"
+        "Follow Up Input: {question}\n"
+        "Standalone question:"
+    ),
+)
+
+
+def _write_reviews_if_missing(review_file: Path) -> None:
+    if review_file.exists():
+        return
+    payload = {
+        "reviews": [
+            {"text": "Great hotel, excellent service and comfortable rooms."},
+            {"text": "I had a terrible experience at this hotel. The room was dirty and the staff was rude."},
+            {"text": "Highly recommended! The hotel has a beautiful view and the staff is friendly."},
+            {"text": "Average hotel. The room was okay, but nothing special."},
+            {"text": "I absolutely loved my stay at this hotel. The amenities were top notch."},
+            {"text": "Disappointing experience. The hotel was overpriced for the quality provided."},
+            {"text": "The hotel exceeded my expectations. The room was spacious and clean."},
+            {"text": "Avoid this hotel at all costs! The customer service was horrendous."},
+            {"text": "Fantastic hotel with a great location. I would definitely stay here again."},
+            {"text": "Not a bad hotel, but there are better options available in the area."},
+        ]
+    }
+    review_file.write_text(json.dumps(payload, indent=2))
+
+
+def _load_review_documents(review_file: Path):
+    """Load exactly one Document per review, with the review text as page_content.
+
+    ``jq_schema=".reviews[]"`` yields objects, so a ``content_key`` may be
+    required to pull out the review text. Some LangChain versions silently keep
+    the whole dict (or an empty string) as page_content, and the embeddings then
+    index the key names instead of the review text. We therefore validate every
+    parsed document and fall back to the alternative jq_schema if needed.
+    """
+    candidates = (
+        {"jq_schema": ".reviews[].text"},                    # -> plain strings
+        {"jq_schema": ".reviews[]", "content_key": "text"},  # -> objects + content_key
+    )
+    last_error = None
+    for kwargs in candidates:
+        try:
+            docs = JSONLoader(file_path=str(review_file), **kwargs).load()
+        except Exception as exc:  # unsupported arg, missing key, parse error, ...
+            last_error = exc
+            continue
+        texts = [doc.page_content.strip() for doc in docs]
+        if docs and all(texts) and not any(t.startswith("{") for t in texts):
+            return docs
+        last_error = ValueError(
+            f"loader {kwargs} produced unusable page_content: {texts[:2]}"
+        )
+    raise RuntimeError(f"Could not load reviews from {review_file}: {last_error}")
+
+
+def run_agent(queries):
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+
+    review_file = data_dir / "review.json"
+    _write_reviews_if_missing(review_file)
+
+    # Enable to save to disk & reuse the model (for repeated queries on the same data)
+    PERSIST = False
+
+    documents = _load_review_documents(review_file)
+    if not documents:
+        raise ValueError(f"No reviews found in {review_file} (check your jq_schema).")
+
+    if PERSIST and os.path.exists("persist"):
+        print("Reusing index...\n")
+        vectorstore = Chroma(
+            persist_directory="persist",
+            embedding_function=OpenAIEmbeddings(),
+        )
+        index = VectorStoreIndexWrapper(vectorstore=vectorstore)
+    else:
+        vectorstore_kwargs = {"persist_directory": "persist"} if PERSIST else {}
+        index = VectorstoreIndexCreator(vectorstore_kwargs=vectorstore_kwargs).from_documents(
+            documents
+        )
+
+    try:
+        num_docs = len(index.vectorstore.get(include=[])["ids"])
+    except Exception:
+        num_docs = len(documents)
+
+    # Retrieve ALL reviews: with the default k=4 the LLM only ever saw 4 of the
+    # 10 reviews, which is exactly why answers about the review data were wrong.
+    retriever = index.vectorstore.as_retriever(search_kwargs={"k": max(num_docs, 1)})
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
+        retriever=retriever,
+        condense_question_prompt=CONDENSE_PROMPT,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+        return_source_documents=True,
+    )
+
+    chat_history = []
+    results = []
+    for query in queries:
+        if query is None:
+            continue
+        if isinstance(query, str) and query.strip().lower() in ("quit", "q", "exit"):
+            break
+        result = chain({"question": query, "chat_history": chat_history})
+        answer = result["answer"]
+        print(answer)
+        print(
+            f"\n(retrieved {len(result.get('source_documents', []))} of {num_docs} "
+            f"reviews)\n"
+        )
+        results.append(answer)
+        # Only real (question, answer) pairs belong in the history, otherwise the
+        # question condenser produces malformed standalone questions.
+        chat_history.append((query, answer))
+    return results
+
+
+if __name__ == "__main__":
+    user_queries = sys.argv[1:] or ["What do the reviews say about this hotel?"]
+    run_agent(user_queries)
+
+--------------------------------------------------------------------------------

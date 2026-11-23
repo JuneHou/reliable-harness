@@ -1,0 +1,695 @@
+Case ID: crewai_1323
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-14 05:21:56
+End Time: 2026-11-14 05:26:29
+Total Duration: 272.63 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### src/crewai/agents/crew_agent_executor.py
+from typing import Any, Dict, List, Optional
+
+from crewai.agents.agent_builder.base_agent_executor_mixin import CrewAgentExecutorMixin
+from crewai.agents.parser import (
+    AgentAction,
+    AgentFinish,
+    CrewAgentParser,
+    OutputParserException,
+)
+from crewai.agents.tools_handler import ToolsHandler
+from crewai.llm import LLM
+from crewai.tools.tool_usage import ToolUsage, ToolUsageErrorException
+from crewai.utilities import I18N
+from crewai.utilities.constants import TRAINING_DATA_FILE
+from crewai.utilities.exceptions.context_window_exceeding_exception import (
+    LLMContextLengthExceededException,
+)
+from crewai.utilities.logger import Logger
+from crewai.utilities.training_handler import CrewTrainingHandler
+
+
+class CrewAgentExecutor(CrewAgentExecutorMixin):
+    _logger: Logger = Logger()
+
+    def __init__(
+        self,
+        llm: Any,
+        task: Any,
+        crew: Any,
+        agent: Any,
+        prompt: str,
+        max_iter: int,
+        tools: List[Any],
+        tools_names: str,
+        stop_words: Optional[List[str]] = None,
+        tools_description: str = "",
+        tools_handler: Optional[ToolsHandler] = None,
+        step_callback: Any = None,
+        original_tools: Optional[List[Any]] = None,
+        function_calling_llm: Any = None,
+        sliding_context_window: bool = False,
+        request_within_rpm_limit: Any = None,
+        callbacks: Optional[List[Any]] = None,
+    ):
+        self._i18n: I18N = I18N()
+        self.llm = llm
+        self.task = task
+        self.agent = agent
+        self.crew = crew
+        self.prompt = prompt
+        self.tools = tools
+        self.tools_names = tools_names
+        # `stop` is optional: models such as o1-preview / o1-mini do not
+        # support stop sequences, so an empty list must never be forwarded.
+        self.stop = stop_words or []
+        self.max_iter = max_iter
+        self.callbacks = callbacks or []
+        self.tools_handler = tools_handler
+        self.original_tools = original_tools or []
+        self.step_callback = step_callback
+        self.tools_description = tools_description
+        self.function_calling_llm = function_calling_llm
+        self.sliding_context_window = sliding_context_window
+        self.request_within_rpm_limit = request_within_rpm_limit
+        self.should_ask_for_human_input = False
+        self.messages = []
+        self.iterations = 0
+        self.have_forced_answer = False
+        self.name_to_tool_map = {tool.name: tool for tool in self.tools}
+
+    def invoke(self, inputs: Dict[str, str]) -> Dict[str, Any]:
+        formatted_answer = None
+        formatted_prompt = self._format_prompt(self.prompt, inputs)
+        self.should_ask_for_human_input = inputs.get(
+            "should_ask_for_human_input", False
+        )
+        self.messages = self._messages(formatted_prompt)
+
+        formatted_answer = self._invoke_loop(formatted_answer)
+
+        if self.should_ask_for_human_input:
+            human_feedback = self._ask_human_input(formatted_answer.output)
+            if self.crew and self.crew._train:
+                self._handle_crew_training_output(formatted_answer, human_feedback)
+
+            # Making sure we only ask for it once, so disabling for the next thought loop
+            self.should_ask_for_human_input = False
+            self.messages.append(
+                {"role": "user", "content": f"Feedback: {human_feedback}"}
+            )
+            formatted_answer = self._invoke_loop(None)
+
+        return {"output": formatted_answer.output}
+
+    def _invoke_loop(self, formatted_answer):
+        try:
+            while not isinstance(formatted_answer, AgentFinish):
+                if not self.request_within_rpm_limit or self.request_within_rpm_limit():
+                    answer = LLM(
+                        self.llm,
+                        stop=self.stop or None,
+                        callbacks=self.callbacks,
+                    ).call(self.messages)
+
+                    self.iterations += 1
+                    formatted_answer = self._format_answer(answer)
+
+                    if isinstance(formatted_answer, AgentAction):
+                        action_result = self._use_tool(formatted_answer)
+                        formatted_answer.text += f"\nObservation: {action_result}"
+
+                        if self.step_callback:
+                            formatted_answer.result = action_result
+                            self.step_callback(formatted_answer)
+                        if self._should_force_answer():
+                            if self.have_forced_answer:
+                                return {
+                                    "output": self._i18n.errors(
+                                        "force_final_answer_error"
+                                    ).format(formatted_answer.text)
+                                }
+                            else:
+                                formatted_answer.text += (
+                                    f'\n{self._i18n.errors("force_final_answer")}'
+                                )
+                                self.have_forced_answer = True
+                    self.messages.append(
+                        {"role": "assistant", "content": formatted_answer.text}
+                    )
+
+        except OutputParserException as e:
+            self.messages.append({"role": "assistant", "content": e.error})
+            self._invoke_loop(formatted_answer)
+
+        except Exception as e:
+            if LLMContextLengthExceededException(str(e))._is_context_limit_error(
+                str(e)
+            ):
+                self._handle_context_length()
+                self._invoke_loop(formatted_answer)
+
+        return formatted_answer
+
+    def _use_tool(self, agent_action: AgentAction) -> None:
+        tool_usage = ToolUsage(
+            tools_handler=self.tools_handler,
+            tools=self.tools,
+            original_tools=self.original_tools,
+            tools_description=self.tools_description,
+            tools_names=self.tools_names,
+            function_calling_llm=self.function_calling_llm,
+            task=self.task,
+            agent=self.agent,
+            action=agent_action,
+        )
+        tool_calling = tool_usage.parse(agent_action.text)
+
+        if isinstance(tool_calling, ToolUsageErrorException):
+            tool_result = tool_calling.message
+        else:
+            if tool_calling.tool_name.casefold().strip() in [
+                name.casefold().strip() for name in self.name_to_tool_map
+            ] or tool_calling.tool_name.casefold().replace("_", " ") in [
+                name.casefold().strip() for name in self.name_to_tool_map
+            ]:
+                tool_result = tool_usage.use(tool_calling, agent_action.text)
+            else:
+                tool_result = self._i18n.errors("wrong_tool_name").format(
+                    tool=tool_calling.tool_name,
+                    tools=", ".join([tool.name.casefold() for tool in self.tools]),
+                )
+        return tool_result
+
+    def _summarize_messages(self) -> None:
+        llm = LLM(self.llm)
+        grouped_messages = []
+
+        for message in self.messages:
+            content = message["content"]
+            for i in range(0, len(content), 5000):
+                grouped_messages.append(content[i : i + 5000])
+
+        summarized_contents = []
+        for group in grouped_messages:
+            summary = llm.call(
+                [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that summarizes text.",
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Summarize the following text, make sure to include all the important information: {group}",
+                    },
+                ]
+            )
+            summarized_contents.append(summary)
+
+        merged_summary = " ".join(summarized_contents)
+
+        self.messages = [
+            {
+                "role": "user",
+                "content": f"This is a summary of our conversation so far:\n{merged_summary}",
+            }
+        ]
+
+    def _handle_context_length(self) -> None:
+        if self.sliding_context_window:
+            self._logger.log(
+                "debug",
+                "Context length exceeded. Summarizing content to fit the model context window.",
+                color="yellow",
+            )
+            self._summarize_messages()
+        else:
+            self._logger.log(
+                "debug",
+                "Context length exceeded. Consider using smaller text or RAG tools from crewai_tools.",
+                color="red",
+            )
+            raise SystemExit(
+                "Context length exceeded and user opted not to summarize. Consider using smaller text or RAG tools from crewai_tools."
+            )
+
+    def _handle_crew_training_output(
+        self, result: AgentFinish, human_feedback: str | None = None
+    ) -> None:
+        """Function to handle the process of the training data."""
+        agent_id = str(self.agent.id)
+
+        if (
+            CrewTrainingHandler(TRAINING_DATA_FILE).load()
+            and not self.should_ask_for_human_input
+        ):
+            training_data = CrewTrainingHandler(TRAINING_DATA_FILE).load()
+            if training_data.get(agent_id):
+                training_data[agent_id][self.crew._train_iteration][
+                    "improved_output"
+                ] = result.output
+                CrewTrainingHandler(TRAINING_DATA_FILE).save(training_data)
+
+        if self.should_ask_for_human_input and human_feedback is not None:
+            training_data = {
+                "initial_output": result.output,
+                "human_feedback": human_feedback,
+                "agent": agent_id,
+                "agent_role": self.agent.role,
+            }
+            CrewTrainingHandler(TRAINING_DATA_FILE).append(
+                self.crew._train_iteration, agent_id, training_data
+            )
+
+    def _format_prompt(self, prompt: str, inputs: Dict[str, str]) -> str:
+        prompt = prompt.replace("{input}", inputs["input"])
+        prompt = prompt.replace("{tool_names}", inputs["tool_names"])
+        prompt = prompt.replace("{tools}", inputs["tools"])
+        return prompt
+
+    def _format_answer(self, answer: str) -> str:
+        return CrewAgentParser(agent=self).parse(answer)
+
+    def _messages(self, prompt: str) -> List[Dict[str, str]]:
+        return [{"role": "user", "content": prompt}]
+
+
+### src/crewai/llm.py
+from typing import Any, Dict, List, Optional
+
+import litellm
+from litellm import completion
+
+
+class LLM:
+    def __init__(
+        self,
+        model: str,
+        stop: Optional[List[str]] = None,
+        callbacks: Optional[List[Any]] = None,
+    ):
+        self.stop = stop or []
+        self.model = model
+        self.callbacks = callbacks or []
+        litellm.callbacks = self.callbacks
+        litellm.set_verbose = True
+
+    def call(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "num_retries": 5,
+        }
+
+        # The `stop` parameter is optional: models like OpenAI's `o1-preview`
+        # and `o1-mini` do not support stop sequences and raise an error when
+        # it is passed. Only forward it when stop words are configured and the
+        # target model supports them.
+        if self.stop and not self._model_rejects_stop(self.model):
+            params["stop"] = self.stop
+
+        response = completion(**params)
+        return response["choices"][0]["message"]["content"]
+
+    @staticmethod
+    def _model_rejects_stop(model: str) -> bool:
+        """Return True when the model does not accept a `stop` parameter."""
+        if not model:
+            return False
+        # Strip provider prefixes such as "openai/o1-preview" or "azure/o1-mini"
+        normalized_model = model.split("/")[-1].strip().lower()
+        return normalized_model.startswith(("o1", "o3"))
+
+    def _call_callbacks(self, formatted_answer):
+        for callback in self.callbacks:
+            callback(formatted_answer)
+
+
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-14 05:26:29
+Duration: 272.63 seconds
+Verdict: ## Evaluation of `crewai_1323`
+
+### 1. What the bug was
+`crew_agent_executor.py` built an `LLM(...)` with `stop=self.stop` and `llm.py` unconditionally forwarded `stop=self.stop` into `litellm.completion(...)`. OpenAI's reasoning models (`o1-preview`, `o1-mini` — and `o3-*`) **reject the `stop` parameter**, so every call failed for those models. A secondary defect: `LLM.__init__` set `litellm.callbacks` but never stored `self.callbacks`, so `_call_callbacks` would raise `AttributeError`.
+
+### 2. Diff review
+The patch addresses both root causes:
+
+- **`src/crewai/llm.py`**
+  - `call()` now builds a `params` dict and only adds `"stop"` when `self.stop` is non-empty **and** the model accepts it:
+    ```python
+    if self.stop and not self._model_rejects_stop(self.model):
+        params["stop"] = self.stop
+    response = completion(**params)
+    ```
+    This is the correct shape for `litellm.completion(model=..., messages=..., num_retries=..., [stop=...])` — the remaining kwargs (`model`, `messages`, `num_retries`) are unchanged from the working original, and `stop` is simply omitted for o1/o3 models, which is exactly what the API requires. No invalid kwargs are introduced.
+  - `_model_rejects_stop` normalizes provider prefixes (`openai/o1-preview` → `o1-preview`) then checks `startswith(("o1", "o3"))` — correct heuristic for the reported class of models, and provider-prefix stripping is a real-world necessity (litellm accepts `provider/model` strings).
+  - `self.callbacks` is now persisted (fixes the latent `_call_callbacks` bug) and mutable default args (`= []`) were replaced with `None` sentinels — a genuine correctness improvement (no shared-state leakage across executors).
+
+- **`src/crewai/agents/crew_agent_executor.py`**
+  - `stop_words`, `tools_description`, `tools_handler`, `original_tools`, `callbacks` are now `Optional[...] = None` with `self.stop = stop_words or []`, `self.callbacks = callbacks or []`, `self.original_tools = original_tools or []`. All mandatory parameters still precede defaulted ones, so the constructor signature remains valid and backward-compatible for existing call sites.
+  - `LLM(self.llm, stop=self.stop or None, callbacks=self.callbacks)` — passing `None`/empty consistently instead of an empty list.
+  - Debug `print(...)` spam and the dead commented-out code were removed; control flow, recursion/retry paths, tool usage, context-length handling and training hooks are untouched.
+
+### 3. Validation results
+- `validate_fixed_code` → **ACCEPT**: every file present exactly once with full text, no structural/format violations, no required interface obligation for this case.
+- `verify_api_usage` for `litellm.completion` / `litellm.set_verbose` returned only general LiteLLM documentation (OpenAI-format unified interface). That confirmation is consistent with the diff: the patch keeps the OpenAI-style `model`/`messages`/`num_retries`/`stop` keyword contract and only *removes* a keyword that certain models forbid — i.e. it narrows to a strictly safer usage rather than inventing new arguments.
+
+### 4. Minor, non-blocking observations
+- `o4-*` style models aren't covered by the prefix tuple (only `o1`, `o3`), but the reported case is o1-only, so this doesn't undermine the fix.
+- `litellm.set_verbose = True` is retained — pre-existing behavior, unrelated to this bug.
+- The supplied "test" is a regex-based file-patching script rather than an assertion-bearing test, so it neither proves nor breaks anything; validation consequently reported no interface constraint. This is a property of the test harness, not a defect in the fix.
+
+### Verdict
+The change targets the actual failure (unconditional `stop` forwarding to `stop`-incompatible reasoning models), is API-correct for `litellm.completion`, removes mutable-default-argument hazards, fixes the unset `self.callbacks`, and preserves all existing control flow and public signatures.
+
+**ACCEPT**
+--------------------------------------------------------------------------------
+### src/crewai/agents/crew_agent_executor.py
+from typing import Any, Dict, List, Optional
+
+from crewai.agents.agent_builder.base_agent_executor_mixin import CrewAgentExecutorMixin
+from crewai.agents.parser import (
+    AgentAction,
+    AgentFinish,
+    CrewAgentParser,
+    OutputParserException,
+)
+from crewai.agents.tools_handler import ToolsHandler
+from crewai.llm import LLM
+from crewai.tools.tool_usage import ToolUsage, ToolUsageErrorException
+from crewai.utilities import I18N
+from crewai.utilities.constants import TRAINING_DATA_FILE
+from crewai.utilities.exceptions.context_window_exceeding_exception import (
+    LLMContextLengthExceededException,
+)
+from crewai.utilities.logger import Logger
+from crewai.utilities.training_handler import CrewTrainingHandler
+
+
+class CrewAgentExecutor(CrewAgentExecutorMixin):
+    _logger: Logger = Logger()
+
+    def __init__(
+        self,
+        llm: Any,
+        task: Any,
+        crew: Any,
+        agent: Any,
+        prompt: str,
+        max_iter: int,
+        tools: List[Any],
+        tools_names: str,
+        stop_words: Optional[List[str]] = None,
+        tools_description: str = "",
+        tools_handler: Optional[ToolsHandler] = None,
+        step_callback: Any = None,
+        original_tools: Optional[List[Any]] = None,
+        function_calling_llm: Any = None,
+        sliding_context_window: bool = False,
+        request_within_rpm_limit: Any = None,
+        callbacks: Optional[List[Any]] = None,
+    ):
+        self._i18n: I18N = I18N()
+        self.llm = llm
+        self.task = task
+        self.agent = agent
+        self.crew = crew
+        self.prompt = prompt
+        self.tools = tools
+        self.tools_names = tools_names
+        # `stop` is optional: models such as o1-preview / o1-mini do not
+        # support stop sequences, so an empty list must never be forwarded.
+        self.stop = stop_words or []
+        self.max_iter = max_iter
+        self.callbacks = callbacks or []
+        self.tools_handler = tools_handler
+        self.original_tools = original_tools or []
+        self.step_callback = step_callback
+        self.tools_description = tools_description
+        self.function_calling_llm = function_calling_llm
+        self.sliding_context_window = sliding_context_window
+        self.request_within_rpm_limit = request_within_rpm_limit
+        self.should_ask_for_human_input = False
+        self.messages = []
+        self.iterations = 0
+        self.have_forced_answer = False
+        self.name_to_tool_map = {tool.name: tool for tool in self.tools}
+
+    def invoke(self, inputs: Dict[str, str]) -> Dict[str, Any]:
+        formatted_answer = None
+        formatted_prompt = self._format_prompt(self.prompt, inputs)
+        self.should_ask_for_human_input = inputs.get(
+            "should_ask_for_human_input", False
+        )
+        self.messages = self._messages(formatted_prompt)
+
+        formatted_answer = self._invoke_loop(formatted_answer)
+
+        if self.should_ask_for_human_input:
+            human_feedback = self._ask_human_input(formatted_answer.output)
+            if self.crew and self.crew._train:
+                self._handle_crew_training_output(formatted_answer, human_feedback)
+
+            # Making sure we only ask for it once, so disabling for the next thought loop
+            self.should_ask_for_human_input = False
+            self.messages.append(
+                {"role": "user", "content": f"Feedback: {human_feedback}"}
+            )
+            formatted_answer = self._invoke_loop(None)
+
+        return {"output": formatted_answer.output}
+
+    def _invoke_loop(self, formatted_answer):
+        try:
+            while not isinstance(formatted_answer, AgentFinish):
+                if not self.request_within_rpm_limit or self.request_within_rpm_limit():
+                    answer = LLM(
+                        self.llm,
+                        stop=self.stop or None,
+                        callbacks=self.callbacks,
+                    ).call(self.messages)
+
+                    self.iterations += 1
+                    formatted_answer = self._format_answer(answer)
+
+                    if isinstance(formatted_answer, AgentAction):
+                        action_result = self._use_tool(formatted_answer)
+                        formatted_answer.text += f"\nObservation: {action_result}"
+
+                        if self.step_callback:
+                            formatted_answer.result = action_result
+                            self.step_callback(formatted_answer)
+                        if self._should_force_answer():
+                            if self.have_forced_answer:
+                                return {
+                                    "output": self._i18n.errors(
+                                        "force_final_answer_error"
+                                    ).format(formatted_answer.text)
+                                }
+                            else:
+                                formatted_answer.text += (
+                                    f'\n{self._i18n.errors("force_final_answer")}'
+                                )
+                                self.have_forced_answer = True
+                    self.messages.append(
+                        {"role": "assistant", "content": formatted_answer.text}
+                    )
+
+        except OutputParserException as e:
+            self.messages.append({"role": "assistant", "content": e.error})
+            self._invoke_loop(formatted_answer)
+
+        except Exception as e:
+            if LLMContextLengthExceededException(str(e))._is_context_limit_error(
+                str(e)
+            ):
+                self._handle_context_length()
+                self._invoke_loop(formatted_answer)
+
+        return formatted_answer
+
+    def _use_tool(self, agent_action: AgentAction) -> None:
+        tool_usage = ToolUsage(
+            tools_handler=self.tools_handler,
+            tools=self.tools,
+            original_tools=self.original_tools,
+            tools_description=self.tools_description,
+            tools_names=self.tools_names,
+            function_calling_llm=self.function_calling_llm,
+            task=self.task,
+            agent=self.agent,
+            action=agent_action,
+        )
+        tool_calling = tool_usage.parse(agent_action.text)
+
+        if isinstance(tool_calling, ToolUsageErrorException):
+            tool_result = tool_calling.message
+        else:
+            if tool_calling.tool_name.casefold().strip() in [
+                name.casefold().strip() for name in self.name_to_tool_map
+            ] or tool_calling.tool_name.casefold().replace("_", " ") in [
+                name.casefold().strip() for name in self.name_to_tool_map
+            ]:
+                tool_result = tool_usage.use(tool_calling, agent_action.text)
+            else:
+                tool_result = self._i18n.errors("wrong_tool_name").format(
+                    tool=tool_calling.tool_name,
+                    tools=", ".join([tool.name.casefold() for tool in self.tools]),
+                )
+        return tool_result
+
+    def _summarize_messages(self) -> None:
+        llm = LLM(self.llm)
+        grouped_messages = []
+
+        for message in self.messages:
+            content = message["content"]
+            for i in range(0, len(content), 5000):
+                grouped_messages.append(content[i : i + 5000])
+
+        summarized_contents = []
+        for group in grouped_messages:
+            summary = llm.call(
+                [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that summarizes text.",
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Summarize the following text, make sure to include all the important information: {group}",
+                    },
+                ]
+            )
+            summarized_contents.append(summary)
+
+        merged_summary = " ".join(summarized_contents)
+
+        self.messages = [
+            {
+                "role": "user",
+                "content": f"This is a summary of our conversation so far:\n{merged_summary}",
+            }
+        ]
+
+    def _handle_context_length(self) -> None:
+        if self.sliding_context_window:
+            self._logger.log(
+                "debug",
+                "Context length exceeded. Summarizing content to fit the model context window.",
+                color="yellow",
+            )
+            self._summarize_messages()
+        else:
+            self._logger.log(
+                "debug",
+                "Context length exceeded. Consider using smaller text or RAG tools from crewai_tools.",
+                color="red",
+            )
+            raise SystemExit(
+                "Context length exceeded and user opted not to summarize. Consider using smaller text or RAG tools from crewai_tools."
+            )
+
+    def _handle_crew_training_output(
+        self, result: AgentFinish, human_feedback: str | None = None
+    ) -> None:
+        """Function to handle the process of the training data."""
+        agent_id = str(self.agent.id)
+
+        if (
+            CrewTrainingHandler(TRAINING_DATA_FILE).load()
+            and not self.should_ask_for_human_input
+        ):
+            training_data = CrewTrainingHandler(TRAINING_DATA_FILE).load()
+            if training_data.get(agent_id):
+                training_data[agent_id][self.crew._train_iteration][
+                    "improved_output"
+                ] = result.output
+                CrewTrainingHandler(TRAINING_DATA_FILE).save(training_data)
+
+        if self.should_ask_for_human_input and human_feedback is not None:
+            training_data = {
+                "initial_output": result.output,
+                "human_feedback": human_feedback,
+                "agent": agent_id,
+                "agent_role": self.agent.role,
+            }
+            CrewTrainingHandler(TRAINING_DATA_FILE).append(
+                self.crew._train_iteration, agent_id, training_data
+            )
+
+    def _format_prompt(self, prompt: str, inputs: Dict[str, str]) -> str:
+        prompt = prompt.replace("{input}", inputs["input"])
+        prompt = prompt.replace("{tool_names}", inputs["tool_names"])
+        prompt = prompt.replace("{tools}", inputs["tools"])
+        return prompt
+
+    def _format_answer(self, answer: str) -> str:
+        return CrewAgentParser(agent=self).parse(answer)
+
+    def _messages(self, prompt: str) -> List[Dict[str, str]]:
+        return [{"role": "user", "content": prompt}]
+
+
+### src/crewai/llm.py
+from typing import Any, Dict, List, Optional
+
+import litellm
+from litellm import completion
+
+
+class LLM:
+    def __init__(
+        self,
+        model: str,
+        stop: Optional[List[str]] = None,
+        callbacks: Optional[List[Any]] = None,
+    ):
+        self.stop = stop or []
+        self.model = model
+        self.callbacks = callbacks or []
+        litellm.callbacks = self.callbacks
+        litellm.set_verbose = True
+
+    def call(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "num_retries": 5,
+        }
+
+        # The `stop` parameter is optional: models like OpenAI's `o1-preview`
+        # and `o1-mini` do not support stop sequences and raise an error when
+        # it is passed. Only forward it when stop words are configured and the
+        # target model supports them.
+        if self.stop and not self._model_rejects_stop(self.model):
+            params["stop"] = self.stop
+
+        response = completion(**params)
+        return response["choices"][0]["message"]["content"]
+
+    @staticmethod
+    def _model_rejects_stop(model: str) -> bool:
+        """Return True when the model does not accept a `stop` parameter."""
+        if not model:
+            return False
+        # Strip provider prefixes such as "openai/o1-preview" or "azure/o1-mini"
+        normalized_model = model.split("/")[-1].strip().lower()
+        return normalized_model.startswith(("o1", "o3"))
+
+    def _call_callbacks(self, formatted_answer):
+        for callback in self.callbacks:
+            callback(formatted_answer)
+
+
+
+--------------------------------------------------------------------------------

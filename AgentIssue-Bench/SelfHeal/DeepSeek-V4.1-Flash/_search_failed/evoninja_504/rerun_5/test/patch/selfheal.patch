@@ -1,0 +1,112 @@
+diff --git a/apps/browser/pages/api/proxy/embeddings.ts b/apps/browser/pages/api/proxy/embeddings.ts
+index 29affd6..1924281 100644
+--- a/apps/browser/pages/api/proxy/embeddings.ts
++++ b/apps/browser/pages/api/proxy/embeddings.ts
+@@ -7,6 +7,24 @@ import { canUseSubsidy } from "../../../api-utils/subsidy";
+ import { createSupabaseClient } from "../../../api-utils/supabase";
+ import { createOpenAIApiClient } from "../../../api-utils/openai";
+ 
++// Prompts that need extensive web scraping produce a lot of text, and every
++// chunk of that text has to be sent to this route before it can be embedded.
++// Next.js' default API body parser limit (1mb) is far too small for that, so
++// those requests were rejected with a "body exceeds maximum size" error before
++// the handler ever ran. Raise the limit so large embedding payloads are
++// accepted instead of failing.
++export const config = {
++  api: {
++    bodyParser: {
++      sizeLimit: "10mb",
++    },
++  },
++};
++
++// The embeddings endpoint only accepts a bounded number of inputs per request,
++// so oversized batches are split again before being forwarded upstream.
++const MAX_INPUTS_PER_REQUEST = 2048;
++
+ export default async function handler(
+   req: NextApiRequest,
+   res: NextApiResponse
+@@ -14,7 +32,7 @@ export default async function handler(
+   if (!(req.method === "POST")) {
+     return res.status(404).send({});
+   }
+-  const goalId = req.body.goalId;
++  const goalId = req.body?.goalId;
+ 
+   // Ensure the user is logged in
+   const session = await getServerSession(req, res, authOptions);
+@@ -37,25 +55,61 @@ export default async function handler(
+     return res.status(403).send({});
+   }
+ 
+-  const input: string[][] = req.body.input;
++  // The client sends an array of batches of chunks; tolerate a flat array of
++  // chunks too instead of silently embedding individual characters.
++  const rawInput = req.body?.input;
++  if (!Array.isArray(rawInput) || rawInput.length === 0) {
++    return res.status(400).send({});
++  }
++  const input: string[][] = Array.isArray(rawInput[0])
++    ? (rawInput as string[][])
++    : [rawInput as string[]];
++
+   try {
+     const embeddings = await Promise.all(
+       input.map(async (inputs) => {
+-        const { data } = await openai.embeddings.create({
+-          model: req.body.model,
+-          input: inputs,
+-        });
++        const batches: string[][] = [];
++        for (let i = 0; i < inputs.length; i += MAX_INPUTS_PER_REQUEST) {
++          batches.push(inputs.slice(i, i + MAX_INPUTS_PER_REQUEST));
++        }
++        if (batches.length === 0) {
++          batches.push([]);
++        }
+ 
+-        return data.map((innerData) => {
+-          return {
+-            embedding: innerData.embedding,
+-            input: inputs[innerData.index],
+-          };
+-        });
++        const batchResults = await Promise.all(
++          batches.map(async (batch) => {
++            const { data } = await openai.embeddings.create({
++              model: req.body.model,
++              input: batch,
++            });
++
++            return data.map((innerData, position) => {
++              const index =
++                typeof innerData.index === "number"
++                  ? innerData.index
++                  : position;
++
++              return {
++                embedding: innerData.embedding,
++                input: batch[index] ?? batch[position],
++              };
++            });
++          })
++        );
++
++        return batchResults;
+       })
+     );
+-    return res.status(200).json({ embeddings: embeddings.flat() });
++    return res.status(200).json({ embeddings: embeddings.flat(2) });
+   } catch (e: any) {
++    // Request (or upstream request) payload was too large to be handled
++    if (
++      e?.type === "entity.too.large" ||
++      e?.statusCode === 413 ||
++      e?.status === 413
++    ) {
++      return res.status(413).send({});
++    }
+     // Rate limit error
+     if (e instanceof OpenAIApi.APIError && e.status === 429) {
+       return res.status(429).send({});

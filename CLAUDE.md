@@ -1,4 +1,4 @@
-# AgentDefect project rules
+# stochastic-harness project rules
 
 ## Instruction fidelity
 
@@ -12,20 +12,13 @@ relevant. Jun will ask for more if they want more.
 Before doing any work: read the instruction back, word by word, and list everything it
 asks for. Build only that list.
 
-## Dataset example tabs
+## Datasets
 
-The dataset example tabs in the advisor artifact show only files the dataset authors
-provided. This means:
+AgentDefect is the benchmark dataset at `/data/wang/junh/githubs/AgentDefect`. It is read-only
+from this project. Do not write experiment output into that repository.
 
-- AgentDefect tab: only files in `motivation_pilot/artifacts/repairs/<case_id>/` that come
-  from the SelfHeal archive — run_buggy.py, attempt_1.py, attempt_2.py for the chosen case.
-- AgentIssue-Bench tab: only files the AgentIssue-Bench repository contains — repro JSON
-  records in `inputs/agentissue/repro/` and generated patches in `Generated Patches/`.
-
-Everything else is our experiment output and must not appear in these tabs. This includes
-but is not limited to: comparisons.jsonl, reanalysis.jsonl, summary.json, boundary.json,
-decision.json, configuration adequacy tables, enactment rate tables, PN tables, pilot
-summaries, and any file produced by running our code.
+AgentIssue-Bench is the second dataset at `/data/wang/junh/githubs/AgentIssue-Bench`. Also
+read-only from here.
 
 ## Artifact publish rule
 
@@ -43,7 +36,11 @@ lines, callouts, and figure captions. File paths that contain dates as folder na
 Never use: "canon", "yardstick", "enact", "enactment". Use plain alternatives: for
 enact/enactment use "execute" or "execution".
 
-## No experiment except the motivation one in the artifact
+## Number registry
 
-The advisor artifact contains only the motivation pilot experiment. No other experiment
-(surrogate audit, reanalysis, test1, boundary audit) appears in any tab of the artifact.
+Every number that appears in any document must have a row in `docs/NUMBERS.md` before it
+is written. Run the number check after every edit to a document that contains numbers:
+
+```
+python3 ~/.claude/skills/number-check/scripts/check_numbers.py --registry docs/NUMBERS.md <file>
+```

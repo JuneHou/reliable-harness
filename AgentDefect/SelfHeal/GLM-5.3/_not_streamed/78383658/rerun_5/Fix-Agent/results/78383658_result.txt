@@ -1,0 +1,450 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 09:33:05
+End Time: 2026-11-05 09:47:00
+Total Duration: 834.85 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import CSVLoader
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Similarity thresholds for the two result categories the user wants.
+# Cosine distance from Chroma:  distance = 1 - cosine_similarity,
+# so LOWER distance == MORE similar. We convert to a similarity score in [0, 1].
+# ---------------------------------------------------------------------------
+SIMILAR_THRESHOLD = 0.80   # e.g. similarity >= 0.80 -> "similar" pair
+DUPLICATE_THRESHOLD = 0.90  # e.g. similarity >= 0.90 -> "duplicate" pair
+
+
+def build_control_pair_context(csv_path="control.csv"):
+    """Load the control CSV, embed every row, and compute pairwise similarity.
+
+    The original bug: the code used a generic RAG retriever (default k=4,
+    L2 distance, no scores exposed) and a generic 3-sentence Q&A prompt.
+    That pipeline can only answer questions about a handful of chunks --
+    it structurally cannot enumerate similar/duplicate pairs across the
+    whole CSV, which is why the output never matched expectations.
+
+    Fix: perform the similarity analysis explicitly in code
+    (similarity_search_with_score with cosine distance over all rows),
+    apply the thresholds deterministically, and hand the LLM the complete
+    pre-computed candidate pairs so it can format/summarize them.
+    """
+    # Load the CSV. Each row becomes one document, and its text content is
+    # the natural unit of comparison for "similar/duplicate controls".
+    # (The CharacterTextSplitter in the buggy code chopped rows into
+    # arbitrary 500-char chunks, destroying row boundaries.)
+    loader = CSVLoader(file_path=csv_path)
+    data = loader.load()
+
+    # Chroma defaults to L2 distance, where a *smaller* number is more
+    # similar but is NOT bounded to [0, 1] and does not equal a cosine
+    # similarity score. For threshold-based similarity, build the
+    # collection in "cosine" space.
+    vectorstore = Chroma.from_documents(
+        documents=data,
+        embedding=OpenAIEmbeddings(),
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+
+    similar_pairs = []
+    duplicate_pairs = []
+
+    # Compare every control against every other control (all candidates,
+    # not just a retriever's default top-k=4).
+    n = len(data)
+    for i in range(n):
+        # Retrieve the most similar controls with scores.
+        # k = n so nothing is silently dropped from the analysis.
+        results = vectorstore.similarity_search_with_score(
+            query=data[i].page_content,
+            k=n,
+        )
+
+        for doc, distance in results:
+            # Find the index of the matched document to build a pair (i, j).
+            try:
+                j = next(
+                    idx
+                    for idx, d in enumerate(data)
+                    if d.page_content == doc.page_content
+                    and d.metadata.get("source") == doc.metadata.get("source")
+                    and d.metadata.get("row") == doc.metadata.get("row")
+                )
+            except StopIteration:
+                continue
+
+            # Skip self-matches and duplicate (i, j) / (j, i) reporting.
+            if j <= i:
+                continue
+
+            # Convert cosine distance to a similarity score in [0, 1].
+            similarity = max(0.0, 1.0 - distance)
+
+            pair = {
+                "control_a": f"row {data[i].metadata.get('row', i)}: {data[i].page_content}",
+                "control_b": f"row {data[j].metadata.get('row', j)}: {doc.page_content}",
+                "similarity_score": round(similarity, 4),
+            }
+
+            if similarity >= DUPLICATE_THRESHOLD:
+                duplicate_pairs.append(pair)
+            elif similarity >= SIMILAR_THRESHOLD:
+                similar_pairs.append(pair)
+
+    # Build a structured context string containing the actual pairs and
+    # scores, so the LLM formats verified data instead of guessing.
+    context_lines = []
+
+    if similar_pairs:
+        context_lines.append("### SIMILAR CONTROL PAIRS (>= %.2f similarity) ###" % SIMILAR_THRESHOLD)
+        for p in similar_pairs:
+            context_lines.append(
+                f"- Pair (similarity {p['similarity_score']}):\n"
+                f"  Control A: {p['control_a']}\n"
+                f"  Control B: {p['control_b']}"
+            )
+        context_lines.append("")
+
+    if duplicate_pairs:
+        context_lines.append("### DUPLICATE CONTROL PAIRS (>= %.2f similarity) ###" % DUPLICATE_THRESHOLD)
+        for p in duplicate_pairs:
+            context_lines.append(
+                f"- Pair (similarity {p['similarity_score']}):\n"
+                f"  Control A: {p['control_a']}\n"
+                f"  Control B: {p['control_b']}"
+            )
+
+    if not context_lines:
+        context_lines.append(
+            "No control pairs met the similarity threshold of %.2f "
+            "or the duplicate threshold of %.2f." % (SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD)
+        )
+
+    return "\n".join(context_lines)
+
+
+def run_agent(query):
+    # Step 1: do the similarity analysis in code (deterministic, complete).
+    pair_context = build_control_pair_context()
+
+    # Step 2: use a task-specific prompt that asks the model to present
+    # the similar and duplicate control pairs as a structured list.
+    # (The original bug: the generic "3 sentences max, say you don't know"
+    # Q&A prompt actively prevented the model from producing a list of
+    # pairs, so the output never matched expectations.)
+    template = """You are an assistant that analyzes control data in a CSV file and
+reports similar and duplicate control pairs based on similarity scores.
+
+You are given the pre-computed similar and duplicate control pairs below,
+including their similarity scores. These pairs were computed by comparing
+every control's Name and Description using cosine similarity.
+
+Your task:
+1. List every pair in the "SIMILAR CONTROL PAIRS" section under the heading
+   "Similar Controls" (pairs with similarity >= {similar_threshold}).
+2. List every pair in the "DUPLICATE CONTROL PAIRS" section under the heading
+   "Duplicate Controls" (pairs with similarity >= {duplicate_threshold}).
+3. Present each pair on its own line as:
+   - Control A: <control a text> | Control B: <control b text> | Similarity: <score>
+4. If a section has no pairs, state "No pairs found above the threshold."
+5. Do not invent, merge, or omit any pairs. Use only the pairs provided in
+   the context, exactly as given.
+6. Do not summarize the controls. Output the full list of pairs.
+
+Question: {question}
+
+Context (pre-computed control pairs with similarity scores):
+{context}
+
+Answer:"""
+
+    prompt = ChatPromptTemplate.from_template(template)
+
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", verbose=True)
+
+    rag_chain = prompt | llm | StrOutputParser()
+
+    # The query and the computed pairs are both passed explicitly; the
+    # buggy code routed a bare retriever into {context} and the raw query
+    # through RunnablePassthrough, so the model never saw the pair data.
+    output = rag_chain.invoke(
+        {
+            "question": query,
+            "context": pair_context,
+            "similar_threshold": SIMILAR_THRESHOLD,
+            "duplicate_threshold": DUPLICATE_THRESHOLD,
+        }
+    )
+    return output
+
+
+if __name__ == "__main__":
+    query = (
+        "Find all similar and duplicate control pairs in control.csv based "
+        "on the similarity scores of their Name and Description, and list "
+        "each pair with its similarity score."
+    )
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 09:47:00
+Duration: 834.85 seconds
+Verdict: ## Analysis
+
+**Diff summary:** The fix replaced the generic RAG Q&A pipeline with a pairwise similarity analysis over `control.csv` (computing cosine-similarity pairs via `similarity_search_with_score`), then feeds the pre-computed pairs to an LLM with a task-specific prompt asking it to list the pairs.
+
+**Validation result:** `validate_fixed_code` returned ACCEPT — however, I must verify this against the actual test contract, which is where the problem lies.
+
+## Critical Issue: Return Type Mismatch
+
+The test is explicitly named `TestRunAgentStructuredOutput` and asserts:
+
+```python
+self.assertIsInstance(result, dict)          # 1. result must be a dict
+self.assertIn("results", result)             # 2. must contain "results" key
+self.assertIsInstance(result["results"], list)  # 3. "results" must be a list
+for item in result["results"]:
+    self.assertIsInstance(item, dict)        # 4. each item must be a dict
+```
+
+The fixed code's `run_agent` ends its chain with:
+
+```python
+rag_chain = prompt | llm | StrOutputParser()
+output = rag_chain.invoke({...})
+return output
+```
+
+`StrOutputParser` **always returns a `str`** — it unwraps the LLM message and calls `str()` on its content. There is no `with_structured_output()`, no Pydantic/JSON output parser, no `response_format`, and no post-processing step anywhere in the fixed code. Assertion #1 (`assertIsInstance(result, dict)`) will fail immediately with an `AssertionError` because a string is returned, not a dict.
+
+## Secondary Issue: Semantic Mismatch with the Test
+
+The test query is *"Find movies for family. Return only the title, genre and budget."* — clearly a movie-listing task expecting structured records. The fix instead hardcodes a **control-pair similarity analysis** pipeline, ignoring the query's actual task entirely (the `query` is only interpolated into the prompt; the pipeline behavior is fixed). The correct fix direction would have been to make `run_agent` return structured data (e.g., a Pydantic model like `class Result(BaseModel): results: List[...]` via `llm.with_structured_output(Result)`).
+
+## Other Observations
+
+- The migration to `langchain_community` imports is fine (the old `langchain.*` paths were deprecated).
+- `Chroma.from_documents(..., collection_metadata={"hnsw:space": "cosine"})` is a legitimate way to get cosine distance, and the distance→similarity conversion is correct.
+- The O(n²) loop with `k=n` retrieval per row is a performance smell but not a correctness failure.
+- The validator's ACCEPT appears to have only checked syntax/structure, not the return-type contract required by the test.
+
+## Verdict
+
+**REJECT**
+
+The test requires `run_agent` to return a `dict` containing a `"results"` key holding a list of dicts. The fixed code returns a plain string from `StrOutputParser()` with no structured-output mechanism whatsoever, so `assertIsInstance(result, dict)` fails on the very first assertion. Additionally, the fix addresses a different task (control-pair similarity) rather than the structured movie output the test queries for. The fix must be redone to produce structured output — e.g., by defining a Pydantic schema with a `results` field and using `llm.with_structured_output(...)` — so that the return value is a dict matching the test's contract.
+--------------------------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import CSVLoader
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Similarity thresholds for the two result categories the user wants.
+# Cosine distance from Chroma:  distance = 1 - cosine_similarity,
+# so LOWER distance == MORE similar. We convert to a similarity score in [0, 1].
+# ---------------------------------------------------------------------------
+SIMILAR_THRESHOLD = 0.80   # e.g. similarity >= 0.80 -> "similar" pair
+DUPLICATE_THRESHOLD = 0.90  # e.g. similarity >= 0.90 -> "duplicate" pair
+
+
+def build_control_pair_context(csv_path="control.csv"):
+    """Load the control CSV, embed every row, and compute pairwise similarity.
+
+    The original bug: the code used a generic RAG retriever (default k=4,
+    L2 distance, no scores exposed) and a generic 3-sentence Q&A prompt.
+    That pipeline can only answer questions about a handful of chunks --
+    it structurally cannot enumerate similar/duplicate pairs across the
+    whole CSV, which is why the output never matched expectations.
+
+    Fix: perform the similarity analysis explicitly in code
+    (similarity_search_with_score with cosine distance over all rows),
+    apply the thresholds deterministically, and hand the LLM the complete
+    pre-computed candidate pairs so it can format/summarize them.
+    """
+    # Load the CSV. Each row becomes one document, and its text content is
+    # the natural unit of comparison for "similar/duplicate controls".
+    # (The CharacterTextSplitter in the buggy code chopped rows into
+    # arbitrary 500-char chunks, destroying row boundaries.)
+    loader = CSVLoader(file_path=csv_path)
+    data = loader.load()
+
+    # Chroma defaults to L2 distance, where a *smaller* number is more
+    # similar but is NOT bounded to [0, 1] and does not equal a cosine
+    # similarity score. For threshold-based similarity, build the
+    # collection in "cosine" space.
+    vectorstore = Chroma.from_documents(
+        documents=data,
+        embedding=OpenAIEmbeddings(),
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+
+    similar_pairs = []
+    duplicate_pairs = []
+
+    # Compare every control against every other control (all candidates,
+    # not just a retriever's default top-k=4).
+    n = len(data)
+    for i in range(n):
+        # Retrieve the most similar controls with scores.
+        # k = n so nothing is silently dropped from the analysis.
+        results = vectorstore.similarity_search_with_score(
+            query=data[i].page_content,
+            k=n,
+        )
+
+        for doc, distance in results:
+            # Find the index of the matched document to build a pair (i, j).
+            try:
+                j = next(
+                    idx
+                    for idx, d in enumerate(data)
+                    if d.page_content == doc.page_content
+                    and d.metadata.get("source") == doc.metadata.get("source")
+                    and d.metadata.get("row") == doc.metadata.get("row")
+                )
+            except StopIteration:
+                continue
+
+            # Skip self-matches and duplicate (i, j) / (j, i) reporting.
+            if j <= i:
+                continue
+
+            # Convert cosine distance to a similarity score in [0, 1].
+            similarity = max(0.0, 1.0 - distance)
+
+            pair = {
+                "control_a": f"row {data[i].metadata.get('row', i)}: {data[i].page_content}",
+                "control_b": f"row {data[j].metadata.get('row', j)}: {doc.page_content}",
+                "similarity_score": round(similarity, 4),
+            }
+
+            if similarity >= DUPLICATE_THRESHOLD:
+                duplicate_pairs.append(pair)
+            elif similarity >= SIMILAR_THRESHOLD:
+                similar_pairs.append(pair)
+
+    # Build a structured context string containing the actual pairs and
+    # scores, so the LLM formats verified data instead of guessing.
+    context_lines = []
+
+    if similar_pairs:
+        context_lines.append("### SIMILAR CONTROL PAIRS (>= %.2f similarity) ###" % SIMILAR_THRESHOLD)
+        for p in similar_pairs:
+            context_lines.append(
+                f"- Pair (similarity {p['similarity_score']}):\n"
+                f"  Control A: {p['control_a']}\n"
+                f"  Control B: {p['control_b']}"
+            )
+        context_lines.append("")
+
+    if duplicate_pairs:
+        context_lines.append("### DUPLICATE CONTROL PAIRS (>= %.2f similarity) ###" % DUPLICATE_THRESHOLD)
+        for p in duplicate_pairs:
+            context_lines.append(
+                f"- Pair (similarity {p['similarity_score']}):\n"
+                f"  Control A: {p['control_a']}\n"
+                f"  Control B: {p['control_b']}"
+            )
+
+    if not context_lines:
+        context_lines.append(
+            "No control pairs met the similarity threshold of %.2f "
+            "or the duplicate threshold of %.2f." % (SIMILAR_THRESHOLD, DUPLICATE_THRESHOLD)
+        )
+
+    return "\n".join(context_lines)
+
+
+def run_agent(query):
+    # Step 1: do the similarity analysis in code (deterministic, complete).
+    pair_context = build_control_pair_context()
+
+    # Step 2: use a task-specific prompt that asks the model to present
+    # the similar and duplicate control pairs as a structured list.
+    # (The original bug: the generic "3 sentences max, say you don't know"
+    # Q&A prompt actively prevented the model from producing a list of
+    # pairs, so the output never matched expectations.)
+    template = """You are an assistant that analyzes control data in a CSV file and
+reports similar and duplicate control pairs based on similarity scores.
+
+You are given the pre-computed similar and duplicate control pairs below,
+including their similarity scores. These pairs were computed by comparing
+every control's Name and Description using cosine similarity.
+
+Your task:
+1. List every pair in the "SIMILAR CONTROL PAIRS" section under the heading
+   "Similar Controls" (pairs with similarity >= {similar_threshold}).
+2. List every pair in the "DUPLICATE CONTROL PAIRS" section under the heading
+   "Duplicate Controls" (pairs with similarity >= {duplicate_threshold}).
+3. Present each pair on its own line as:
+   - Control A: <control a text> | Control B: <control b text> | Similarity: <score>
+4. If a section has no pairs, state "No pairs found above the threshold."
+5. Do not invent, merge, or omit any pairs. Use only the pairs provided in
+   the context, exactly as given.
+6. Do not summarize the controls. Output the full list of pairs.
+
+Question: {question}
+
+Context (pre-computed control pairs with similarity scores):
+{context}
+
+Answer:"""
+
+    prompt = ChatPromptTemplate.from_template(template)
+
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", verbose=True)
+
+    rag_chain = prompt | llm | StrOutputParser()
+
+    # The query and the computed pairs are both passed explicitly; the
+    # buggy code routed a bare retriever into {context} and the raw query
+    # through RunnablePassthrough, so the model never saw the pair data.
+    output = rag_chain.invoke(
+        {
+            "question": query,
+            "context": pair_context,
+            "similar_threshold": SIMILAR_THRESHOLD,
+            "duplicate_threshold": DUPLICATE_THRESHOLD,
+        }
+    )
+    return output
+
+
+if __name__ == "__main__":
+    query = (
+        "Find all similar and duplicate control pairs in control.csv based "
+        "on the similarity scores of their Name and Description, and list "
+        "each pair with its similarity score."
+    )
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------

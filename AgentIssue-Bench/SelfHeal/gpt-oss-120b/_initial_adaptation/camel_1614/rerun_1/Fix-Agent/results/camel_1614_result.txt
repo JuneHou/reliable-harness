@@ -1,0 +1,493 @@
+Case ID: camel_1614
+Status: ACCEPTED
+Final Attempt: 2
+Start Time: 2026-11-08 13:54:40
+End Time: 2026-11-08 13:55:34
+Total Duration: 53.78 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### camel/models/deepseek_model.py
+# ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
+
+import os
+import re
+from typing import Any, Dict, List, Optional, Union
+
+from openai import OpenAI, Stream
+
+from camel.configs import DEEPSEEK_API_PARAMS, DeepSeekConfig
+from camel.logger import get_logger
+from camel.messages import OpenAIMessage
+from camel.models.base_model import BaseModelBackend
+from camel.types import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ModelType,
+)
+from camel.utils import BaseTokenCounter, OpenAITokenCounter, api_keys_required
+
+logger = get_logger(__name__)
+
+
+class DeepSeekModel(BaseModelBackend):
+    r"""DeepSeek API in a unified BaseModelBackend interface.
+
+    Args:
+        model_type (Union[ModelType, str]): Model for which a backend is
+            created.
+        model_config_dict (Optional[Dict[str, Any]], optional): A dictionary
+            that will be fed into:obj:`openai.ChatCompletion.create()`. If
+            :obj:`None`, :obj:`DeepSeekConfig().as_dict()` will be used.
+            (default: :obj:`None`)
+        api_key (Optional[str], optional): The API key for authenticating with
+            the DeepSeek service. (default: :obj:`None`)
+        url (Optional[str], optional): The url to the DeepSeek service.
+            (default: :obj:`https://api.deepseek.com`)
+        token_counter (Optional[BaseTokenCounter], optional): Token counter to
+            use for the model. If not provided, :obj:`OpenAITokenCounter`
+            will be used. (default: :obj:`None`)
+
+    References:
+        https://api-docs.deepseek.com/
+    """
+
+    @api_keys_required(
+        [
+            ("api_key", "DEEPSEEK_API_KEY"),
+        ]
+    )
+    def __init__(
+        self,
+        model_type: Union[ModelType, str],
+        model_config_dict: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+        url: Optional[str] = None,
+        token_counter: Optional[BaseTokenCounter] = None,
+    ) -> None:
+        if model_config_dict is None:
+            model_config_dict = DeepSeekConfig().as_dict()
+        api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+        url = url or os.environ.get(
+            "DEEPSEEK_API_BASE_URL",
+            "https://api.deepseek.com",
+        )
+        super().__init__(
+            model_type, model_config_dict, api_key, url, token_counter
+        )
+
+        self._client = OpenAI(
+            timeout=180,
+            max_retries=3,
+            api_key=self._api_key,
+            base_url=self._url,
+        )
+
+    @property
+    def token_counter(self) -> BaseTokenCounter:
+        r"""Initialize the token counter for the model backend.
+
+        Returns:
+            BaseTokenCounter: The token counter following the model's
+                tokenization style.
+        """
+        if not self._token_counter:
+            self._token_counter = OpenAITokenCounter(
+                model=ModelType.GPT_4O_MINI
+            )
+        return self._token_counter
+
+    def _strip_think_tags(self, messages: List[OpenAIMessage]) -> List[OpenAIMessage]:
+        """Remove any ``<think>...</think>`` blocks from message contents.
+
+        DeepSeek (including the R1 model) does not accept the ``<think>`` tag
+        used by the Camel reasoning pipeline. Stripping these tags ensures the
+        request payload is compatible with all DeepSeek endpoints.
+        """
+        cleaned = []
+        for msg in messages:
+            # ``msg`` is a dict‑like ``OpenAIMessage``; ensure ``content``
+            # exists and is a string before applying the regex.
+            content = msg.get("content")
+            if isinstance(content, str):
+                new_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                cleaned_msg = {**msg, "content": new_content}
+                cleaned.append(cleaned_msg)  # type: ignore[arg-type]
+            else:
+                # If there is no textual content (e.g., tool calls) keep the
+                # message unchanged.
+                cleaned.append(msg)  # type: ignore[arg-type]
+        return cleaned
+
+    def run(
+        self,
+        messages: List[OpenAIMessage],
+    ) -> Union[ChatCompletion, Stream[ChatCompletionChunk]]:
+        r"""Runs inference of DeepSeek chat completion.
+
+        Args:
+            messages (List[OpenAIMessage]): Message list with the chat history
+                in OpenAI API format.
+
+        Returns:
+            Union[ChatCompletion, Stream[ChatCompletionChunk]]:
+                `ChatCompletion` in the non-stream mode, or
+                `Stream[ChatCompletionChunk]` in the stream mode.
+        """
+        # DeepSeek Reasoner has additional limitations; we handle them first.
+        if self.model_type in [
+            ModelType.DEEPSEEK_REASONER,
+        ]:
+            # Drop unsupported parameters for the reasoner model.
+            unsupported_keys = [
+                "temperature",
+                "top_p",
+                "presence_penalty",
+                "frequency_penalty",
+                "logprobs",
+                "top_logprobs",
+                "tools",
+            ]
+            for key in unsupported_keys:
+                if key in self.model_config_dict:
+                    del self.model_config_dict[key]
+
+        # Strip <think> tags for *all* DeepSeek models (including R1).
+        messages = self._strip_think_tags(messages)
+
+        response = self._client.chat.completions.create(
+            messages=messages,
+            model=self.model_type,
+            **self.model_config_dict,
+        )
+
+        # Handle reasoning content with <think> tags at the beginning for the
+        # reasoner model when the user explicitly requests it via the
+        # ``GET_REASONING_CONTENT`` environment variable.
+        if (
+            self.model_type
+            in [
+                ModelType.DEEPSEEK_REASONER,
+            ]
+            and os.environ.get("GET_REASONING_CONTENT", "false").lower()
+            == "true"
+        ):
+            reasoning_content = response.choices[0].message.reasoning_content
+            combined_content = (
+                f"<think>\n{reasoning_content}\n</think>\n" if reasoning_content else ""
+            ) + response.choices[0].message.content
+
+            response = ChatCompletion.construct(
+                id=response.id,
+                choices=[
+                    dict(
+                        index=response.choices[0].index,
+                        message={
+                            "role": response.choices[0].message.role,
+                            "content": combined_content,
+                            "tool_calls": None,
+                        },
+                        finish_reason=response.choices[0].finish_reason
+                        if response.choices[0].finish_reason
+                        else None,
+                    )
+                ],
+                created=response.created,
+                model=response.model,
+                object="chat.completion",
+                usage=response.usage,
+            )
+
+        return response
+
+    def check_model_config(self):
+        r"""Check whether the model configuration contains any
+        unexpected arguments to DeepSeek API.
+
+        Raises:
+            ValueError: If the model configuration dictionary contains any
+                unexpected arguments to DeepSeek API.
+        """
+        for param in self.model_config_dict:
+            if param not in DEEPSEEK_API_PARAMS:
+                raise ValueError(
+                    f"Unexpected argument `{param}` is "
+                    "input into DeepSeek model backend."
+                )
+
+    @property
+    def stream(self) -> bool:
+        r"""Returns whether the model is in stream mode, which sends partial
+        results each time.
+
+        Returns:
+            bool: Whether the model is in stream mode.
+        """
+        return self.model_config_dict.get("stream", False)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-08 13:54:58
+Duration: 17.28 seconds
+Verdict: The request cannot be completed because there is no fixed version of the code supplied for this case. Without a diff or the corrected files, I cannot evaluate whether a bug has been fixed or whether any changes are correct. Accordingly, I must reject the evaluation.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-08 13:55:34
+Duration: 36.50 seconds
+Verdict: ACCEPT
+
+**Reasoning**
+
+The patch introduces a clean, reusable method `_strip_think_tags` to remove `<think>...</think>` blocks from all message contents, addressing DeepSeek’s inability to handle these tags. It also centralizes the import of `re` and removes duplicated in‑line regex handling. The original functionality for the Reasoner model (dropping unsupported parameters) remains untouched, while the warning message is omitted—this does not affect core behavior. All changes are syntactically correct, imports are properly added, and the code now follows DRY principles, making it functionally sound.
+--------------------------------------------------------------------------------
+### camel/models/deepseek_model.py
+# ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ========= Copyright 2023-2024 @ CAMEL-AI.org. All Rights Reserved. =========
+
+import os
+import re
+from typing import Any, Dict, List, Optional, Union
+
+from openai import OpenAI, Stream
+
+from camel.configs import DEEPSEEK_API_PARAMS, DeepSeekConfig
+from camel.logger import get_logger
+from camel.messages import OpenAIMessage
+from camel.models.base_model import BaseModelBackend
+from camel.types import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ModelType,
+)
+from camel.utils import BaseTokenCounter, OpenAITokenCounter, api_keys_required
+
+logger = get_logger(__name__)
+
+
+class DeepSeekModel(BaseModelBackend):
+    r"""DeepSeek API in a unified BaseModelBackend interface.
+
+    Args:
+        model_type (Union[ModelType, str]): Model for which a backend is
+            created.
+        model_config_dict (Optional[Dict[str, Any]], optional): A dictionary
+            that will be fed into:obj:`openai.ChatCompletion.create()`. If
+            :obj:`None`, :obj:`DeepSeekConfig().as_dict()` will be used.
+            (default: :obj:`None`)
+        api_key (Optional[str], optional): The API key for authenticating with
+            the DeepSeek service. (default: :obj:`None`)
+        url (Optional[str], optional): The url to the DeepSeek service.
+            (default: :obj:`https://api.deepseek.com`)
+        token_counter (Optional[BaseTokenCounter], optional): Token counter to
+            use for the model. If not provided, :obj:`OpenAITokenCounter`
+            will be used. (default: :obj:`None`)
+
+    References:
+        https://api-docs.deepseek.com/
+    """
+
+    @api_keys_required(
+        [
+            ("api_key", "DEEPSEEK_API_KEY"),
+        ]
+    )
+    def __init__(
+        self,
+        model_type: Union[ModelType, str],
+        model_config_dict: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+        url: Optional[str] = None,
+        token_counter: Optional[BaseTokenCounter] = None,
+    ) -> None:
+        if model_config_dict is None:
+            model_config_dict = DeepSeekConfig().as_dict()
+        api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+        url = url or os.environ.get(
+            "DEEPSEEK_API_BASE_URL",
+            "https://api.deepseek.com",
+        )
+        super().__init__(
+            model_type, model_config_dict, api_key, url, token_counter
+        )
+
+        self._client = OpenAI(
+            timeout=180,
+            max_retries=3,
+            api_key=self._api_key,
+            base_url=self._url,
+        )
+
+    @property
+    def token_counter(self) -> BaseTokenCounter:
+        r"""Initialize the token counter for the model backend.
+
+        Returns:
+            BaseTokenCounter: The token counter following the model's
+                tokenization style.
+        """
+        if not self._token_counter:
+            self._token_counter = OpenAITokenCounter(
+                model=ModelType.GPT_4O_MINI
+            )
+        return self._token_counter
+
+    def _strip_think_tags(self, messages: List[OpenAIMessage]) -> List[OpenAIMessage]:
+        """Remove any ``<think>...</think>`` blocks from message contents.
+
+        DeepSeek (including the R1 model) does not accept the ``<think>`` tag
+        used by the Camel reasoning pipeline. Stripping these tags ensures the
+        request payload is compatible with all DeepSeek endpoints.
+        """
+        cleaned = []
+        for msg in messages:
+            # ``msg`` is a dict‑like ``OpenAIMessage``; ensure ``content``
+            # exists and is a string before applying the regex.
+            content = msg.get("content")
+            if isinstance(content, str):
+                new_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                cleaned_msg = {**msg, "content": new_content}
+                cleaned.append(cleaned_msg)  # type: ignore[arg-type]
+            else:
+                # If there is no textual content (e.g., tool calls) keep the
+                # message unchanged.
+                cleaned.append(msg)  # type: ignore[arg-type]
+        return cleaned
+
+    def run(
+        self,
+        messages: List[OpenAIMessage],
+    ) -> Union[ChatCompletion, Stream[ChatCompletionChunk]]:
+        r"""Runs inference of DeepSeek chat completion.
+
+        Args:
+            messages (List[OpenAIMessage]): Message list with the chat history
+                in OpenAI API format.
+
+        Returns:
+            Union[ChatCompletion, Stream[ChatCompletionChunk]]:
+                `ChatCompletion` in the non-stream mode, or
+                `Stream[ChatCompletionChunk]` in the stream mode.
+        """
+        # DeepSeek Reasoner has additional limitations; we handle them first.
+        if self.model_type in [
+            ModelType.DEEPSEEK_REASONER,
+        ]:
+            # Drop unsupported parameters for the reasoner model.
+            unsupported_keys = [
+                "temperature",
+                "top_p",
+                "presence_penalty",
+                "frequency_penalty",
+                "logprobs",
+                "top_logprobs",
+                "tools",
+            ]
+            for key in unsupported_keys:
+                if key in self.model_config_dict:
+                    del self.model_config_dict[key]
+
+        # Strip <think> tags for *all* DeepSeek models (including R1).
+        messages = self._strip_think_tags(messages)
+
+        response = self._client.chat.completions.create(
+            messages=messages,
+            model=self.model_type,
+            **self.model_config_dict,
+        )
+
+        # Handle reasoning content with <think> tags at the beginning for the
+        # reasoner model when the user explicitly requests it via the
+        # ``GET_REASONING_CONTENT`` environment variable.
+        if (
+            self.model_type
+            in [
+                ModelType.DEEPSEEK_REASONER,
+            ]
+            and os.environ.get("GET_REASONING_CONTENT", "false").lower()
+            == "true"
+        ):
+            reasoning_content = response.choices[0].message.reasoning_content
+            combined_content = (
+                f"<think>\n{reasoning_content}\n</think>\n" if reasoning_content else ""
+            ) + response.choices[0].message.content
+
+            response = ChatCompletion.construct(
+                id=response.id,
+                choices=[
+                    dict(
+                        index=response.choices[0].index,
+                        message={
+                            "role": response.choices[0].message.role,
+                            "content": combined_content,
+                            "tool_calls": None,
+                        },
+                        finish_reason=response.choices[0].finish_reason
+                        if response.choices[0].finish_reason
+                        else None,
+                    )
+                ],
+                created=response.created,
+                model=response.model,
+                object="chat.completion",
+                usage=response.usage,
+            )
+
+        return response
+
+    def check_model_config(self):
+        r"""Check whether the model configuration contains any
+        unexpected arguments to DeepSeek API.
+
+        Raises:
+            ValueError: If the model configuration dictionary contains any
+                unexpected arguments to DeepSeek API.
+        """
+        for param in self.model_config_dict:
+            if param not in DEEPSEEK_API_PARAMS:
+                raise ValueError(
+                    f"Unexpected argument `{param}` is "
+                    "input into DeepSeek model backend."
+                )
+
+    @property
+    def stream(self) -> bool:
+        r"""Returns whether the model is in stream mode, which sends partial
+        results each time.
+
+        Returns:
+            bool: Whether the model is in stream mode.
+        """
+        return self.model_config_dict.get("stream", False)
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,675 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 19:29:47
+End Time: 2026-11-04 19:32:10
+Total Duration: 143.40 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Find similar / duplicate control pairs with similarity scores and thresholds.
+
+Why the original code failed to produce the expected output:
+1. A RAG chain never computes similarities. `retriever` returns the top-k chunks for ONE
+   query string and the LLM is told to "answer the question" in three sentences, so the
+   model has no way to emit a *list of pairs* with numeric scores.
+2. There is no similarity score anywhere in the pipeline: `as_retriever()` throws the
+   distance away, and no threshold is ever applied.
+3. `CharacterTextSplitter(chunk_size=500, chunk_overlap=50)` splits the CSV rows into
+   arbitrary chunks, so a "control" can be truncated / duplicated and can no longer be
+   paired with its own row.
+4. The prompt asks a summarisation question ("find movies ...") instead of asking for
+   the concrete deliverable (a table/JSON of control pairs, their score and the
+   threshold that was used), and it does not even define what "duplicate" means.
+
+The corrected pipeline therefore:
+* loads each control as ONE document whose embedded text combines Name + Description,
+* keeps a stable id so a control is never paired with itself,
+* uses `similarity_search_with_score` (cosine space -> similarity = 1 - distance),
+* applies an explicit SIMILARITY_THRESHOLD / DUPLICATE_THRESHOLD,
+* de-duplicates (A,B)/(B,A) pairs and returns a sorted list of
+  {control_a, control_b, similarity, duplicate, thresholds...},
+* and finally asks the LLM to explain that *already computed* list (the prompt is
+  rewritten to be explicit about the input, the fields and the output format).
+"""
+
+import csv
+import os
+from typing import Any, Dict, List
+
+from dotenv import load_dotenv
+
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+# `langchain_chroma` is the maintained home of the Chroma wrapper.
+try:
+    from langchain_chroma import Chroma
+except ImportError:  # pragma: no cover - fallback for older installs
+    from langchain_community.vectorstores import Chroma
+
+load_dotenv()
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+CSV_PATH = os.getenv("CONTROL_CSV", "control.csv")
+COLLECTION_NAME = "control_pairs"
+PERSIST_DIRECTORY = os.getenv("CHROMA_DIR", "chroma_control_store")
+
+NAME_CANDIDATES = ("Name", "name", "Control", "control", "Title", "title")
+DESCRIPTION_CANDIDATES = (
+    "Description",
+    "description",
+    "Desc",
+    "desc",
+    "Details",
+    "details",
+)
+
+TOP_K = 10                 # candidates retrieved per control
+SIMILARITY_THRESHOLD = 0.70  # below this the pair is discarded
+DUPLICATE_THRESHOLD = 0.90   # at/above this the pair is a duplicate
+
+
+# --------------------------------------------------------------------------- #
+# Data loading
+# --------------------------------------------------------------------------- #
+def _first_present(row: Dict[str, Any], candidates) -> str:
+    for key in candidates:
+        value = row.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def load_control_documents(csv_path: str = CSV_PATH) -> List[Document]:
+    """One Document per control: Name + Description (the text that is embedded)."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    documents: List[Document] = []
+    with open(csv_path, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"{csv_path} is empty or has no header row")
+
+        for row_index, row in enumerate(reader):
+            name = _first_present(row, NAME_CANDIDATES)
+            description = _first_present(row, DESCRIPTION_CANDIDATES)
+
+            # Fall back to the whole row if the column names are unknown.
+            if not name and not description:
+                name = " | ".join(str(v).strip() for v in row.values() if v)
+
+            if not name and not description:
+                continue
+
+            content = f"Name: {name}\nDescription: {description}".strip()
+            documents.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "id": str(row_index),
+                        "name": name,
+                        "description": description,
+                    },
+                )
+            )
+
+    if not documents:
+        raise ValueError(f"No usable rows found in {csv_path}")
+
+    return documents
+
+
+# --------------------------------------------------------------------------- #
+# Vector store
+# --------------------------------------------------------------------------- #
+def build_vectorstore(documents: List[Document]) -> Chroma:
+    """Cosine space: Chroma then returns `1 - cosine_similarity` as the distance."""
+    return Chroma.from_documents(
+        documents=documents,
+        embedding=OpenAIEmbeddings(),
+        collection_name=COLLECTION_NAME,
+        persist_directory=PERSIST_DIRECTORY,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+
+
+def distance_to_similarity(distance: float) -> float:
+    """Cosine distance (0..2) -> similarity (1..-1), clamped to [0, 1]."""
+    return max(0.0, min(1.0, 1.0 - float(distance)))
+
+
+# --------------------------------------------------------------------------- #
+# Core: deterministic pair extraction (this is what the user actually wanted)
+# --------------------------------------------------------------------------- #
+def find_control_pairs(
+    documents: List[Document],
+    vectorstore: Chroma,
+    top_k: int = TOP_K,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+    duplicate_threshold: float = DUPLICATE_THRESHOLD,
+) -> List[Dict[str, Any]]:
+    """Return every similar/duplicate pair, its score and its classification."""
+    if duplicate_threshold < similarity_threshold:
+        raise ValueError("duplicate_threshold must be >= similarity_threshold")
+
+    k = max(1, min(top_k + 1, len(documents)))
+    collected: Dict[tuple, Dict[str, Any]] = {}
+    names = {doc.metadata["id"]: doc.metadata.get("name", "") for doc in documents}
+
+    for document in documents:
+        doc_id = document.metadata["id"]
+        results = vectorstore.similarity_search_with_score(document.page_content, k=k)
+
+        for other, distance in results:
+            other_id = other.metadata.get("id")
+            if other_id is None or other_id == doc_id:
+                continue  # never pair a control with itself
+
+            similarity = round(distance_to_similarity(distance), 4)
+            if similarity < similarity_threshold:
+                continue
+
+            key = tuple(sorted((doc_id, other_id)))
+            existing = collected.get(key)
+            if existing is not None and existing["similarity"] >= similarity:
+                continue  # symmetric hit with a lower score -> keep the best one
+
+            collected[key] = {
+                "control_a_id": key[0],
+                "control_a": names.get(key[0], ""),
+                "control_b_id": key[1],
+                "control_b": names.get(key[1], ""),
+                "similarity": similarity,
+                "duplicate": similarity >= duplicate_threshold,
+                "similarity_threshold": similarity_threshold,
+                "duplicate_threshold": duplicate_threshold,
+            }
+
+    return sorted(collected.values(), key=lambda pair: pair["similarity"], reverse=True)
+
+
+# --------------------------------------------------------------------------- #
+# Fixed prompt: explicit about the data, the fields and the requested output
+# --------------------------------------------------------------------------- #
+PROMPT_TEMPLATE = """You are an audit assistant that reports on control comparisons.
+
+You are given a PRE-COMPUTED list of control pairs. Do NOT invent pairs and do NOT
+recompute anything: use only the pairs, similarity values and thresholds below.
+
+Definitions:
+- similar  : similarity >= {similarity_threshold} (all pairs below already satisfy this)
+- duplicate: similarity >= {duplicate_threshold}
+
+Rules:
+- List EVERY pair that is supplied, ordered by similarity (highest first).
+- For each pair output exactly: "A" <-> "B" | similarity=<score> | duplicate=yes/no
+- After the list, state both thresholds and how many pairs are duplicates.
+- Do not answer with prose about the task, and do not add pairs that are not supplied.
+- If the list is empty, reply exactly: "No pairs met the similarity threshold of
+  {similarity_threshold}."
+
+Task/question: {question}
+
+Pre-computed pairs ({pair_count} total):
+{context}
+
+Answer:"""
+
+
+def build_llm_chain():
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+    return prompt | llm | StrOutputParser()
+
+
+def format_pairs_for_prompt(pairs: List[Dict[str, Any]]) -> str:
+    if not pairs:
+        return "(empty)"
+    return "\n".join(
+        (
+            f'- "{pair["control_a"]}" <-> "{pair["control_b"]}" | '
+            f'similarity={pair["similarity"]:.4f} | '
+            f'duplicate={"yes" if pair["duplicate"] else "no"}'
+        )
+        for pair in pairs
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def run_agent(
+    query: str,
+    csv_path: str = CSV_PATH,
+    top_k: int = TOP_K,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+    duplicate_threshold: float = DUPLICATE_THRESHOLD,
+    with_llm_summary: bool = True,
+) -> Dict[str, Any]:
+    documents = load_control_documents(csv_path)
+    vectorstore = build_vectorstore(documents)
+
+    pairs = find_control_pairs(
+        documents=documents,
+        vectorstore=vectorstore,
+        top_k=top_k,
+        similarity_threshold=similarity_threshold,
+        duplicate_threshold=duplicate_threshold,
+    )
+
+    result: Dict[str, Any] = {
+        "pairs": pairs,
+        "similar_pairs": [p for p in pairs if not p["duplicate"]],
+        "duplicate_pairs": [p for p in pairs if p["duplicate"]],
+        "similarity_threshold": similarity_threshold,
+        "duplicate_threshold": duplicate_threshold,
+        "controls_compared": len(documents),
+        "answer": None,
+    }
+
+    if with_llm_summary:
+        chain = build_llm_chain()
+        result["answer"] = chain.invoke(
+            {
+                "question": query,
+                "context": format_pairs_for_prompt(pairs),
+                "pair_count": len(pairs),
+                "similarity_threshold": similarity_threshold,
+                "duplicate_threshold": duplicate_threshold,
+            }
+        )
+
+    return result
+
+
+if __name__ == "__main__":
+    query = (
+        "List every pair of controls that are similar or duplicates, "
+        "with their similarity score and the thresholds used."
+    )
+
+    result = run_agent(query)
+
+    print(f"Compared {result['controls_compared']} controls "
+          f"(similar >= {result['similarity_threshold']}, "
+          f"duplicate >= {result['duplicate_threshold']})")
+    print(f"Found {len(result['similar_pairs'])} similar pair(s) "
+          f"and {len(result['duplicate_pairs'])} duplicate pair(s).\n")
+
+    for pair in result["pairs"]:
+        print(
+            f'- "{pair["control_a"]}" <-> "{pair["control_b"]}" | '
+            f'similarity={pair["similarity"]:.4f} | '
+            f'duplicate={"yes" if pair["duplicate"] else "no"}'
+        )
+
+    if result["answer"]:
+        print("\nSummary:\n" + result["answer"])
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 19:32:10
+Duration: 143.39 seconds
+Verdict: ## REJECT
+
+### 1. Hard failure against the test contract
+
+The test's first structural assertion is:
+
+```python
+self.assertIn("results", result)
+```
+
+The fixed `run_agent` returns:
+
+```python
+result: Dict[str, Any] = {
+    "pairs": pairs,
+    "similar_pairs": [...],
+    "duplicate_pairs": [...],
+    "similarity_threshold": ...,
+    "duplicate_threshold": ...,
+    "controls_compared": len(documents),
+    "answer": None,
+}
+```
+
+There is **no `"results"` key**. `assertIn("results", result)` fails on the very first assertion, so every subsequent check (`result["results"]` is a list, each item is a dict) is never reached. The test cannot pass even if `pairs` were a perfectly valid `List[Dict[str, Any]]` — the key name is simply wrong.
+
+Notably, `validate_fixed_code` returned ACCEPT, but that verdict is contradicted by the actual test source: the return contract in the code and the key asserted by the test are different. The validation result should not be trusted over the explicit test expectations here.
+
+### 2. The "structured output" requirement was never implemented
+
+The test class is `TestRunAgentStructuredOutput` — the intent is that the agent returns a *structured* dict payload. The fix instead returns a hand-assembled Python dict of internally computed pairs and keeps the LLM output as an unstructured prose string under `"answer"` (`prompt | llm | StrOutputParser()`).
+
+No structured-output mechanism is used anywhere. I verified `ChatOpenAI.with_structured_output` exists and is the appropriate API (it accepts a Pydantic model / TypedDict / JSON schema and returns a parsed object), and it is exactly what this case needs — it was neither used nor replaced with an equivalent (e.g. `JsonOutputParser` + `PydanticOutputParser` with `with_fallbacks`). The result is that the required top-level shape (`{"results": [ {...}, ... ]}`) was invented by hand and, as shown above, named incorrectly.
+
+### 3. Secondary correctness concerns (worth noting, not the blocking reason)
+
+- **Stateful vector store breaks repeatability.** `build_vectorstore` hardcodes `collection_name="control_pairs"` with `persist_directory="chroma_control_store"`. `from_documents` with an existing collection appends documents rather than replacing them, and a persisted collection will raise or silently accumulate duplicates on a second run — making results non-deterministic across invocations/test re-runs. An ephemeral store (no `persist_directory`) or an explicit reset was needed.
+- **Inexact score semantics.** `similarity_search_with_score` returns the raw *distance* (lower = more similar). The manual `1.0 - distance` conversion with `max(0.0, min(1.0, ...))` clamping is only valid under the `{"hnsw:space": "cosine"}` metadata that was set, and the clamping silently destroys information for distances > 1 (which cosine distance allows, up to 2). A cosine similarity of 0 would be reported as 0, and a genuinely dissimilar pair (distance 1.5) is also reported as 0 — indistinguishable. `similarity_search_with_relevance_scores` or a non-clamping transform would be safer.
+- **Behavioral scope creep.** The rewrite discards the original RAG-over-`control.csv` design entirely (removing `CSVLoader`/`CharacterTextSplitter` and the retriever chain), introduces thresholds (`0.70`/`0.90`), env-var-configurable paths, and O(n·k) pairwise scanning. None of that is required by the test, and it makes `run_agent` depend on a CSV schema that may not match the fixture (`NAME_CANDIDATES`/`DESCRIPTION_CANDIDATES` guesswork, `FileNotFoundError` on a missing `control.csv`).
+
+### Summary
+
+The fix is a substantial, reasonably well-documented rewrite that may improve the *semantics* of the underlying task, but it does not satisfy the specified interface: the mandated `"results"` key is absent, and no structured-output path (via `ChatOpenAI.with_structured_output` or an equivalent parser chain) was implemented despite the test explicitly targeting structured output. The test will fail at `assertIn("results", result)`. **REJECT.**
+--------------------------------------------------------------------------------
+"""
+Find similar / duplicate control pairs with similarity scores and thresholds.
+
+Why the original code failed to produce the expected output:
+1. A RAG chain never computes similarities. `retriever` returns the top-k chunks for ONE
+   query string and the LLM is told to "answer the question" in three sentences, so the
+   model has no way to emit a *list of pairs* with numeric scores.
+2. There is no similarity score anywhere in the pipeline: `as_retriever()` throws the
+   distance away, and no threshold is ever applied.
+3. `CharacterTextSplitter(chunk_size=500, chunk_overlap=50)` splits the CSV rows into
+   arbitrary chunks, so a "control" can be truncated / duplicated and can no longer be
+   paired with its own row.
+4. The prompt asks a summarisation question ("find movies ...") instead of asking for
+   the concrete deliverable (a table/JSON of control pairs, their score and the
+   threshold that was used), and it does not even define what "duplicate" means.
+
+The corrected pipeline therefore:
+* loads each control as ONE document whose embedded text combines Name + Description,
+* keeps a stable id so a control is never paired with itself,
+* uses `similarity_search_with_score` (cosine space -> similarity = 1 - distance),
+* applies an explicit SIMILARITY_THRESHOLD / DUPLICATE_THRESHOLD,
+* de-duplicates (A,B)/(B,A) pairs and returns a sorted list of
+  {control_a, control_b, similarity, duplicate, thresholds...},
+* and finally asks the LLM to explain that *already computed* list (the prompt is
+  rewritten to be explicit about the input, the fields and the output format).
+"""
+
+import csv
+import os
+from typing import Any, Dict, List
+
+from dotenv import load_dotenv
+
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+# `langchain_chroma` is the maintained home of the Chroma wrapper.
+try:
+    from langchain_chroma import Chroma
+except ImportError:  # pragma: no cover - fallback for older installs
+    from langchain_community.vectorstores import Chroma
+
+load_dotenv()
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+CSV_PATH = os.getenv("CONTROL_CSV", "control.csv")
+COLLECTION_NAME = "control_pairs"
+PERSIST_DIRECTORY = os.getenv("CHROMA_DIR", "chroma_control_store")
+
+NAME_CANDIDATES = ("Name", "name", "Control", "control", "Title", "title")
+DESCRIPTION_CANDIDATES = (
+    "Description",
+    "description",
+    "Desc",
+    "desc",
+    "Details",
+    "details",
+)
+
+TOP_K = 10                 # candidates retrieved per control
+SIMILARITY_THRESHOLD = 0.70  # below this the pair is discarded
+DUPLICATE_THRESHOLD = 0.90   # at/above this the pair is a duplicate
+
+
+# --------------------------------------------------------------------------- #
+# Data loading
+# --------------------------------------------------------------------------- #
+def _first_present(row: Dict[str, Any], candidates) -> str:
+    for key in candidates:
+        value = row.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def load_control_documents(csv_path: str = CSV_PATH) -> List[Document]:
+    """One Document per control: Name + Description (the text that is embedded)."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    documents: List[Document] = []
+    with open(csv_path, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"{csv_path} is empty or has no header row")
+
+        for row_index, row in enumerate(reader):
+            name = _first_present(row, NAME_CANDIDATES)
+            description = _first_present(row, DESCRIPTION_CANDIDATES)
+
+            # Fall back to the whole row if the column names are unknown.
+            if not name and not description:
+                name = " | ".join(str(v).strip() for v in row.values() if v)
+
+            if not name and not description:
+                continue
+
+            content = f"Name: {name}\nDescription: {description}".strip()
+            documents.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "id": str(row_index),
+                        "name": name,
+                        "description": description,
+                    },
+                )
+            )
+
+    if not documents:
+        raise ValueError(f"No usable rows found in {csv_path}")
+
+    return documents
+
+
+# --------------------------------------------------------------------------- #
+# Vector store
+# --------------------------------------------------------------------------- #
+def build_vectorstore(documents: List[Document]) -> Chroma:
+    """Cosine space: Chroma then returns `1 - cosine_similarity` as the distance."""
+    return Chroma.from_documents(
+        documents=documents,
+        embedding=OpenAIEmbeddings(),
+        collection_name=COLLECTION_NAME,
+        persist_directory=PERSIST_DIRECTORY,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+
+
+def distance_to_similarity(distance: float) -> float:
+    """Cosine distance (0..2) -> similarity (1..-1), clamped to [0, 1]."""
+    return max(0.0, min(1.0, 1.0 - float(distance)))
+
+
+# --------------------------------------------------------------------------- #
+# Core: deterministic pair extraction (this is what the user actually wanted)
+# --------------------------------------------------------------------------- #
+def find_control_pairs(
+    documents: List[Document],
+    vectorstore: Chroma,
+    top_k: int = TOP_K,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+    duplicate_threshold: float = DUPLICATE_THRESHOLD,
+) -> List[Dict[str, Any]]:
+    """Return every similar/duplicate pair, its score and its classification."""
+    if duplicate_threshold < similarity_threshold:
+        raise ValueError("duplicate_threshold must be >= similarity_threshold")
+
+    k = max(1, min(top_k + 1, len(documents)))
+    collected: Dict[tuple, Dict[str, Any]] = {}
+    names = {doc.metadata["id"]: doc.metadata.get("name", "") for doc in documents}
+
+    for document in documents:
+        doc_id = document.metadata["id"]
+        results = vectorstore.similarity_search_with_score(document.page_content, k=k)
+
+        for other, distance in results:
+            other_id = other.metadata.get("id")
+            if other_id is None or other_id == doc_id:
+                continue  # never pair a control with itself
+
+            similarity = round(distance_to_similarity(distance), 4)
+            if similarity < similarity_threshold:
+                continue
+
+            key = tuple(sorted((doc_id, other_id)))
+            existing = collected.get(key)
+            if existing is not None and existing["similarity"] >= similarity:
+                continue  # symmetric hit with a lower score -> keep the best one
+
+            collected[key] = {
+                "control_a_id": key[0],
+                "control_a": names.get(key[0], ""),
+                "control_b_id": key[1],
+                "control_b": names.get(key[1], ""),
+                "similarity": similarity,
+                "duplicate": similarity >= duplicate_threshold,
+                "similarity_threshold": similarity_threshold,
+                "duplicate_threshold": duplicate_threshold,
+            }
+
+    return sorted(collected.values(), key=lambda pair: pair["similarity"], reverse=True)
+
+
+# --------------------------------------------------------------------------- #
+# Fixed prompt: explicit about the data, the fields and the requested output
+# --------------------------------------------------------------------------- #
+PROMPT_TEMPLATE = """You are an audit assistant that reports on control comparisons.
+
+You are given a PRE-COMPUTED list of control pairs. Do NOT invent pairs and do NOT
+recompute anything: use only the pairs, similarity values and thresholds below.
+
+Definitions:
+- similar  : similarity >= {similarity_threshold} (all pairs below already satisfy this)
+- duplicate: similarity >= {duplicate_threshold}
+
+Rules:
+- List EVERY pair that is supplied, ordered by similarity (highest first).
+- For each pair output exactly: "A" <-> "B" | similarity=<score> | duplicate=yes/no
+- After the list, state both thresholds and how many pairs are duplicates.
+- Do not answer with prose about the task, and do not add pairs that are not supplied.
+- If the list is empty, reply exactly: "No pairs met the similarity threshold of
+  {similarity_threshold}."
+
+Task/question: {question}
+
+Pre-computed pairs ({pair_count} total):
+{context}
+
+Answer:"""
+
+
+def build_llm_chain():
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+    return prompt | llm | StrOutputParser()
+
+
+def format_pairs_for_prompt(pairs: List[Dict[str, Any]]) -> str:
+    if not pairs:
+        return "(empty)"
+    return "\n".join(
+        (
+            f'- "{pair["control_a"]}" <-> "{pair["control_b"]}" | '
+            f'similarity={pair["similarity"]:.4f} | '
+            f'duplicate={"yes" if pair["duplicate"] else "no"}'
+        )
+        for pair in pairs
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def run_agent(
+    query: str,
+    csv_path: str = CSV_PATH,
+    top_k: int = TOP_K,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+    duplicate_threshold: float = DUPLICATE_THRESHOLD,
+    with_llm_summary: bool = True,
+) -> Dict[str, Any]:
+    documents = load_control_documents(csv_path)
+    vectorstore = build_vectorstore(documents)
+
+    pairs = find_control_pairs(
+        documents=documents,
+        vectorstore=vectorstore,
+        top_k=top_k,
+        similarity_threshold=similarity_threshold,
+        duplicate_threshold=duplicate_threshold,
+    )
+
+    result: Dict[str, Any] = {
+        "pairs": pairs,
+        "similar_pairs": [p for p in pairs if not p["duplicate"]],
+        "duplicate_pairs": [p for p in pairs if p["duplicate"]],
+        "similarity_threshold": similarity_threshold,
+        "duplicate_threshold": duplicate_threshold,
+        "controls_compared": len(documents),
+        "answer": None,
+    }
+
+    if with_llm_summary:
+        chain = build_llm_chain()
+        result["answer"] = chain.invoke(
+            {
+                "question": query,
+                "context": format_pairs_for_prompt(pairs),
+                "pair_count": len(pairs),
+                "similarity_threshold": similarity_threshold,
+                "duplicate_threshold": duplicate_threshold,
+            }
+        )
+
+    return result
+
+
+if __name__ == "__main__":
+    query = (
+        "List every pair of controls that are similar or duplicates, "
+        "with their similarity score and the thresholds used."
+    )
+
+    result = run_agent(query)
+
+    print(f"Compared {result['controls_compared']} controls "
+          f"(similar >= {result['similarity_threshold']}, "
+          f"duplicate >= {result['duplicate_threshold']})")
+    print(f"Found {len(result['similar_pairs'])} similar pair(s) "
+          f"and {len(result['duplicate_pairs'])} duplicate pair(s).\n")
+
+    for pair in result["pairs"]:
+        print(
+            f'- "{pair["control_a"]}" <-> "{pair["control_b"]}" | '
+            f'similarity={pair["similarity"]:.4f} | '
+            f'duplicate={"yes" if pair["duplicate"] else "no"}'
+        )
+
+    if result["answer"]:
+        print("\nSummary:\n" + result["answer"])
+
+--------------------------------------------------------------------------------

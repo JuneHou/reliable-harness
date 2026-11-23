@@ -1,0 +1,568 @@
+Case ID: 76456041
+Status: ACCEPTED
+Final Attempt: 2
+Start Time: 2026-11-04 20:11:48
+End Time: 2026-11-04 20:52:29
+Total Duration: 2441.20 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Fixed version of the CSV question/answering script.
+
+Why the original version returned the wrong output and was so expensive
+----------------------------------------------------------------------
+* ``chain_type="map_reduce"`` does not reuse the ``stuff`` prompt. Out of the
+  box it uses the generic QA map-reduce prompts (``QUESTION_PROMPT`` /
+  ``COMBINE_PROMPT``):
+      map   : "Use the following portion ... Return any relevant text verbatim."
+      reduce: "... create a final answer with references (SOURCES). If you
+               don't know the answer, just say that you don't know."
+  For an exhaustive question such as "tell me the name of every driver who is
+  German" the per-document answers are lossy and the final reduce/collapse step
+  drops names (or answers "I don't know"), which is exactly why the answer
+  differs from the one produced by ``stuff``.
+* ``search_kwargs={"k": 1000}`` retrieves *every* row of the CSV, and
+  ``map_reduce`` calls the LLM once per retrieved document -> one map call per
+  CSV row (thousands of OpenAI calls per query, per file). That is where the
+  unexpectedly high API cost comes from, and it is also what makes the
+  collapse step lose information.
+
+What this version changes
+-------------------------
+1. CSV rows are grouped into a handful of larger documents, so the map/reduce
+   chain makes tens of LLM calls instead of thousands (much cheaper) while
+   still seeing every row (so "every ..." questions stay exhaustive).
+2. Explicit, purpose-built map/reduce prompts are passed through
+   ``chain_type_kwargs`` using the correct keys for the map_reduce chain
+   (``question_prompt`` and ``combine_prompt`` with the input variables
+   ``context``/``question`` and ``summaries``/``question``). They force the
+   model to quote every relevant record verbatim and to merge all partial
+   answers without dropping or summarising items away.
+3. The vectorstore/retriever is built once per file and ``k`` is the number of
+   documents that actually exist, instead of the meaningless ``k=1000``.
+"""
+
+import os
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.document_loaders import CSVLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+
+try:  # older langchain
+    from langchain.docstore.document import Document
+except ImportError:  # newer langchain
+    from langchain_core.documents import Document
+
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY") or ""
+
+# Number of CSV rows packed into a single document. Keeping this reasonably
+# large is what keeps the number of (paid) map calls low.
+ROWS_PER_CHUNK = 40
+
+# Map step prompt: extract every relevant record verbatim from one chunk.
+MAP_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are given a part of a CSV file. Each line of the text below is one "
+        "record of that file.\n\n"
+        "Read the text and extract EVERY fact from it that is relevant to answering "
+        "the question. Quote the relevant records verbatim, one record per line. "
+        "Do not summarise, do not paraphrase, do not interpret and do not drop any "
+        "matching record.\n"
+        "If nothing in this part of the file is relevant, answer exactly: NONE\n\n"
+        "Text:\n{context}\n\n"
+        "Question: {question}\n"
+        "Relevant records (verbatim, one per line, or NONE):"
+    ),
+)
+
+# Reduce/collapse step prompt: merge all partial answers without losing items.
+COMBINE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "You are given several extracts taken from the same CSV file. Each extract "
+        "contains only records that are relevant to the question.\n\n"
+        "Combine all of them into one complete answer to the question.\n"
+        "Rules:\n"
+        "- keep every item that appears in ANY of the extracts,\n"
+        "- remove exact duplicates only,\n"
+        "- never summarise away, shorten or omit an item,\n"
+        "- never add information that is not present in the extracts.\n"
+        "If the extracts contain no relevant information at all, answer exactly: NONE\n\n"
+        "Extracts:\n{summaries}\n\n"
+        "Question: {question}\n"
+        "Complete answer:"
+    ),
+)
+
+
+def load_chunked_documents(path, rows_per_chunk=ROWS_PER_CHUNK):
+    """Load a CSV file and pack its rows into a few larger documents."""
+    loader = CSVLoader(file_path=path, encoding="utf-8")
+    rows = loader.load()
+
+    if not rows:
+        return []
+
+    documents = []
+    for start in range(0, len(rows), rows_per_chunk):
+        group = rows[start:start + rows_per_chunk]
+        content = "\n".join(row.page_content.replace("\n", "; ") for row in group)
+        documents.append(
+            Document(
+                page_content=content,
+                metadata={
+                    "source": path,
+                    "rows": f"{start}-{start + len(group) - 1}",
+                },
+            )
+        )
+    return documents
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    for file in files:
+        if not os.path.exists(file):
+            print(f"Skipping missing file: {file}")
+            continue
+
+        print("=====================================")
+        print(file)
+        print("=====================================")
+
+        with get_openai_callback() as cb:
+            llm = OpenAI(temperature=0, batch_size=20)
+
+            # Group rows so that map_reduce performs a few calls, not one per row.
+            docs = load_chunked_documents(file)
+            if not docs:
+                print(f"No rows found in {file}")
+                continue
+
+            embeddings = OpenAIEmbeddings()
+
+            # Build the vectorstore (index) once per file.
+            db = Chroma.from_documents(docs, embeddings)
+
+            # k must be a sensible number of documents: retrieving every row
+            # (k=1000) is what made map_reduce both slow/expensive and lossy.
+            retriever = db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": len(docs)},
+            )
+
+            for query in queries:
+                # Custom map/reduce prompts: this is the actual fix for the
+                # wrong output, chain_type_kwargs expects `question_prompt`
+                # and `combine_prompt` for the map_reduce chain type.
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=llm,
+                    chain_type="map_reduce",
+                    retriever=retriever,
+                    chain_type_kwargs={
+                        "question_prompt": MAP_PROMPT,
+                        "combine_prompt": COMBINE_PROMPT,
+                    },
+                    verbose=True,
+                )
+
+                print(query)
+                result = qa_chain.run(query)
+                results.append(result)
+
+                print(result)
+
+            # Cost report for the whole file (index + all queries).
+            print(cb)
+
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+    print(res)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 20:21:07
+Duration: 559.13 seconds
+Verdict: ## Evaluation Summary
+
+**Diff review**
+The change is essentially three things:
+1. Cosmetic cleanups (whitespace, hoisting `OpenAIEmbeddings()` out of the loop, removing the redundant inner import).
+2. A new `QA_PROMPT` (`PromptTemplate` with `context`/`question`) wired in via `chain_type_kwargs`.
+3. A **behavioral change**: `chain_type="map_reduce"` → `"stuff"`, and `search_kwargs={"k": 1000}` → `k = min(len(docs), 5)`.
+
+**Tool results**
+- `validate_fixed_code` → *REJECT: test code unavailable* (no test signal either way; inconclusive).
+- API verification: `RetrievalQA.from_chain_type(..., chain_type="stuff", chain_type_kwargs={"prompt": ...})` is the documented way to pass a custom `StuffDocumentsChain` prompt, and `PromptTemplate` with `input_variables=["context", "question"]` matches what the stuff chain feeds in — so the *mechanical* usage of the new APIs is correct. `db.as_retriever(search_type="similarity", search_kwargs={"k": ...})` is also valid.
+
+**Why the fix is not reasonable**
+The program's only query is an *aggregation/full-scan* question: `"Tell me the name of every driver who is German"`. The fix caps retrieval at 5 documents (`k = min(len(docs), 5)`). Retrieval QA with `k=5` over a per-row CSV index can only ever see 5 rows, so it physically cannot return "every" German driver — the answer will be truncated or, per the new prompt, literally `"I don't know"`. That is a functional regression traded for a cost win, not a fix of the underlying defect.
+
+The real defect (huge API bill on `map_reduce` over ~1000 row-documents) would be addressed by keeping a document-level aggregation strategy — e.g. `map_reduce` with a corrected map prompt (`context` + `question`, instructing "list names found in this row; say NONE if none") and a reduce prompt that unions the results, plus batching/`k` chosen to fit the budget/context window. The fix instead silently deletes the information the aggregation needs.
+
+Additional concerns:
+- Hard-coded magic `5` with no relation to the data size or the model's context window; if the CSVs are small, `len(docs)` alone would have been correct, and if they are large, a full `stuff` prompt would blow the context — neither case is handled thoughtfully.
+- Still constructs the LLM/QA chain per query and leaves the deprecated `langchain.llms.OpenAI` default model (`text-davinci-003`), i.e. the run-time failure/cost surface is not really cleaned up.
+- `print(cb)` remains outside the query loop, so per-query cost accounting (part of the reported problem) is still not observable.
+- `k = ... if docs else 1` will still fail on an empty index, since `Chroma.from_documents([])` raises earlier — the guard is dead code.
+
+## Verdict
+
+**REJECT** — the API usage is syntactically correct, but the substantive change (bounding retrieval to 5 rows and switching to `stuff`) makes the very question the program is asked unanswerable, so the bug is masked rather than fixed.
+--------------------------------------------------------------------------------
+import os
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.document_loaders import CSVLoader
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+from langchain.embeddings.openai import OpenAIEmbeddings
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+
+# Prompt used by the (single) QA call. It is explicit about the expected
+# output format so the answer is a list of matching records instead of a
+# vague "summary" of the retrieved chunks.
+QA_PROMPT = PromptTemplate(
+    template="""You are given rows retrieved from a CSV file of driver records.
+Answer the question using ONLY the information contained in those rows.
+If the answer cannot be found in the rows, reply exactly: I don't know.
+
+{context}
+
+Question: {question}
+Answer (when the question asks for a list, list EVERY matching entry found in the rows):""",
+    input_variables=["context", "question"],
+)
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    # Embeddings only need to be instantiated once and reused.
+    embeddings = OpenAIEmbeddings()
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as cb:
+
+            loader = CSVLoader(file_path=file, encoding='utf-8')
+            docs = loader.load()
+
+            # create the vectorestore to use as the index
+            db = Chroma.from_documents(docs, embeddings)
+
+            # CSVLoader creates ONE Document per CSV row. Because of that:
+            #  * search_kwargs={"k": 1000} fed (up to) a thousand rows to the
+            #    chain, and a map_reduce chain issues one LLM call per document
+            #    (N map calls + combine calls) -> the huge API bill.
+            #  * every map call only saw a single row, so questions that need
+            #    all rows at once ("every driver who is German", "how many ...")
+            #    were answered with "None"/"not relevant" per row and the
+            #    reduce step then produced no answer at all.
+            # Retrieve a small, bounded number of the most relevant rows and
+            # answer them in a single ("stuff") prompt instead.
+            k = min(len(docs), 5) if docs else 1
+            retriever = db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": k},
+            )
+
+            for query in queries:
+                # "stuff" puts all retrieved rows in a single prompt, so the
+                # model can aggregate over them (map_reduce processed each row
+                # in isolation and lost the information needed to answer).
+                qa_stuff = RetrievalQA.from_chain_type(
+                    llm=OpenAI(temperature=0, batch_size=20),
+                    chain_type="stuff",
+                    retriever=retriever,
+                    chain_type_kwargs={"prompt": QA_PROMPT},
+                    verbose=True,
+                )
+
+                print(query)
+                result = qa_stuff.run(query)
+                results.append(result)
+
+                print(result)
+
+            print(cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-04 20:52:29
+Duration: 1882.07 seconds
+Verdict: ## Evaluation of case 76456041
+
+### 1. Diff analysis
+The fix rewrites the script but keeps the same overall contract (`run_agent(queries) -> list[str]`, same imports, same two CSVs, same OpenAI/Chroma plumbing). Substantive changes:
+
+| Original | Fixed |
+|---|---|
+| `chain_type="map_reduce"` relying on LangChain's default *generic* map/reduce prompts | Same chain type, but with purpose-built `question_prompt`/`combine_prompt` that demand verbatim extraction and loss-less merging |
+| `k=1000` (retrieves every row; one LLM map call **per CSV row**) | Rows packed into chunks of 40, `k=len(docs)` → tens of calls, every row still seen |
+| Vectorstore/retriever inside the MVP loop, `OpenAIEmbeddings` re-imported in-loop | Store built once per file, import hoisted |
+| `os.environ[...] = os.getenv(...)` (assigning `None` raises `TypeError`) | `... or ""` guard, missing files skipped |
+
+The rationale in the docstring matches the bug context (wrong/incomplete answer for "every driver who is German" + unexpectedly high API spend): `map_reduce` maps over *each* document, and with `k=1000` that is one call per row, and the default combine prompt ("say you don't know", "with references") drops items during collapse.
+
+### 2. Validation
+`validate_fixed_code` returned `REJECT test code unavailable` — no tests exist for this case, so the failure is a *tooling limitation*, not evidence of a defect. Structure was therefore checked by inspection: helper `load_chunked_documents` returns `Document` objects with `page_content` + `metadata`, handles empty CSVs, and `run_agent` still returns a flat list of answers.
+
+### 3. API verification
+- `RetrievalQA.from_chain_type` accepts `chain_type_kwargs` forwarded to `load_qa_chain`; for `map_reduce` the valid keys are exactly `question_prompt` (inputs `context`/`question`) and `combine_prompt` (inputs `summaries`/`question`) — the fix's two `PromptTemplate`s declare precisely those `input_variables`, and the default document variable names (`context`, `summaries`) are used, so the prompts will bind correctly.
+- `langchain.chains.mapreduce.MapReduceDocumentsChain` confirms map-over-documents → reduce semantics, matching the fix's chunking strategy.
+- `PromptTemplate` / `Document`: standard, and the `langchain.docstore.document` → `langchain_core.documents` fallback is correct across langchain versions.
+- `db.as_retriever(search_type="similarity", search_kwargs={"k": len(docs)})` — `k` valid and now semantically meaningful.
+- `OpenAI(temperature=0, batch_size=20)` unchanged and still valid; `get_openai_callback` still wraps index + queries so the cost report remains accurate.
+
+### 4. Minor caveats (not blocking)
+- The fix still relies on an LLM actually obeying the "verbatim, don't drop items" instruction, so exhaustiveness is prompt-level rather than guaranteed.
+- `print(res)` at the end adds output not present originally (no tests to conflict with).
+- The `.env`/empty-key guard prevents a crash but doesn't guarantee a valid key.
+- Files are re-indexed per run and into the default Chroma collection (pre-existing behaviour, unchanged).
+
+**Verdict: ACCEPT** — The change targets the actual root cause of the reported symptom (lossy default `map_reduce` prompts + `k=1000` causing one paid call per CSV row), uses the correct `chain_type_kwargs` keys and prompt input variables for the `map_reduce` chain type, preserves the public function signature/return type, and adds sensible robustness. The `REJECT` from `validate_fixed_code` stems solely from the absence of test code, not from a structural or API error.
+--------------------------------------------------------------------------------
+"""Fixed version of the CSV question/answering script.
+
+Why the original version returned the wrong output and was so expensive
+----------------------------------------------------------------------
+* ``chain_type="map_reduce"`` does not reuse the ``stuff`` prompt. Out of the
+  box it uses the generic QA map-reduce prompts (``QUESTION_PROMPT`` /
+  ``COMBINE_PROMPT``):
+      map   : "Use the following portion ... Return any relevant text verbatim."
+      reduce: "... create a final answer with references (SOURCES). If you
+               don't know the answer, just say that you don't know."
+  For an exhaustive question such as "tell me the name of every driver who is
+  German" the per-document answers are lossy and the final reduce/collapse step
+  drops names (or answers "I don't know"), which is exactly why the answer
+  differs from the one produced by ``stuff``.
+* ``search_kwargs={"k": 1000}`` retrieves *every* row of the CSV, and
+  ``map_reduce`` calls the LLM once per retrieved document -> one map call per
+  CSV row (thousands of OpenAI calls per query, per file). That is where the
+  unexpectedly high API cost comes from, and it is also what makes the
+  collapse step lose information.
+
+What this version changes
+-------------------------
+1. CSV rows are grouped into a handful of larger documents, so the map/reduce
+   chain makes tens of LLM calls instead of thousands (much cheaper) while
+   still seeing every row (so "every ..." questions stay exhaustive).
+2. Explicit, purpose-built map/reduce prompts are passed through
+   ``chain_type_kwargs`` using the correct keys for the map_reduce chain
+   (``question_prompt`` and ``combine_prompt`` with the input variables
+   ``context``/``question`` and ``summaries``/``question``). They force the
+   model to quote every relevant record verbatim and to merge all partial
+   answers without dropping or summarising items away.
+3. The vectorstore/retriever is built once per file and ``k`` is the number of
+   documents that actually exist, instead of the meaningless ``k=1000``.
+"""
+
+import os
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.document_loaders import CSVLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+
+try:  # older langchain
+    from langchain.docstore.document import Document
+except ImportError:  # newer langchain
+    from langchain_core.documents import Document
+
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY") or ""
+
+# Number of CSV rows packed into a single document. Keeping this reasonably
+# large is what keeps the number of (paid) map calls low.
+ROWS_PER_CHUNK = 40
+
+# Map step prompt: extract every relevant record verbatim from one chunk.
+MAP_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are given a part of a CSV file. Each line of the text below is one "
+        "record of that file.\n\n"
+        "Read the text and extract EVERY fact from it that is relevant to answering "
+        "the question. Quote the relevant records verbatim, one record per line. "
+        "Do not summarise, do not paraphrase, do not interpret and do not drop any "
+        "matching record.\n"
+        "If nothing in this part of the file is relevant, answer exactly: NONE\n\n"
+        "Text:\n{context}\n\n"
+        "Question: {question}\n"
+        "Relevant records (verbatim, one per line, or NONE):"
+    ),
+)
+
+# Reduce/collapse step prompt: merge all partial answers without losing items.
+COMBINE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "You are given several extracts taken from the same CSV file. Each extract "
+        "contains only records that are relevant to the question.\n\n"
+        "Combine all of them into one complete answer to the question.\n"
+        "Rules:\n"
+        "- keep every item that appears in ANY of the extracts,\n"
+        "- remove exact duplicates only,\n"
+        "- never summarise away, shorten or omit an item,\n"
+        "- never add information that is not present in the extracts.\n"
+        "If the extracts contain no relevant information at all, answer exactly: NONE\n\n"
+        "Extracts:\n{summaries}\n\n"
+        "Question: {question}\n"
+        "Complete answer:"
+    ),
+)
+
+
+def load_chunked_documents(path, rows_per_chunk=ROWS_PER_CHUNK):
+    """Load a CSV file and pack its rows into a few larger documents."""
+    loader = CSVLoader(file_path=path, encoding="utf-8")
+    rows = loader.load()
+
+    if not rows:
+        return []
+
+    documents = []
+    for start in range(0, len(rows), rows_per_chunk):
+        group = rows[start:start + rows_per_chunk]
+        content = "\n".join(row.page_content.replace("\n", "; ") for row in group)
+        documents.append(
+            Document(
+                page_content=content,
+                metadata={
+                    "source": path,
+                    "rows": f"{start}-{start + len(group) - 1}",
+                },
+            )
+        )
+    return documents
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    for file in files:
+        if not os.path.exists(file):
+            print(f"Skipping missing file: {file}")
+            continue
+
+        print("=====================================")
+        print(file)
+        print("=====================================")
+
+        with get_openai_callback() as cb:
+            llm = OpenAI(temperature=0, batch_size=20)
+
+            # Group rows so that map_reduce performs a few calls, not one per row.
+            docs = load_chunked_documents(file)
+            if not docs:
+                print(f"No rows found in {file}")
+                continue
+
+            embeddings = OpenAIEmbeddings()
+
+            # Build the vectorstore (index) once per file.
+            db = Chroma.from_documents(docs, embeddings)
+
+            # k must be a sensible number of documents: retrieving every row
+            # (k=1000) is what made map_reduce both slow/expensive and lossy.
+            retriever = db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": len(docs)},
+            )
+
+            for query in queries:
+                # Custom map/reduce prompts: this is the actual fix for the
+                # wrong output, chain_type_kwargs expects `question_prompt`
+                # and `combine_prompt` for the map_reduce chain type.
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=llm,
+                    chain_type="map_reduce",
+                    retriever=retriever,
+                    chain_type_kwargs={
+                        "question_prompt": MAP_PROMPT,
+                        "combine_prompt": COMBINE_PROMPT,
+                    },
+                    verbose=True,
+                )
+
+                print(query)
+                result = qa_chain.run(query)
+                results.append(result)
+
+                print(result)
+
+            # Cost report for the whole file (index + all queries).
+            print(cb)
+
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+    print(res)
+
+--------------------------------------------------------------------------------

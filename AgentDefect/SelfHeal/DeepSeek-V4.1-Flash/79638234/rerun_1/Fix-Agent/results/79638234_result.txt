@@ -1,0 +1,361 @@
+Case ID: 79638234
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 19:42:17
+End Time: 2026-11-04 19:46:55
+Total Duration: 278.20 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Fixed version of run_agent.
+
+Why the original returned the same (parroted) answer every time:
+
+1. No seed control -> Ollama reused the same sampling state for identical
+   prompts/options, so the sampling path was effectively deterministic.
+2. `repeat_penalty=1.2` is too aggressive for Qwen2.5: the penalty distorts the
+   token distribution, which makes the model fall back to copying the prompt
+   ("Please tell me a lighthearted joke") or looping instead of answering.
+3. `num_ctx=2048` is too small once a system instruction + the answer are added;
+   the window silently truncates context.
+4. The prompt was sent as a bare string - there was no system message telling the
+   model to answer in its own words and to produce something NEW, so the safest
+   continuation for the model was to restate the question.
+
+The fix: explicit fresh random seed per call, sane sampling params, a real
+system message, a larger context, and a guard that rejects parroted/duplicate
+output and retries with a new seed.
+"""
+
+from __future__ import annotations
+
+import random
+import re
+import sys
+from collections import deque
+from typing import Deque, List, Optional, Set
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+
+MODEL = "qwen2.5:14b"
+
+# A system message is what stops the model from simply echoing the question.
+SYSTEM_PROMPT = (
+    "You are a warm, witty stand-up comedian chatting with a friend.\n"
+    "Rules:\n"
+    "1. Answer in your OWN words. Never repeat, quote or paraphrase the user's request.\n"
+    "2. Every reply must contain ONE fresh, original, lighthearted joke that you have not told before.\n"
+    "3. No preamble, no lists, no meta-commentary - just the joke, 1-3 sentences."
+)
+
+_WORD_RE = re.compile(r"[a-z0-9']+")
+_SENT_SPLIT_RE = re.compile(r"[.!?\n]+")
+
+
+def _tokens(text: str) -> List[str]:
+    return _WORD_RE.findall(text.lower())
+
+
+def _fingerprint(text: str) -> str:
+    return " ".join(_tokens(text))
+
+
+def _echoes_prompt(answer: str, prompt: str) -> bool:
+    """True when the model restated the user's request instead of answering it."""
+    a, p = _fingerprint(answer), _fingerprint(prompt)
+    if not a or not p:
+        return False
+    # The whole request (or essentially all of it) reappears inside the answer.
+    return len(p) >= 12 and p in a
+
+
+def _loops(answer: str) -> bool:
+    """True when the answer repeats whole sentences (classic low-variety loop)."""
+    sentences = [s.strip() for s in _SENT_SPLIT_RE.split(answer) if s.strip()]
+    return len(sentences) >= 2 and len(set(sentences)) < len(sentences)
+
+
+_SEEN: Deque[str] = deque(maxlen=200)
+_SEEN_SET: Set[str] = set()
+
+
+def _remember(answer: str) -> None:
+    fp = _fingerprint(answer)
+    if len(_SEEN) == _SEEN.maxlen and _SEEN:
+        _SEEN_SET.discard(_SEEN[0])
+    _SEEN.append(fp)
+    _SEEN_SET.add(fp)
+
+
+def _build_llm(seed: int, temperature: float) -> ChatOllama:
+    """A fresh seed per call is the single most important change here."""
+    kwargs = dict(
+        model=MODEL,
+        temperature=temperature,   # higher than 0.7 -> more verbal variety
+        top_p=0.95,
+        top_k=40,                  # keeps sampling out of the absurd tail
+        seed=seed,                 # <-- explicit random seed, no more identical output
+        repeat_penalty=1.05,       # 1.2 was distorting Qwen2.5's tokens
+        repeat_last_n=128,         # look further back when penalising repetition
+        num_ctx=4096,              # 2048 truncated system prompt + answer
+        num_predict=256,
+        keep_alive="10m",          # keep the model warm between calls
+    )
+    try:
+        return ChatOllama(client_kwargs={"timeout": 120.0}, **kwargs)
+    except Exception:              # older/newer API surfaces
+        return ChatOllama(timeout=120.0, **kwargs)
+
+
+def _is_bad(answer: str, prompt: str, require_novel: bool) -> bool:
+    if len(answer.strip()) < 15:
+        return True
+    if _echoes_prompt(answer, prompt) or _loops(answer):
+        return True
+    if require_novel and _fingerprint(answer) in _SEEN_SET:
+        return True
+    return False
+
+
+def run_agent(
+    input_text: str,
+    *,
+    seed: Optional[int] = None,
+    require_novel: bool = True,
+    max_attempts: int = 4,
+) -> str:
+    """Return one varied, original answer to `input_text`.
+
+    Each attempt uses a brand-new random seed (and a slightly hotter temperature),
+    and parroted / duplicated answers are rejected and regenerated.
+    """
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=input_text),
+    ]
+
+    last_answer = ""
+    for attempt in range(max_attempts):
+        call_seed = seed if seed is not None else random.randint(0, 2**31 - 1)
+        temperature = min(0.8 + 0.15 * attempt, 1.2)
+        llm = _build_llm(seed=call_seed, temperature=temperature)
+
+        response = llm.invoke(messages)
+        answer = (response.content or "").strip()
+        last_answer = answer or last_answer
+
+        if not _is_bad(answer, input_text, require_novel):
+            _remember(answer)
+            return answer
+
+    # Nothing clean came back (e.g. the model is a base model with a bare
+    # `{{ .Prompt }}` template). Return the best we have rather than crashing.
+    return last_answer
+
+
+if __name__ == "__main__":
+    prompt = sys.argv[1] if len(sys.argv) > 1 else "Please tell me a lighthearted joke"
+    for i in range(3):
+        print(f"--- response {i + 1} ---")
+        print(run_agent(prompt))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 19:46:55
+Duration: 278.20 seconds
+Verdict: ## Evaluation Summary
+
+**1. Diff review — root cause addressed**
+
+The original bug: `run_agent` returned the *same* parroted/identical text on every call. The fixed code addresses this on multiple fronts:
+
+- **Sampling**: `seed=random.randint(0, 2**31-1)` per call (a fresh sampling state each invocation) and a slightly hotter `temperature` ramp (`0.8 + 0.15*attempt`, capped at 1.2). This is the primary mechanism that guarantees different outputs.
+- **Prompting**: a real `SystemMessage` telling the model to answer in its own words, plus `HumanMessage`, instead of a bare string — removes the "safest continuation is to restate the question" failure mode.
+- **Sane options**: `repeat_penalty` 1.2 → 1.05, `repeat_last_n=128`, `num_ctx` 2048 → 4096, `num_predict=256`, `top_k=40`, `keep_alive="10m"`.
+- **Guard/retry**: `_echoes_prompt`, `_loops`, short-answer filter, and a module-level `_SEEN`/`_SEEN_SET` fingerprint ring buffer (deque, `maxlen=200`) that rejects duplicates across calls and retries with a new seed (up to 4 attempts).
+
+**2. API correctness (verified)**
+
+- `langchain_ollama.ChatOllama` supports all params used here (`model`, `temperature`, `top_p`, `top_k`, `seed`, `repeat_penalty`, `repeat_last_n`, `num_ctx`, `num_predict`, `keep_alive`) — confirmed by the reference docs for `ChatOllama` and specifically the `ChatOllama.seed` entry (`seed | langchain_ollama`), so the seed control is a genuinely supported parameter, not a fabricated kwarg.
+- `client_kwargs={"timeout": 120.0}` is a valid modern ChatOllama surface; the `try/except` fallback to `ChatOllama(timeout=120.0, ...)` cleanly covers older/newer variants where `client_kwargs` is rejected (Pydantic `ValidationError` → `ValueError` → caught).
+- `llm.invoke(messages)` with `SystemMessage`/`HumanMessage` from `langchain_core.messages` (a hard dependency of `langchain_ollama`) is correct, and `response.content` is a `str`, so `.strip()` is safe and the returned value is a `str` as the test asserts.
+- `deque.maxlen` usage in `_remember` is correct; the eviction `_SEEN_SET.discard(_SEEN[0])` happens before append, so the set stays consistent with the deque.
+
+**3. Structural validation**
+
+`validate_fixed_code` → **ACCEPT** (matches expected structure and output format): `run_agent(input_text)` keeps its original signature and single-string return, and the `__main__` demo no longer breaks the import used by the test (`if __name__ == "__main__"` guard preserved).
+
+**4. Test-path analysis**
+
+`result1 = run_agent(prompt)`; `result2 = run_agent(prompt)`. Call 2 draws a new random seed, and even if the model reproduced call 1's joke, `_is_bad(..., require_novel=True)` rejects it via `_SEEEN_SET` and regenerates. Non-emptiness (`len > 15` gating plus `.strip()`) and type checks are all satisfied.
+
+**Caveats (non-blocking)**
+
+- The final `return last_answer` fallback can, in a pathological case where *every* attempt echoes/loops, return identical text for both calls — but that requires a broken model, and the returned value is still a non-empty `str` (only `assertNotEqual` would be at risk).
+- The fix is probabilistic by nature (it depends on the model actually running); with 4 seeded attempts plus novelty rejection, failure on `assertNotEqual` is extremely unlikely.
+- Runtime cost grows (up to 4 model calls on rejection), but `timeout=120` is preserved and no functional requirement is violated.
+
+## Verdict
+
+**ACCEPT** — the change correctly identifies the determinism/parroting root cause, uses only genuinely supported `ChatOllama` parameters (including the verified `seed`), adds a defensive retry/novelty guard, preserves the public `run_agent(input_text) -> str` contract, and passes structural validation.
+--------------------------------------------------------------------------------
+"""Fixed version of run_agent.
+
+Why the original returned the same (parroted) answer every time:
+
+1. No seed control -> Ollama reused the same sampling state for identical
+   prompts/options, so the sampling path was effectively deterministic.
+2. `repeat_penalty=1.2` is too aggressive for Qwen2.5: the penalty distorts the
+   token distribution, which makes the model fall back to copying the prompt
+   ("Please tell me a lighthearted joke") or looping instead of answering.
+3. `num_ctx=2048` is too small once a system instruction + the answer are added;
+   the window silently truncates context.
+4. The prompt was sent as a bare string - there was no system message telling the
+   model to answer in its own words and to produce something NEW, so the safest
+   continuation for the model was to restate the question.
+
+The fix: explicit fresh random seed per call, sane sampling params, a real
+system message, a larger context, and a guard that rejects parroted/duplicate
+output and retries with a new seed.
+"""
+
+from __future__ import annotations
+
+import random
+import re
+import sys
+from collections import deque
+from typing import Deque, List, Optional, Set
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+
+MODEL = "qwen2.5:14b"
+
+# A system message is what stops the model from simply echoing the question.
+SYSTEM_PROMPT = (
+    "You are a warm, witty stand-up comedian chatting with a friend.\n"
+    "Rules:\n"
+    "1. Answer in your OWN words. Never repeat, quote or paraphrase the user's request.\n"
+    "2. Every reply must contain ONE fresh, original, lighthearted joke that you have not told before.\n"
+    "3. No preamble, no lists, no meta-commentary - just the joke, 1-3 sentences."
+)
+
+_WORD_RE = re.compile(r"[a-z0-9']+")
+_SENT_SPLIT_RE = re.compile(r"[.!?\n]+")
+
+
+def _tokens(text: str) -> List[str]:
+    return _WORD_RE.findall(text.lower())
+
+
+def _fingerprint(text: str) -> str:
+    return " ".join(_tokens(text))
+
+
+def _echoes_prompt(answer: str, prompt: str) -> bool:
+    """True when the model restated the user's request instead of answering it."""
+    a, p = _fingerprint(answer), _fingerprint(prompt)
+    if not a or not p:
+        return False
+    # The whole request (or essentially all of it) reappears inside the answer.
+    return len(p) >= 12 and p in a
+
+
+def _loops(answer: str) -> bool:
+    """True when the answer repeats whole sentences (classic low-variety loop)."""
+    sentences = [s.strip() for s in _SENT_SPLIT_RE.split(answer) if s.strip()]
+    return len(sentences) >= 2 and len(set(sentences)) < len(sentences)
+
+
+_SEEN: Deque[str] = deque(maxlen=200)
+_SEEN_SET: Set[str] = set()
+
+
+def _remember(answer: str) -> None:
+    fp = _fingerprint(answer)
+    if len(_SEEN) == _SEEN.maxlen and _SEEN:
+        _SEEN_SET.discard(_SEEN[0])
+    _SEEN.append(fp)
+    _SEEN_SET.add(fp)
+
+
+def _build_llm(seed: int, temperature: float) -> ChatOllama:
+    """A fresh seed per call is the single most important change here."""
+    kwargs = dict(
+        model=MODEL,
+        temperature=temperature,   # higher than 0.7 -> more verbal variety
+        top_p=0.95,
+        top_k=40,                  # keeps sampling out of the absurd tail
+        seed=seed,                 # <-- explicit random seed, no more identical output
+        repeat_penalty=1.05,       # 1.2 was distorting Qwen2.5's tokens
+        repeat_last_n=128,         # look further back when penalising repetition
+        num_ctx=4096,              # 2048 truncated system prompt + answer
+        num_predict=256,
+        keep_alive="10m",          # keep the model warm between calls
+    )
+    try:
+        return ChatOllama(client_kwargs={"timeout": 120.0}, **kwargs)
+    except Exception:              # older/newer API surfaces
+        return ChatOllama(timeout=120.0, **kwargs)
+
+
+def _is_bad(answer: str, prompt: str, require_novel: bool) -> bool:
+    if len(answer.strip()) < 15:
+        return True
+    if _echoes_prompt(answer, prompt) or _loops(answer):
+        return True
+    if require_novel and _fingerprint(answer) in _SEEN_SET:
+        return True
+    return False
+
+
+def run_agent(
+    input_text: str,
+    *,
+    seed: Optional[int] = None,
+    require_novel: bool = True,
+    max_attempts: int = 4,
+) -> str:
+    """Return one varied, original answer to `input_text`.
+
+    Each attempt uses a brand-new random seed (and a slightly hotter temperature),
+    and parroted / duplicated answers are rejected and regenerated.
+    """
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=input_text),
+    ]
+
+    last_answer = ""
+    for attempt in range(max_attempts):
+        call_seed = seed if seed is not None else random.randint(0, 2**31 - 1)
+        temperature = min(0.8 + 0.15 * attempt, 1.2)
+        llm = _build_llm(seed=call_seed, temperature=temperature)
+
+        response = llm.invoke(messages)
+        answer = (response.content or "").strip()
+        last_answer = answer or last_answer
+
+        if not _is_bad(answer, input_text, require_novel):
+            _remember(answer)
+            return answer
+
+    # Nothing clean came back (e.g. the model is a base model with a bare
+    # `{{ .Prompt }}` template). Return the best we have rather than crashing.
+    return last_answer
+
+
+if __name__ == "__main__":
+    prompt = sys.argv[1] if len(sys.argv) > 1 else "Please tell me a lighthearted joke"
+    for i in range(3):
+        print(f"--- response {i + 1} ---")
+        print(run_agent(prompt))
+
+--------------------------------------------------------------------------------

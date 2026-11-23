@@ -1,0 +1,301 @@
+diff --git a/apps/browser/components/ChatInputButton.tsx b/apps/browser/components/ChatInputButton.tsx
+index fedfc45..0c18f56 100644
+--- a/apps/browser/components/ChatInputButton.tsx
++++ b/apps/browser/components/ChatInputButton.tsx
+@@ -18,10 +18,10 @@ const ChatInputButton = ({
+       {!running ? (
+         <Button
+           hierarchy="secondary"
+-          onClick={async () => await handleSend()}
++          onClick={handleSend}
+           disabled={message.length === 0}
+           className="!p-2"
+-          type="submit"
++          type="button"
+         >
+           <ArrowRight weight="bold" />
+         </Button>
+diff --git a/apps/browser/components/providers/WorkspaceFilesProvider.tsx b/apps/browser/components/providers/WorkspaceFilesProvider.tsx
+index c940550..2b44f0c 100644
+--- a/apps/browser/components/providers/WorkspaceFilesProvider.tsx
++++ b/apps/browser/components/providers/WorkspaceFilesProvider.tsx
+@@ -17,24 +17,44 @@ export default function WorkspaceFilesProvider({ children }: { children: React.R
+ 
+       const decoder = new TextDecoder();
+       const files = [...uploadedFiles];
+-      setUploadedFiles([]);
+-
+-      // Write all uploaded files
+-      await Promise.all(
+-        files.map((file) =>
+-          userWorkspace.writeFile(
+-            file.path,
+-            decoder.decode(file.content)
+-          )
+-        )
++
++      // Take the files out of the queue before writing them, so that a
++      // re-render (or a workspace change happening at the same time) cannot
++      // write the very same file twice
++      setUploadedFiles((current) => current.filter((x) => !files.includes(x)));
++
++      // Write all uploaded files. A single failing file must not prevent the
++      // remaining ones from being written to the workspace
++      const results = await Promise.all(
++        files.map(async (file) => {
++          try {
++            await userWorkspace.writeFile(
++              file.path,
++              decoder.decode(file.content)
++            );
++            return true;
++          } catch (e) {
++            console.error(`Failed to write ${file.path} to the workspace`, e);
++            return false;
++          }
++        })
+       );
+-      await updateUserFiles(userWorkspace);
++
++      if (!results.some((x) => x)) {
++        return;
++      }
++
++      try {
++        await updateUserFiles(userWorkspace);
++      } catch (e) {
++        console.error("Failed to update the user files", e);
++      }
+     })();
+-  }, [uploadedFiles]);
++  }, [uploadedFiles, userWorkspace]);
+ 
+   return (
+     <>
+       {children}
+     </>
+   )
+-}
+\ No newline at end of file
++}
+diff --git a/apps/browser/lib/hooks/useUploadFile.ts b/apps/browser/lib/hooks/useUploadFile.ts
+index d3ac06a..001e07f 100644
+--- a/apps/browser/lib/hooks/useUploadFile.ts
++++ b/apps/browser/lib/hooks/useUploadFile.ts
+@@ -20,7 +20,13 @@ export function useUploadFiles() {
+           })
+         );
+ 
+-        setUploadedFiles(result);
++        // Newly dropped files are added to the files that are still waiting to
++        // be written to the workspace (instead of replacing them), so that
++        // files dropped in several batches are all kept
++        setUploadedFiles((current: InMemoryFile[]) => [
++          ...current.filter((x) => !result.some((y) => y.path === x.path)),
++          ...result,
++        ]);
+       }
+     })();
+   }, [acceptedFiles, setUploadedFiles]);
+diff --git a/apps/browser/lib/mutations/useCreateChat.ts b/apps/browser/lib/mutations/useCreateChat.ts
+index 0efa53c..3f6172b 100644
+--- a/apps/browser/lib/mutations/useCreateChat.ts
++++ b/apps/browser/lib/mutations/useCreateChat.ts
+@@ -2,11 +2,15 @@ import { createSupabaseClient } from "../supabase/createSupabaseClient"
+ import { Chat } from "@/lib/queries/useChats"
+ import { useMutation, useQueryClient } from "@tanstack/react-query"
+ import { useSession } from "next-auth/react"
++import { useAtom } from "jotai"
++import { userWorkspaceAtom } from "@/lib/store"
++import { SupabaseWorkspace } from "../supabase/SupabaseWorkspace"
+ 
+ export const useCreateChat = () => {
+   const { data: session } = useSession()
+   const queryClient = useQueryClient()
+-  
++  const [userWorkspace] = useAtom(userWorkspaceAtom)
++
+   return useMutation({
+     mutationFn: async (chatId: string) => {
+       const supabase = createSupabaseClient(session?.supabaseAccessToken as string)
+@@ -21,6 +25,26 @@ export const useCreateChat = () => {
+         throw new Error(error.message);
+       }
+ 
++      // Creating a chat also creates a brand new workspace for it (scoped by
++      // the chat id). Everything the user uploaded while working in the
++      // previous workspace (for example the anonymous, in memory workspace)
++      // lives there, so it has to be copied over to the workspace of the chat
++      // that was just created. Otherwise the uploaded files would be lost as
++      // soon as the chat is opened.
++      const chatWorkspace = new SupabaseWorkspace(chatId, supabase.storage)
++      const isOtherWorkspace =
++        !(userWorkspace instanceof SupabaseWorkspace) || userWorkspace.chatId !== chatId
++
++      if (isOtherWorkspace) {
++        try {
++          await chatWorkspace.copyFrom(userWorkspace)
++        } catch (e) {
++          // Failing to carry the files over should not prevent the chat from
++          // being created
++          console.error("Failed to carry over the uploaded files to the new chat", e)
++        }
++      }
++
+       return data[0]
+     },
+     onMutate: async (chatId: string) => {
+@@ -38,4 +62,4 @@ export const useCreateChat = () => {
+       queryClient.invalidateQueries({ queryKey: ['chats'] })
+     },
+   })
+-}
+\ No newline at end of file
++}
+diff --git a/apps/browser/lib/supabase/SupabaseWorkspace.ts b/apps/browser/lib/supabase/SupabaseWorkspace.ts
+index 6975971..84d50d2 100644
+--- a/apps/browser/lib/supabase/SupabaseWorkspace.ts
++++ b/apps/browser/lib/supabase/SupabaseWorkspace.ts
+@@ -4,6 +4,18 @@ import * as path from "path-browserify";
+ 
+ const BUCKET_NAME = "workspaces";
+ 
++const isNotFoundError = (
++  error: { message?: string; statusCode?: string | number } | null
++): boolean => {
++  if (!error) {
++    return false;
++  }
++
++  const message = (error.message ?? "").toLowerCase();
++
++  return message.includes("not found") || `${error.statusCode ?? ""}` === "404";
++};
++
+ export class SupabaseWorkspace implements Workspace {
+   constructor(
+     public readonly chatId: string,
+@@ -13,9 +25,12 @@ export class SupabaseWorkspace implements Workspace {
+   async writeFile(subpath: string, data: string): Promise<void> {
+     const path = this.toWorkspacePath(subpath);
+ 
++    // Files are copied over from the workspace the user was previously working
++    // in and can be re-uploaded with the same name, so the content is always
++    // overwritten instead of failing when the file already exists
+     const { error } = await this.supabaseStorage
+       .from(BUCKET_NAME)
+-      .upload(path, data);
++      .upload(path, data, { upsert: true });
+ 
+     if (error) {
+       throw error;
+@@ -49,11 +64,12 @@ export class SupabaseWorkspace implements Workspace {
+       .from(BUCKET_NAME)
+       .download(path);
+ 
+-    if (error) {
++    // A missing file is not an error, it simply means that it does not exist
++    if (error && !isNotFoundError(error)) {
+       throw error;
+     }
+ 
+-    return data !== null;
++    return !!data;
+   }
+ 
+   async rename(oldPath: string, newPath: string): Promise<void> {
+@@ -85,6 +101,7 @@ export class SupabaseWorkspace implements Workspace {
+     if (listError) {
+       throw listError;
+     }
++
+     const filesToRemove = list.map((x) => `${path}/${x.name}`);
+ 
+     if (filesToRemove.length === 0) {
+@@ -117,32 +134,27 @@ export class SupabaseWorkspace implements Workspace {
+ 
+     return data
+       .filter((x) => !x.name.startsWith("."))
+-      .map((x) => ({
++      .map<DirectoryEntry>((x) => ({
+         name: x.name,
+-        type: "file",
++        type: x.id ? "file" : "directory",
+       }));
+   }
+ 
+   async appendFile(subpath: string, data: string): Promise<void> {
+-    const path = this.toWorkspacePath(subpath);
+-
+-    const { data: existingData, error: readError } = await this.supabaseStorage
+-      .from(BUCKET_NAME)
+-      .download(path);
+-
+-    if (readError) {
+-      throw readError;
++    let existingData = "";
++
++    try {
++      existingData = await this.readFile(subpath);
++    } catch (e) {
++      // The file does not exist yet, so it is created with the given data
++      if (!isNotFoundError(e as { message?: string; statusCode?: string | number })) {
++        console.error(`Failed to read ${subpath} before appending to it`, e);
++      }
+     }
+ 
+-    const newData = existingData ? existingData.text() + data : data;
+-
+-    const { error: writeError } = await this.supabaseStorage
+-      .from(BUCKET_NAME)
+-      .upload(path, newData);
+-
+-    if (writeError) {
+-      throw writeError;
+-    }
++    // The previous content has to be awaited, otherwise its promise is
++    // concatenated with the data (resulting in a corrupted file)
++    await this.writeFile(subpath, existingData + data);
+   }
+ 
+   async rm(subpath: string): Promise<void> {
+@@ -157,6 +169,39 @@ export class SupabaseWorkspace implements Workspace {
+     }
+   }
+ 
++  /**
++   * Copies every file of the given workspace into this workspace, preserving
++   * the (relative) paths of the files.
++   *
++   * This is used to carry over the files a user uploaded before the chat (and
++   * therefore the chat workspace) existed, e.g. files uploaded in the
++   * anonymous workspace.
++   */
++  async copyFrom(source: Workspace, subpath: string = "/"): Promise<void> {
++    let entries: DirectoryEntry[] = [];
++
++    try {
++      entries = await source.readdir(subpath);
++    } catch {
++      // The directory does not exist (yet), there is nothing to copy
++      return;
++    }
++
++    await Promise.all(
++      entries.map(async (entry) => {
++        const entryPath = path.join(subpath, entry.name);
++
++        if (entry.type === "directory") {
++          await this.copyFrom(source, entryPath);
++          return;
++        }
++
++        const content = await source.readFile(entryPath);
++        await this.writeFile(entryPath, content);
++      })
++    );
++  }
++
+   async exec(
+     _command: string,
+     _args?: string[],

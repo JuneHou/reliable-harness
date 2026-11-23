@@ -1,0 +1,168 @@
+diff --git a/src/crewai/flow/flow.py b/src/crewai/flow/flow.py
+index 982f14d..46a08f5 100644
+--- a/src/crewai/flow/flow.py
++++ b/src/crewai/flow/flow.py
+@@ -121,7 +121,6 @@ class FlowMeta(type):
+                 condition_type = getattr(attr_value, "__condition_type__", "OR")
+                 listeners[attr_name] = (condition_type, methods)
+ 
+-            # TODO: should we add a check for __condition_type__ 'AND'?
+             elif hasattr(attr_value, "__is_router__"):
+                 routers[attr_value.__router_for__] = attr_name
+                 possible_returns = get_possible_return_constants(attr_value)
+@@ -139,11 +138,6 @@ class FlowMeta(type):
+         setattr(cls, "_routers", routers)
+         setattr(cls, "_router_paths", router_paths)
+ 
+-        print("_start_methods", start_methods)
+-        print("_listeners", listeners)
+-        print("_routers", routers)
+-        print("_router_paths", router_paths)
+-
+         return cls
+ 
+ 
+@@ -177,7 +171,6 @@ class Flow(Generic[T], metaclass=FlowMeta):
+             if callable(getattr(self, method_name)) and not method_name.startswith(
+                 "__"
+             ):
+-                print("Method", method_name)
+                 self._methods[method_name] = getattr(self, method_name)
+ 
+     def _create_initial_state(self) -> T:
+@@ -219,6 +212,11 @@ class Flow(Generic[T], metaclass=FlowMeta):
+         # Run all start methods concurrently
+         await asyncio.gather(*tasks)
+ 
++        # Safety net: execute any AND listener whose triggers have all completed.
++        # This covers flows where the last dependency finished inside a branch
++        # that had already been evaluated.
++        await self._execute_ready_and_listeners()
++
+         # Return the final output (from the last executed method)
+         if self._method_outputs:
+             return self._method_outputs[-1]
+@@ -246,7 +244,16 @@ class Flow(Generic[T], metaclass=FlowMeta):
+         return result
+ 
+     async def _execute_listeners(self, trigger_method: str, result: Any) -> None:
+-        listener_tasks = []
++        """Execute every listener whose condition is satisfied.
++
++        ``OR`` listeners run as soon as one of their triggers completes, while
++        ``AND`` listeners only run once *all* of their triggers have completed.
++        The progress of each ``AND`` condition is tracked per listener in
++        ``_pending_and_listeners`` (the set of triggers still outstanding), so a
++        partially satisfied condition is remembered instead of being forgotten
++        when an unrelated method finishes or when the branches run concurrently.
++        """
++        listener_tasks: List[asyncio.Task] = []
+ 
+         if trigger_method in self._routers:
+             router_method = self._methods[self._routers[trigger_method]]
+@@ -256,31 +263,73 @@ class Flow(Generic[T], metaclass=FlowMeta):
+             # Use the path as the new trigger method
+             trigger_method = path
+ 
++        listeners_to_run: List[str] = []
++
+         for listener_name, (condition_type, methods) in self._listeners.items():
++            if listener_name in self._executed_methods:
++                continue
++            if listener_name in self._scheduled_tasks:
++                continue
++
+             if condition_type == "OR":
+                 if trigger_method in methods:
+-                    if (
+-                        listener_name not in self._executed_methods
+-                        and listener_name not in self._scheduled_tasks
+-                    ):
+-                        self._scheduled_tasks.add(listener_name)
+-                        listener_tasks.append(
+-                            self._execute_single_listener(listener_name, result)
+-                        )
++                    listeners_to_run.append(listener_name)
+             elif condition_type == "AND":
+-                if all(method in self._executed_methods for method in methods):
+-                    if (
+-                        listener_name not in self._executed_methods
+-                        and listener_name not in self._scheduled_tasks
+-                    ):
+-                        self._scheduled_tasks.add(listener_name)
+-                        listener_tasks.append(
+-                            self._execute_single_listener(listener_name, result)
+-                        )
++                # Register the listener the first time one of its triggers fires
++                # and immediately account for triggers that already completed
++                # (e.g. the other branch of the flow finished first). Method
++                # references and string names are both normalized to the method
++                # name, so both spellings satisfy the same condition.
++                if listener_name not in self._pending_and_listeners:
++                    self._pending_and_listeners[listener_name] = set(methods)
++
++                pending = self._pending_and_listeners[listener_name]
++                pending.difference_update(self._executed_methods)
++
++                if not pending:
++                    listeners_to_run.append(listener_name)
++
++        for listener_name in listeners_to_run:
++            if listener_name in self._scheduled_tasks:
++                continue
++            self._scheduled_tasks.add(listener_name)
++            listener_tasks.append(self._execute_single_listener(listener_name, result))
+ 
+         # Run all listener tasks concurrently and wait for them to complete
+         await asyncio.gather(*listener_tasks)
+ 
++    async def _execute_ready_and_listeners(self) -> None:
++        """Execute ``AND`` listeners whose triggers have all completed.
++
++        ``_execute_listeners`` normally takes care of this, but when triggers
++        complete in separate, concurrently running branches the very last
++        evaluation can happen before the other dependency is recorded. This
++        final sweep guarantees the dependent steps documented with ``and_(...)``
++        still run.
++        """
++        attempted: Set[str] = set()
++
++        while True:
++            ready = [
++                listener_name
++                for listener_name, (condition_type, methods) in self._listeners.items()
++                if condition_type == "AND"
++                and listener_name not in self._executed_methods
++                and listener_name not in self._scheduled_tasks
++                and listener_name not in attempted
++                and bool(methods)
++                and all(method in self._executed_methods for method in methods)
++            ]
++
++            if not ready:
++                return
++
++            for listener_name in ready:
++                attempted.add(listener_name)
++                self._scheduled_tasks.add(listener_name)
++                result = self._method_outputs[-1] if self._method_outputs else None
++                await self._execute_single_listener(listener_name, result)
++
+     async def _execute_single_listener(self, listener_name: str, result: Any) -> None:
+         try:
+             method = self._methods[listener_name]
+@@ -301,10 +350,14 @@ class Flow(Generic[T], metaclass=FlowMeta):
+ 
+             # Remove from scheduled tasks after execution
+             self._scheduled_tasks.discard(listener_name)
++            # The condition has been fully consumed, no pending triggers remain
++            self._pending_and_listeners.pop(listener_name, None)
+ 
+             # Execute listeners of this listener
+             await self._execute_listeners(listener_name, listener_result)
+         except Exception as e:
++            # Do not keep a failed listener in the scheduled state forever
++            self._scheduled_tasks.discard(listener_name)
+             print(
+                 f"[Flow._execute_single_listener] Error in method {listener_name}: {e}"
+             )

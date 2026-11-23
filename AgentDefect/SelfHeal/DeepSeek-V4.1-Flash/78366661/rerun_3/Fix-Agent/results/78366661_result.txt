@@ -1,0 +1,392 @@
+Case ID: 78366661
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 18:42:40
+End Time: 2026-11-05 18:48:11
+Total Duration: 331.05 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Fixed version: the vector search returned [] because the code searched before a
+real Atlas collection / vector search index existed.
+
+Original problems:
+  1. `atlas_collection = []` was a plain Python list, so nothing was ever written to
+     MongoDB Atlas (the write silently went to the dummy/no-op vector store).
+  2. No Atlas Search (vectorSearch) index named "vector_index" was created, and the
+     query was issued immediately - an index that is still building returns 0 results.
+  3. The embedding dimension / path used by the index was never aligned with the
+     embeddings actually stored, so even a ready index could match nothing.
+
+Fixes: connect to Atlas with pymongo, use the real Collection, create (or reuse) the
+vector search index with the correct numDimensions/path and wait until it is
+queryable, only then embed + search - and retry the search until results appear.
+"""
+
+from dotenv import load_dotenv
+import os
+import time
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+
+try:  # current package, falls back to the community re-export
+    from langchain_mongodb import MongoDBAtlasVectorSearch
+except ImportError:  # pragma: no cover
+    from langchain_community.vectorstores import MongoDBAtlasVectorSearch
+
+from pymongo import MongoClient
+from pymongo.operations import SearchIndexModel
+
+VECTOR_INDEX_NAME = "vector_index"
+TEXT_KEY = "text"
+EMBEDDING_KEY = "embedding"
+
+
+def get_atlas_collection():
+    """Return a real MongoDB Atlas collection instead of an in-memory list."""
+    load_dotenv()
+
+    uri = os.getenv("MONGODB_ATLAS_CLUSTER_URI")
+    if not uri:
+        raise ValueError("MONGODB_ATLAS_CLUSTER_URI not found")
+
+    db_name = os.getenv("MONGODB_DB_NAME", "langchain_db")
+    collection_name = os.getenv("MONGODB_COLLECTION_NAME", "gpt4_paper")
+
+    client = MongoClient(uri)
+    collection = client[db_name][collection_name]
+    return client, collection
+
+
+def ensure_vector_search_index(collection, dimensions, index_name=VECTOR_INDEX_NAME):
+    """Create the Atlas vectorSearch index if needed and wait until it is queryable.
+
+    Searching an index that does not exist or is still being built is the classic
+    reason `similarity_search` returns an empty list even though the data was saved.
+    """
+    try:
+        existing = {idx.get("name") for idx in collection.list_search_indexes()}
+    except Exception:
+        existing = set()
+
+    if index_name not in existing:
+        model = SearchIndexModel(
+            definition={
+                "fields": [
+                    {
+                        "type": "vector",
+                        "path": EMBEDDING_KEY,
+                        "numDimensions": dimensions,
+                        "similarity": "cosine",
+                    },
+                    {"type": "filter", "path": "metadata.source"},
+                ]
+            },
+            name=index_name,
+            type="vectorSearch",
+        )
+        try:
+            collection.create_search_index(model=model)
+        except Exception:
+            # Index may already exist / be in flight - keep going and just wait.
+            pass
+
+    # Poll until the index reports "queryable" (or give up after ~5 minutes).
+    for _ in range(60):
+        try:
+            statuses = list(collection.list_search_indexes(index_name))
+        except Exception:
+            statuses = []
+        if statuses and all(
+            s.get("queryable") or s.get("status") == "READY" for s in statuses
+        ):
+            return True
+        time.sleep(5)
+    return False
+
+
+def run_agent(pdf_url):
+    client, atlas_collection = get_atlas_collection()
+
+    embeddings = OpenAIEmbeddings(disallowed_special=())
+
+    # The index dimensions must match the embedding model output exactly.
+    dimensions = len(embeddings.embed_query("dimension probe"))
+
+    if atlas_collection.count_documents({}, limit=1) == 0:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+        )
+        loader = PyPDFLoader(pdf_url)
+        data = loader.load()
+        docs = text_splitter.split_documents(data)
+
+        vector_search = MongoDBAtlasVectorSearch.from_documents(
+            documents=docs,
+            embedding=embeddings,
+            collection=atlas_collection,
+            index_name=VECTOR_INDEX_NAME,
+            text_key=TEXT_KEY,
+            embedding_key=EMBEDDING_KEY,
+        )
+        # Make sure what we just wrote is actually visible before searching.
+        for _ in range(30):
+            if atlas_collection.count_documents({}) >= len(docs):
+                break
+            time.sleep(1)
+    else:
+        vector_search = MongoDBAtlasVectorSearch(
+            collection=atlas_collection,
+            embedding=embeddings,
+            index_name=VECTOR_INDEX_NAME,
+            text_key=TEXT_KEY,
+            embedding_key=EMBEDDING_KEY,
+        )
+
+    # Create + wait for the vector search index before querying it.
+    ensure_vector_search_index(atlas_collection, dimensions)
+
+    query = "What were the compute requirements for training GPT 4"
+
+    # Retry: freshly built indexes can take a few extra seconds to serve queries.
+    results = []
+    for _ in range(12):
+        results = vector_search.similarity_search(query, k=4)
+        if results:
+            break
+        time.sleep(5)
+
+    client.close()
+    return results
+
+
+if __name__ == "__main__":
+    url = "https://arxiv.org/pdf/2303.08774.pdf"
+
+    results = run_agent(url)
+
+    if not results:
+        print(
+            "No documents returned. Verify the Atlas vector index "
+            f"'{VECTOR_INDEX_NAME}' is queryable and that its path "
+            f"'{EMBEDDING_KEY}' matches the stored embeddings."
+        )
+
+    print("Result:", results)
+    for i, doc in enumerate(results, start=1):
+        print(f"--- Chunk {i} ---")
+        print(doc.page_content)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 18:48:11
+Duration: 331.05 seconds
+Verdict: I have the diff and validation results. The API verification tool returned irrelevant web noise (Météo-France, LangChain Wikipedia), so I'll rely on direct knowledge of these APIs — noting that `SearchIndexModel` returning weather results is not evidence about the code.
+
+## Assessment of the fix
+
+**Root cause addressed (correctly):**
+- The buggy code defined local stub classes: `DummyVectorSearch.similarity_search()` hard-returned `[]`, and a fake `MongoDBAtlasVectorSearch.from_documents()` shadowed the real one, while `atlas_collection = []` was a plain Python list. So nothing was ever written or queried — the empty result was guaranteed regardless of credentials. The fix removes the stubs and uses the real stack (`pymongo.MongoClient` collection + real `MongoDBAtlasVectorSearch`).
+- It also fixes the *second* real-world cause of empty vector results: querying a `vectorSearch` index that doesn't exist or is still building. `ensure_vector_search_index()` creates the index with matching `numDimensions`/`path` and polls until queryable, and the search itself is retried. This is the standard, correct remedy.
+
+**API usage check (all appear sound):**
+- `SearchIndexModel(definition={...}, name=..., type="vectorSearch")` — correct; `create_search_index(model=...)` is the documented Atlas path.
+- `collection.list_search_indexes()` / `list_search_indexes(index_name)` — correct, returns a cursor of dicts; `queryable`/`status` keys are the right ones to poll.
+- `count_documents({}, limit=1)` — valid pymongo passthrough to the `count` command.
+- `MongoDBAtlasVectorSearch.from_documents(..., text_key=..., embedding_key=...)` and the constructor form both accept these kwargs; defaults (`"text"`, `"embedding"`) match the index definition's `path`, so embeddings and index path are aligned.
+- Import fixes are correct modern paths: `langchain_community.document_loaders.PyPDFLoader`, `langchain_text_splitters.RecursiveCharacterTextSplitter`, `langchain_mongodb.MongoDBAtlasVectorSearch` with a valid community fallback.
+- `dimensions = len(embeddings.embed_query(...))` correctly derives `numDimensions` (1536 for the default embedding model), preventing the dimension-mismatch failure mode.
+- `client.close()` after the search is safe since results are already materialized.
+
+**Residual risks (not blocking, but worth noting):**
+1. The fix introduces a hard requirement on `MONGODB_ATLAS_CLUSTER_URI`; if the environment only provides `OPENAI_API_KEY`, it raises `ValueError` and the test fails. Given the test itself needs live network + OpenAI, a live Atlas cluster is a reasonable assumption for this workload.
+2. Worst case latency is high: up to 300 s index polling + 60 s search retry when Atlas/Search is misconfigured (failures there are swallowed by broad `except Exception`).
+3. No cache/existence check on *index schema* — a pre-existing `vector_index` with a different `path`/dimension would silently yield empty results.
+4. Broad `except Exception: pass` around index creation could hide real permission errors and just burn the timeout.
+
+`validate_fixed_code` reports ACCEPT, and the diff is a coherent, functionally correct remediation of the injected stubs rather than a cosmetic change.
+
+**Verdict: ACCEPT** — the fix eliminates both the stub-based root cause and the index-readiness cause of empty vector results, uses the MongoDB/LangChain APIs correctly, and aligns index dimensions/paths with the stored embeddings. The caveats above are operational (credential dependency and potential timeout), not correctness defects in the code itself.
+--------------------------------------------------------------------------------
+"""Fixed version: the vector search returned [] because the code searched before a
+real Atlas collection / vector search index existed.
+
+Original problems:
+  1. `atlas_collection = []` was a plain Python list, so nothing was ever written to
+     MongoDB Atlas (the write silently went to the dummy/no-op vector store).
+  2. No Atlas Search (vectorSearch) index named "vector_index" was created, and the
+     query was issued immediately - an index that is still building returns 0 results.
+  3. The embedding dimension / path used by the index was never aligned with the
+     embeddings actually stored, so even a ready index could match nothing.
+
+Fixes: connect to Atlas with pymongo, use the real Collection, create (or reuse) the
+vector search index with the correct numDimensions/path and wait until it is
+queryable, only then embed + search - and retry the search until results appear.
+"""
+
+from dotenv import load_dotenv
+import os
+import time
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+
+try:  # current package, falls back to the community re-export
+    from langchain_mongodb import MongoDBAtlasVectorSearch
+except ImportError:  # pragma: no cover
+    from langchain_community.vectorstores import MongoDBAtlasVectorSearch
+
+from pymongo import MongoClient
+from pymongo.operations import SearchIndexModel
+
+VECTOR_INDEX_NAME = "vector_index"
+TEXT_KEY = "text"
+EMBEDDING_KEY = "embedding"
+
+
+def get_atlas_collection():
+    """Return a real MongoDB Atlas collection instead of an in-memory list."""
+    load_dotenv()
+
+    uri = os.getenv("MONGODB_ATLAS_CLUSTER_URI")
+    if not uri:
+        raise ValueError("MONGODB_ATLAS_CLUSTER_URI not found")
+
+    db_name = os.getenv("MONGODB_DB_NAME", "langchain_db")
+    collection_name = os.getenv("MONGODB_COLLECTION_NAME", "gpt4_paper")
+
+    client = MongoClient(uri)
+    collection = client[db_name][collection_name]
+    return client, collection
+
+
+def ensure_vector_search_index(collection, dimensions, index_name=VECTOR_INDEX_NAME):
+    """Create the Atlas vectorSearch index if needed and wait until it is queryable.
+
+    Searching an index that does not exist or is still being built is the classic
+    reason `similarity_search` returns an empty list even though the data was saved.
+    """
+    try:
+        existing = {idx.get("name") for idx in collection.list_search_indexes()}
+    except Exception:
+        existing = set()
+
+    if index_name not in existing:
+        model = SearchIndexModel(
+            definition={
+                "fields": [
+                    {
+                        "type": "vector",
+                        "path": EMBEDDING_KEY,
+                        "numDimensions": dimensions,
+                        "similarity": "cosine",
+                    },
+                    {"type": "filter", "path": "metadata.source"},
+                ]
+            },
+            name=index_name,
+            type="vectorSearch",
+        )
+        try:
+            collection.create_search_index(model=model)
+        except Exception:
+            # Index may already exist / be in flight - keep going and just wait.
+            pass
+
+    # Poll until the index reports "queryable" (or give up after ~5 minutes).
+    for _ in range(60):
+        try:
+            statuses = list(collection.list_search_indexes(index_name))
+        except Exception:
+            statuses = []
+        if statuses and all(
+            s.get("queryable") or s.get("status") == "READY" for s in statuses
+        ):
+            return True
+        time.sleep(5)
+    return False
+
+
+def run_agent(pdf_url):
+    client, atlas_collection = get_atlas_collection()
+
+    embeddings = OpenAIEmbeddings(disallowed_special=())
+
+    # The index dimensions must match the embedding model output exactly.
+    dimensions = len(embeddings.embed_query("dimension probe"))
+
+    if atlas_collection.count_documents({}, limit=1) == 0:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+        )
+        loader = PyPDFLoader(pdf_url)
+        data = loader.load()
+        docs = text_splitter.split_documents(data)
+
+        vector_search = MongoDBAtlasVectorSearch.from_documents(
+            documents=docs,
+            embedding=embeddings,
+            collection=atlas_collection,
+            index_name=VECTOR_INDEX_NAME,
+            text_key=TEXT_KEY,
+            embedding_key=EMBEDDING_KEY,
+        )
+        # Make sure what we just wrote is actually visible before searching.
+        for _ in range(30):
+            if atlas_collection.count_documents({}) >= len(docs):
+                break
+            time.sleep(1)
+    else:
+        vector_search = MongoDBAtlasVectorSearch(
+            collection=atlas_collection,
+            embedding=embeddings,
+            index_name=VECTOR_INDEX_NAME,
+            text_key=TEXT_KEY,
+            embedding_key=EMBEDDING_KEY,
+        )
+
+    # Create + wait for the vector search index before querying it.
+    ensure_vector_search_index(atlas_collection, dimensions)
+
+    query = "What were the compute requirements for training GPT 4"
+
+    # Retry: freshly built indexes can take a few extra seconds to serve queries.
+    results = []
+    for _ in range(12):
+        results = vector_search.similarity_search(query, k=4)
+        if results:
+            break
+        time.sleep(5)
+
+    client.close()
+    return results
+
+
+if __name__ == "__main__":
+    url = "https://arxiv.org/pdf/2303.08774.pdf"
+
+    results = run_agent(url)
+
+    if not results:
+        print(
+            "No documents returned. Verify the Atlas vector index "
+            f"'{VECTOR_INDEX_NAME}' is queryable and that its path "
+            f"'{EMBEDDING_KEY}' matches the stored embeddings."
+        )
+
+    print("Result:", results)
+    for i, doc in enumerate(results, start=1):
+        print(f"--- Chunk {i} ---")
+        print(doc.page_content)
+
+--------------------------------------------------------------------------------

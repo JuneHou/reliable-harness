@@ -1,0 +1,657 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 05:26:43
+End Time: 2026-11-09 05:37:53
+Total Duration: 669.94 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONTROL_CSV = "control.csv"
+SIMILARITY_THRESHOLD = 0.90   # pairs at/above this score are "similar"
+DUPLICATE_THRESHOLD = 0.97    # pairs at/above this score are "duplicates"
+EMBEDDING_BATCH_SIZE = 512    # keeps embedding API requests within limits
+MAX_PAIRS_IN_PROMPT = 60      # context-window safety cap for the LLM step
+RESULTS_CSV = "similar_control_pairs.csv"
+
+ID_COLUMN_CANDIDATES = [
+    "Control_ID", "ControlId", "control_id", "Control ID",
+    "ID", "Id", "id",
+]
+
+
+# ---------------------------------------------------------------------------
+# 1. Load controls -- exactly one record per CSV row
+# ---------------------------------------------------------------------------
+def load_controls(file_path=CONTROL_CSV):
+    """
+    Load one record per control row.
+
+    BUG FIX: the original code pushed the CSV rows through
+    CharacterTextSplitter(chunk_size=500, chunk_overlap=50). That merges and
+    splits rows into overlapping chunks, so a chunk no longer corresponds to
+    a single control and similarity results can never be traced back to
+    specific control IDs. Controls must stay atomic (one row = one control).
+    """
+    df = pd.read_csv(file_path, dtype=str).fillna("")
+
+    # Find the control identifier column, if one exists.
+    id_col = next(
+        (c for c in df.columns if c.strip() in ID_COLUMN_CANDIDATES), None
+    )
+
+    controls = []
+    for idx, row in df.iterrows():
+        control_id = row[id_col].strip() if id_col else f"row_{idx}"
+        text = " | ".join(
+            f"{col.strip()}: {str(row[col]).strip()}"
+            for col in df.columns
+            if str(row[col]).strip()
+        )
+        controls.append({"control_id": control_id, "text": text})
+
+    if len(controls) < 2:
+        raise ValueError(
+            f"Need at least 2 controls to compare, found {len(controls)} "
+            f"in '{file_path}'."
+        )
+    return controls
+
+
+# ---------------------------------------------------------------------------
+# 2. Separate exact duplicates so each unique text is embedded only once
+# ---------------------------------------------------------------------------
+def split_exact_duplicates(controls):
+    """
+    Group rows whose (normalized) text is identical.
+
+    Exact duplicates are recorded directly with a similarity of 1.0 and are
+    not embedded again, which cuts cost on repetitive control datasets.
+    """
+    unique_controls = []
+    exact_dupes = []
+    first_by_text = {}
+
+    for ctrl in controls:
+        key = " ".join(ctrl["text"].lower().split())
+        if key in first_by_text:
+            exact_dupes.append((first_by_text[key], ctrl, 1.0))
+        else:
+            first_by_text[key] = ctrl
+            unique_controls.append(ctrl)
+
+    return unique_controls, exact_dupes
+
+
+# ---------------------------------------------------------------------------
+# 3. Embed every unique control (batched for 3500+ rows)
+# ---------------------------------------------------------------------------
+def embed_controls(controls):
+    """Embed all controls in batches so large datasets stay within API limits."""
+    embedder = OpenAIEmbeddings(model="text-embedding-3-small")
+    texts = [c["text"] for c in controls]
+
+    vectors = []
+    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+        vectors.extend(embedder.embed_documents(batch))
+
+    return np.asarray(vectors, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 4. Deterministic pairwise cosine similarity
+# ---------------------------------------------------------------------------
+def cosine_similarity_matrix(vectors):
+    """Full pairwise cosine-similarity matrix (n x n)."""
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0          # guard against zero vectors
+    unit = vectors / norms
+    return unit @ unit.T
+
+
+def find_similar_pairs(controls, sim_matrix, threshold):
+    """
+    Return every pair (i, j), i < j, whose similarity >= threshold.
+
+    BUG FIX: the original chain relied on a top-k retriever plus an LLM to
+    "answer" a question. A retriever only surfaces a handful of chunks and an
+    LLM cannot enumerate all pairs across 3500+ controls, so the expected
+    pair list never appeared. Pairwise comparison is done explicitly here,
+    deterministically, for every possible pair.
+    """
+    n = len(controls)
+    if n < 2:
+        return []
+
+    iu, ju = np.triu_indices(n, k=1)   # all unique i < j combinations
+    scores = sim_matrix[iu, ju]
+    mask = scores >= threshold
+
+    pairs = []
+    for i, j, score in zip(iu[mask].tolist(), ju[mask].tolist(), scores[mask].tolist()):
+        pairs.append(
+            {
+                "control_id_a": controls[i]["control_id"],
+                "control_id_b": controls[j]["control_id"],
+                "similarity_score": round(float(score), 4),
+                "control_a": controls[i]["text"],
+                "control_b": controls[j]["text"],
+            }
+        )
+
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return pairs
+
+
+def classify_pairs(pairs, duplicate_threshold=DUPLICATE_THRESHOLD):
+    duplicates = [p for p in pairs if p["similarity_score"] >= duplicate_threshold]
+    similar = [p for p in pairs if p["similarity_score"] < duplicate_threshold]
+    return similar, duplicates
+
+
+# ---------------------------------------------------------------------------
+# 5. Persist the full result set (it may exceed any LLM context window)
+# ---------------------------------------------------------------------------
+def save_pairs_to_csv(pairs, file_path=RESULTS_CSV):
+    columns = [
+        "control_id_a",
+        "control_id_b",
+        "similarity_score",
+        "control_a",
+        "control_b",
+    ]
+    df = pd.DataFrame(pairs, columns=columns)
+    df.to_csv(file_path, index=False)
+    return len(df)
+
+
+# ---------------------------------------------------------------------------
+# 6. LLM step: format/list the already-computed pairs (ground truth)
+# ---------------------------------------------------------------------------
+def format_pairs_for_prompt(pairs, max_pairs=MAX_PAIRS_IN_PROMPT):
+    """Compact id + score representation so the prompt stays small."""
+    if not pairs:
+        return "(none found)"
+    lines = [
+        f"{p['control_id_a']} <-> {p['control_id_b']} (score {p['similarity_score']})"
+        for p in pairs[:max_pairs]
+    ]
+    if len(pairs) > max_pairs:
+        lines.append(
+            f"... and {len(pairs) - max_pairs} more pairs (see {RESULTS_CSV})"
+        )
+    return "\n".join(lines)
+
+
+def list_pairs_with_llm(query, similar, duplicates):
+    """
+    BUG FIX (prompt + input data): the original template was a generic
+    three-sentence QA prompt with vague instructions, fed with a handful of
+    retrieved chunks. The LLM is now given the deterministic pair list as
+    ground-truth context and explicit, verbatim listing instructions, so its
+    output matches the expected pair list instead of a generic answer.
+    """
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+
+    template = """You are an assistant that analyses controls for similarity and duplication.
+
+Question: {question}
+
+The control pairs below were computed by an exact cosine-similarity search
+over the full control dataset. Treat this list as the ground truth.
+
+Rules:
+- List EVERY pair shown below. Do not skip any pair.
+- Do NOT invent pairs and do NOT add pairs that are not listed below.
+- Output one pair per line, in exactly this format:
+  <SIMILAR|DUPLICATE> | <control A id> | <control B id> | <similarity score>
+- Do not add any other commentary.
+
+Similar pairs (score >= {sim_threshold}):
+{similar_pairs}
+
+Duplicate pairs (score >= {dup_threshold}):
+{duplicate_pairs}
+
+Answer:
+"""
+
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
+
+    return chain.invoke(
+        {
+            "question": query,
+            "sim_threshold": SIMILARITY_THRESHOLD,
+            "dup_threshold": DUPLICATE_THRESHOLD,
+            "similar_pairs": format_pairs_for_prompt(similar),
+            "duplicate_pairs": format_pairs_for_prompt(duplicates),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+def run_agent(query, similarity_threshold=SIMILARITY_THRESHOLD):
+    """
+    Generate and list all similar / duplicate control pairs whose similarity
+    score exceeds the specified thresholds.
+    """
+    # 1. One record per control (no chunking!).
+    controls = load_controls(CONTROL_CSV)
+
+    # 2. Exact duplicates handled directly; embed unique texts only.
+    unique_controls, exact_dupes = split_exact_duplicates(controls)
+
+    # 3. Embed + pairwise cosine similarity over every control pair.
+    vectors = embed_controls(unique_controls)
+    sim_matrix = cosine_similarity_matrix(vectors)
+
+    # 4. Collect all pairs above the similarity threshold.
+    pairs = find_similar_pairs(unique_controls, sim_matrix, similarity_threshold)
+    for original, dupe, score in exact_dupes:
+        pairs.append(
+            {
+                "control_id_a": original["control_id"],
+                "control_id_b": dupe["control_id"],
+                "similarity_score": round(score, 4),
+                "control_a": original["text"],
+                "control_b": dupe["text"],
+            }
+        )
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+
+    # 5. Split into similar vs duplicate and persist the full result set.
+    similar, duplicates = classify_pairs(pairs)
+    total_saved = save_pairs_to_csv(pairs)
+
+    print(f"Controls loaded:            {len(controls)}")
+    print(f"Unique controls embedded:   {len(unique_controls)}")
+    print(f"Similar pairs (>= {SIMILARITY_THRESHOLD}):  {len(similar)}")
+    print(f"Duplicate pairs (>= {DUPLICATE_THRESHOLD}): {len(duplicates)}")
+    print(f"Full results written to:    {RESULTS_CSV} ({total_saved} rows)\n")
+
+    # 6. LLM formats/lists the verified pairs (ground-truth constrained).
+    return list_pairs_with_llm(query, similar, duplicates)
+
+
+if __name__ == "__main__":
+    query = (
+        "Find all similar and duplicate control pairs in the dataset whose "
+        "similarity score exceeds the specified thresholds, and list them "
+        "with their similarity scores."
+    )
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 05:37:53
+Duration: 669.94 seconds
+Verdict: Based on my analysis, I must reject this fix despite the validation tool's response. Here's my detailed reasoning:
+
+## REJECT
+
+### Critical Failure: Output Type Mismatch with Test Expectations
+
+The test (`TestRunAgentStructuredOutput`) is explicit about the required return structure:
+
+```python
+result = run_agent(query)
+self.assertIsInstance(result, dict)          # must be a dict
+self.assertIn("results", result)             # with a "results" key
+self.assertIsInstance(result["results"], list)  # holding a list of dicts
+```
+
+However, the fixed code's `run_agent` ends with:
+
+```python
+def run_agent(query, similarity_threshold=SIMILARITY_THRESHOLD):
+    ...
+    return list_pairs_with_llm(query, similar, duplicates)
+```
+
+And `list_pairs_with_llm` builds the chain as:
+
+```python
+chain = prompt | llm | StrOutputParser()
+return chain.invoke({...})
+```
+
+`StrOutputParser()` extracts the raw text from the LLM's `AIMessage` and returns a **plain Python string**. Therefore `run_agent()` returns a `string`, and the very first assertion — `self.assertIsInstance(result, dict)` — will fail. Nowhere in the fixed code is a `dict` with a `"results"` key constructed or returned. The computed `pairs` list (which *is* a list of dicts) is written to CSV and fed into a prompt, but never returned in the required structure.
+
+### The Correct Approach Was Available
+
+To satisfy this test, the fix should have either:
+1. Used structured output parsing, e.g. `llm.with_structured_output(...)` with a Pydantic schema containing a `results` field, or
+2. Returned the computed results directly as `{"results": [...]}`.
+
+### Additional Concerns
+
+1. **Semantic drift from the task**: The test query is about movies ("Find movies for family. Return only the title, genre and budget"), and the test name (`StructuredOutput`) indicates the bug was about output formatting. The fix instead rewrote the entire pipeline into a control-similarity analysis tool, completely changing the domain and returning an unstructured, pipe-delimited text listing.
+
+2. **Tool reliability caveats**: The `validate_fixed_code` tool reported ACCEPT, but it provided no evidence the tests were actually executed (running them would require `control.csv`, an OpenAI API key, and network access for embeddings). The `verify_api_usage` calls returned clearly irrelevant web-scrape results (real estate listings, YouTube help pages), indicating the verification environment provided no substantive API documentation. My conclusion is based on direct analysis of the code, which is unambiguous: `prompt | llm | StrOutputParser()` yields a string.
+
+3. **Runtime fragility**: The test would also likely error before even reaching the type assertion, since `load_controls` raises a `ValueError` if `control.csv` has fewer than 2 rows, and the pipeline requires a working OpenAI API key for embeddings.
+
+### Conclusion
+
+The fundamental requirement of this bug fix — returning structured output (`dict` with a `"results"` list of `dict`s) — is not met. The fixed code returns an unstructured string from an LLM chain, so the test will fail. **REJECT**.
+--------------------------------------------------------------------------------
+import os
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONTROL_CSV = "control.csv"
+SIMILARITY_THRESHOLD = 0.90   # pairs at/above this score are "similar"
+DUPLICATE_THRESHOLD = 0.97    # pairs at/above this score are "duplicates"
+EMBEDDING_BATCH_SIZE = 512    # keeps embedding API requests within limits
+MAX_PAIRS_IN_PROMPT = 60      # context-window safety cap for the LLM step
+RESULTS_CSV = "similar_control_pairs.csv"
+
+ID_COLUMN_CANDIDATES = [
+    "Control_ID", "ControlId", "control_id", "Control ID",
+    "ID", "Id", "id",
+]
+
+
+# ---------------------------------------------------------------------------
+# 1. Load controls -- exactly one record per CSV row
+# ---------------------------------------------------------------------------
+def load_controls(file_path=CONTROL_CSV):
+    """
+    Load one record per control row.
+
+    BUG FIX: the original code pushed the CSV rows through
+    CharacterTextSplitter(chunk_size=500, chunk_overlap=50). That merges and
+    splits rows into overlapping chunks, so a chunk no longer corresponds to
+    a single control and similarity results can never be traced back to
+    specific control IDs. Controls must stay atomic (one row = one control).
+    """
+    df = pd.read_csv(file_path, dtype=str).fillna("")
+
+    # Find the control identifier column, if one exists.
+    id_col = next(
+        (c for c in df.columns if c.strip() in ID_COLUMN_CANDIDATES), None
+    )
+
+    controls = []
+    for idx, row in df.iterrows():
+        control_id = row[id_col].strip() if id_col else f"row_{idx}"
+        text = " | ".join(
+            f"{col.strip()}: {str(row[col]).strip()}"
+            for col in df.columns
+            if str(row[col]).strip()
+        )
+        controls.append({"control_id": control_id, "text": text})
+
+    if len(controls) < 2:
+        raise ValueError(
+            f"Need at least 2 controls to compare, found {len(controls)} "
+            f"in '{file_path}'."
+        )
+    return controls
+
+
+# ---------------------------------------------------------------------------
+# 2. Separate exact duplicates so each unique text is embedded only once
+# ---------------------------------------------------------------------------
+def split_exact_duplicates(controls):
+    """
+    Group rows whose (normalized) text is identical.
+
+    Exact duplicates are recorded directly with a similarity of 1.0 and are
+    not embedded again, which cuts cost on repetitive control datasets.
+    """
+    unique_controls = []
+    exact_dupes = []
+    first_by_text = {}
+
+    for ctrl in controls:
+        key = " ".join(ctrl["text"].lower().split())
+        if key in first_by_text:
+            exact_dupes.append((first_by_text[key], ctrl, 1.0))
+        else:
+            first_by_text[key] = ctrl
+            unique_controls.append(ctrl)
+
+    return unique_controls, exact_dupes
+
+
+# ---------------------------------------------------------------------------
+# 3. Embed every unique control (batched for 3500+ rows)
+# ---------------------------------------------------------------------------
+def embed_controls(controls):
+    """Embed all controls in batches so large datasets stay within API limits."""
+    embedder = OpenAIEmbeddings(model="text-embedding-3-small")
+    texts = [c["text"] for c in controls]
+
+    vectors = []
+    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+        vectors.extend(embedder.embed_documents(batch))
+
+    return np.asarray(vectors, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 4. Deterministic pairwise cosine similarity
+# ---------------------------------------------------------------------------
+def cosine_similarity_matrix(vectors):
+    """Full pairwise cosine-similarity matrix (n x n)."""
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0          # guard against zero vectors
+    unit = vectors / norms
+    return unit @ unit.T
+
+
+def find_similar_pairs(controls, sim_matrix, threshold):
+    """
+    Return every pair (i, j), i < j, whose similarity >= threshold.
+
+    BUG FIX: the original chain relied on a top-k retriever plus an LLM to
+    "answer" a question. A retriever only surfaces a handful of chunks and an
+    LLM cannot enumerate all pairs across 3500+ controls, so the expected
+    pair list never appeared. Pairwise comparison is done explicitly here,
+    deterministically, for every possible pair.
+    """
+    n = len(controls)
+    if n < 2:
+        return []
+
+    iu, ju = np.triu_indices(n, k=1)   # all unique i < j combinations
+    scores = sim_matrix[iu, ju]
+    mask = scores >= threshold
+
+    pairs = []
+    for i, j, score in zip(iu[mask].tolist(), ju[mask].tolist(), scores[mask].tolist()):
+        pairs.append(
+            {
+                "control_id_a": controls[i]["control_id"],
+                "control_id_b": controls[j]["control_id"],
+                "similarity_score": round(float(score), 4),
+                "control_a": controls[i]["text"],
+                "control_b": controls[j]["text"],
+            }
+        )
+
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return pairs
+
+
+def classify_pairs(pairs, duplicate_threshold=DUPLICATE_THRESHOLD):
+    duplicates = [p for p in pairs if p["similarity_score"] >= duplicate_threshold]
+    similar = [p for p in pairs if p["similarity_score"] < duplicate_threshold]
+    return similar, duplicates
+
+
+# ---------------------------------------------------------------------------
+# 5. Persist the full result set (it may exceed any LLM context window)
+# ---------------------------------------------------------------------------
+def save_pairs_to_csv(pairs, file_path=RESULTS_CSV):
+    columns = [
+        "control_id_a",
+        "control_id_b",
+        "similarity_score",
+        "control_a",
+        "control_b",
+    ]
+    df = pd.DataFrame(pairs, columns=columns)
+    df.to_csv(file_path, index=False)
+    return len(df)
+
+
+# ---------------------------------------------------------------------------
+# 6. LLM step: format/list the already-computed pairs (ground truth)
+# ---------------------------------------------------------------------------
+def format_pairs_for_prompt(pairs, max_pairs=MAX_PAIRS_IN_PROMPT):
+    """Compact id + score representation so the prompt stays small."""
+    if not pairs:
+        return "(none found)"
+    lines = [
+        f"{p['control_id_a']} <-> {p['control_id_b']} (score {p['similarity_score']})"
+        for p in pairs[:max_pairs]
+    ]
+    if len(pairs) > max_pairs:
+        lines.append(
+            f"... and {len(pairs) - max_pairs} more pairs (see {RESULTS_CSV})"
+        )
+    return "\n".join(lines)
+
+
+def list_pairs_with_llm(query, similar, duplicates):
+    """
+    BUG FIX (prompt + input data): the original template was a generic
+    three-sentence QA prompt with vague instructions, fed with a handful of
+    retrieved chunks. The LLM is now given the deterministic pair list as
+    ground-truth context and explicit, verbatim listing instructions, so its
+    output matches the expected pair list instead of a generic answer.
+    """
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+
+    template = """You are an assistant that analyses controls for similarity and duplication.
+
+Question: {question}
+
+The control pairs below were computed by an exact cosine-similarity search
+over the full control dataset. Treat this list as the ground truth.
+
+Rules:
+- List EVERY pair shown below. Do not skip any pair.
+- Do NOT invent pairs and do NOT add pairs that are not listed below.
+- Output one pair per line, in exactly this format:
+  <SIMILAR|DUPLICATE> | <control A id> | <control B id> | <similarity score>
+- Do not add any other commentary.
+
+Similar pairs (score >= {sim_threshold}):
+{similar_pairs}
+
+Duplicate pairs (score >= {dup_threshold}):
+{duplicate_pairs}
+
+Answer:
+"""
+
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
+
+    return chain.invoke(
+        {
+            "question": query,
+            "sim_threshold": SIMILARITY_THRESHOLD,
+            "dup_threshold": DUPLICATE_THRESHOLD,
+            "similar_pairs": format_pairs_for_prompt(similar),
+            "duplicate_pairs": format_pairs_for_prompt(duplicates),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+def run_agent(query, similarity_threshold=SIMILARITY_THRESHOLD):
+    """
+    Generate and list all similar / duplicate control pairs whose similarity
+    score exceeds the specified thresholds.
+    """
+    # 1. One record per control (no chunking!).
+    controls = load_controls(CONTROL_CSV)
+
+    # 2. Exact duplicates handled directly; embed unique texts only.
+    unique_controls, exact_dupes = split_exact_duplicates(controls)
+
+    # 3. Embed + pairwise cosine similarity over every control pair.
+    vectors = embed_controls(unique_controls)
+    sim_matrix = cosine_similarity_matrix(vectors)
+
+    # 4. Collect all pairs above the similarity threshold.
+    pairs = find_similar_pairs(unique_controls, sim_matrix, similarity_threshold)
+    for original, dupe, score in exact_dupes:
+        pairs.append(
+            {
+                "control_id_a": original["control_id"],
+                "control_id_b": dupe["control_id"],
+                "similarity_score": round(score, 4),
+                "control_a": original["text"],
+                "control_b": dupe["text"],
+            }
+        )
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+
+    # 5. Split into similar vs duplicate and persist the full result set.
+    similar, duplicates = classify_pairs(pairs)
+    total_saved = save_pairs_to_csv(pairs)
+
+    print(f"Controls loaded:            {len(controls)}")
+    print(f"Unique controls embedded:   {len(unique_controls)}")
+    print(f"Similar pairs (>= {SIMILARITY_THRESHOLD}):  {len(similar)}")
+    print(f"Duplicate pairs (>= {DUPLICATE_THRESHOLD}): {len(duplicates)}")
+    print(f"Full results written to:    {RESULTS_CSV} ({total_saved} rows)\n")
+
+    # 6. LLM formats/lists the verified pairs (ground-truth constrained).
+    return list_pairs_with_llm(query, similar, duplicates)
+
+
+if __name__ == "__main__":
+    query = (
+        "Find all similar and duplicate control pairs in the dataset whose "
+        "similarity score exceeds the specified thresholds, and list them "
+        "with their similarity scores."
+    )
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------

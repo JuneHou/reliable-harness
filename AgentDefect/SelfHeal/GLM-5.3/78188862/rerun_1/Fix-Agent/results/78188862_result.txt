@@ -1,0 +1,412 @@
+Case ID: 78188862
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 06:52:36
+End Time: 2026-11-09 07:04:22
+Total Duration: 705.89 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import uuid
+from datetime import datetime
+from dotenv import load_dotenv
+import chromadb
+from chromadb.utils import embedding_functions
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+
+
+load_dotenv()
+
+
+config = {
+    "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")
+}
+
+class configs:
+    EMBEDDINGS_MODEL = "text-embedding-3-small"
+
+
+class MockPDFFile:
+    def __init__(self, filepath, filename):
+        self.filepath = filepath
+        self.filename = filename
+
+
+def read_docs(pdf_file):
+    pdf_loader = PyPDFLoader(pdf_file.filepath)
+    pdf_documents = pdf_loader.load()
+
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    documents = text_splitter.split_documents(pdf_documents)
+
+    return documents
+
+
+def generate_and_store_embeddings(documents, pdf_file, user_id):
+    client = chromadb.PersistentClient(path="./trained_db")
+    collection = client.get_or_create_collection(
+        "PDF_Embeddings",
+        embedding_function=embedding_functions.OpenAIEmbeddingFunction(
+            api_key=config["OPENAI_API_KEY"],
+            model_name=configs.EMBEDDINGS_MODEL
+        )
+    )
+    now = datetime.now()
+
+    # ----------------------------------------------------------------------
+    # FIX 1 (root cause of the wrong output):
+    # The old code passed the metadata via `collection_metadata=`, which only
+    # attaches metadata to the *collection itself*.  A `where={"source": ...}`
+    # filter in `vectordb.get()` / `collection.get()` matches *per-document*
+    # metadata, so the filter never matched anything and result["ids"] came
+    # back empty even though the PDF was stored.
+    # -> Write the metadata onto every single document (chunk) instead.
+    #
+    # FIX 2: PyPDFLoader sets `source` on each chunk to the *full file path*
+    # (e.g. "docs/report.pdf"), but the later filter uses the *file name*
+    # (e.g. "report.pdf").  Overwrite `source` with the file name so that
+    # `where={"source": filename}` really matches this PDF's embeddings.
+    # ----------------------------------------------------------------------
+    doc_metadata = {
+        "source": pdf_file.filename,
+        "user": str(user_id),
+        "created_at": now.strftime("%d/%m/%Y %H:%M:%S"),
+    }
+    for doc in documents:
+        doc.metadata.update(doc_metadata)
+
+    ids = [str(uuid.uuid4()) for _ in range(len(documents))]
+
+    try:
+        vectordb = Chroma.from_documents(
+                    documents,
+                    embedding=OpenAIEmbeddings(
+                        openai_api_key=config["OPENAI_API_KEY"],
+                        model=configs.EMBEDDINGS_MODEL
+                    ),
+                    persist_directory='./trained_db',
+                    collection_name=collection.name,
+                    client=client,
+                    ids=ids,
+                )
+        # PersistentClient already flushes everything to disk; `persist()` is
+        # deprecated/removed in newer versions, so only call it if available.
+        if hasattr(vectordb, "persist"):
+            try:
+                vectordb.persist()
+            except Exception:
+                pass
+
+    except Exception as err:
+        print(f"An error occured: {err=}, {type(err)=}")
+        return {"answer": "An error occured while generating embeddings. Please check terminal for more details."}
+    return vectordb
+
+
+def get_embeddings_for_pdf(vectordb, filename, user_id=None):
+    """
+    Retrieve ONLY the ids + metadata of the embeddings that belong to a given
+    PDF file, instead of fetching every id/metadata pair of the whole
+    collection.
+
+    `include=["metadatas"]` makes ChromaDB return just ids and metadata
+    (no documents, no embedding vectors), which is exactly what is needed
+    in order to delete them afterwards.
+    """
+    where = {"source": filename}
+    if user_id is not None:
+        where = {"$and": [{"source": filename}, {"user": str(user_id)}]}
+    return vectordb.get(where=where, include=["metadatas"])
+
+
+def delete_embeddings_for_pdf(vectordb, filename, user_id=None):
+    """Delete all embeddings belonging to a given PDF file (optionally per user)."""
+    result = get_embeddings_for_pdf(vectordb, filename, user_id=user_id)
+    if result["ids"]:
+        vectordb.delete(ids=result["ids"])
+    return result["ids"]
+
+
+def run_agent(pdf_path, user_id):
+
+    pdf_file = MockPDFFile(pdf_path, os.path.basename(pdf_path))
+
+    documents = read_docs(pdf_file)
+    print(f"    ✓ Loaded {len(documents)} document chunks")
+
+    vectordb = generate_and_store_embeddings(documents, pdf_file, user_id)
+
+    if isinstance(vectordb, dict):
+        return None, pdf_file.filename
+
+    return vectordb, pdf_file.filename
+
+
+if __name__ == "__main__":
+
+    pdf_path = None
+    user_id = "test_user_123"
+
+    if os.path.exists("docs"):
+        for file in os.listdir("docs"):
+            if file.endswith(".pdf"):
+                pdf_path = os.path.join("docs", file)
+                break
+
+    if not pdf_path:
+        print("No PDF file found in docs folder")
+        exit(1)
+
+    vectordb, filename = run_agent(pdf_path, user_id)
+
+    if vectordb is None:
+        print("Agent failed to create embeddings")
+        exit(1)
+
+    # ----------------------------------------------------------------------
+    # FIX 3: query with a `where` filter on the per-document metadata that is
+    # now actually stored, and ask only for ids + metadata.  This returns
+    # exactly the embeddings of *this* PDF file (the ones that were just
+    # added), not all entries of the collection.
+    # ----------------------------------------------------------------------
+    result = get_embeddings_for_pdf(vectordb, filename, user_id=user_id)
+
+    # `result` is a dict like {"ids": [...], "metadatas": [...]}:
+    #   - len(result)        -> number of *keys* in the result dict (2)
+    #   - len(result["ids"]) -> number of matching embeddings (all chunks of
+    #                            this PDF, e.g. equal to the number of chunks
+    #                            printed by run_agent)
+    print(len(result))
+    print(len(result['ids']))
+
+    for doc_id, meta in zip(result["ids"], result["metadatas"]):
+        print(f"  {doc_id} -> {meta}")
+
+    # To remove these embeddings again:
+    # deleted = delete_embeddings_for_pdf(vectordb, filename, user_id=user_id)
+    # print(f"Deleted {len(deleted)} embeddings of '{filename}'")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 07:04:22
+Duration: 705.89 seconds
+Verdict: The verification tool only returned general framework documentation without specific signature details, so I'll complete the analysis based on the diff, structural validation results, and my knowledge of these APIs.
+
+## Analysis
+
+**Root cause of the bug (correctly identified):**
+The buggy code passed metadata via `collection_metadata=` to `Chroma.from_documents()`. That parameter attaches metadata to the *collection object itself*, while `vectordb.get(where={"source": filename})` filters on *per-document* metadata. Additionally, even if per-document metadata existed, `PyPDFLoader` sets each chunk's `source` to the **full file path** (e.g., `./docs/test.pdf`), but the filter used `os.path.basename(pdf_path)` (e.g., `test.pdf`). Both issues guaranteed an empty `result["ids"]`, failing `assertGreater(len(result["ids"]), 0)`.
+
+**Verification of the fix:**
+
+1. **FIX 1 & 2 — Per-document metadata:** `doc.metadata.update(doc_metadata)` writes `source` (filename), `user`, and `created_at` onto every chunk before `from_documents()`. LangChain's `Chroma.from_documents` → `add_documents` uses each `Document.metadata` as the per-document metadata in ChromaDB, so the `where={"source": filename}` filter now matches. All values are strings, which are valid ChromaDB metadata types. ✅
+
+2. **`Chroma.from_documents(..., ids=ids, collection_name=..., client=..., persist_directory=...)`:** All parameters are valid in `langchain_community`'s Chroma wrapper; removing `collection_metadata` is appropriate since it wasn't serving the filtering purpose. ✅
+
+3. **`get_embeddings_for_pdf`:** `vectordb.get(where=..., include=["metadatas"])` — LangChain's `Chroma.get` accepts `where` and `include` and forwards them to the underlying collection; ids are always returned. The `{"$and": [...]}` compound filter is a valid ChromaDB `where` operator syntax. ✅
+
+4. **`vectordb.delete(ids=result["ids"])`:** Valid signature for `Chroma.delete`. ✅
+
+5. **`persist()` guard:** `Chroma.persist()` was deprecated/removed in newer `langchain_community` versions. The `hasattr` + try/except guard is defensive and correct — with `PersistentClient`, data is flushed to disk automatically anyway. ✅
+
+6. **Test compatibility:** `run_agent` returns `(vectordb, filename)` where vectordb is non-None on success; the test's direct call `vectordb.get(where={"source": filename})` now matches the newly inserted chunks, so `len(result["ids"]) > 0` holds. The client/collection/embedding setup is unchanged from the original (no new risks introduced).
+
+7. **Structural validation** returned ACCEPT, confirming the fixed code matches expected structure and output format.
+
+**Verdict: ACCEPT**
+
+The fix correctly addresses the root cause (collection-level vs. per-document metadata) and the secondary filename/path mismatch, uses valid ChromaDB/LangChain API constructs, defensively handles the removed `persist()` method, and adds clean helper functions for filtered retrieval and deletion. The test `test_should_return_ids_for_specific_pdf` will pass because per-document `source` metadata now equals the filename used in the where filter.
+--------------------------------------------------------------------------------
+import os
+import uuid
+from datetime import datetime
+from dotenv import load_dotenv
+import chromadb
+from chromadb.utils import embedding_functions
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+
+
+load_dotenv()
+
+
+config = {
+    "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")
+}
+
+class configs:
+    EMBEDDINGS_MODEL = "text-embedding-3-small"
+
+
+class MockPDFFile:
+    def __init__(self, filepath, filename):
+        self.filepath = filepath
+        self.filename = filename
+
+
+def read_docs(pdf_file):
+    pdf_loader = PyPDFLoader(pdf_file.filepath)
+    pdf_documents = pdf_loader.load()
+
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    documents = text_splitter.split_documents(pdf_documents)
+
+    return documents
+
+
+def generate_and_store_embeddings(documents, pdf_file, user_id):
+    client = chromadb.PersistentClient(path="./trained_db")
+    collection = client.get_or_create_collection(
+        "PDF_Embeddings",
+        embedding_function=embedding_functions.OpenAIEmbeddingFunction(
+            api_key=config["OPENAI_API_KEY"],
+            model_name=configs.EMBEDDINGS_MODEL
+        )
+    )
+    now = datetime.now()
+
+    # ----------------------------------------------------------------------
+    # FIX 1 (root cause of the wrong output):
+    # The old code passed the metadata via `collection_metadata=`, which only
+    # attaches metadata to the *collection itself*.  A `where={"source": ...}`
+    # filter in `vectordb.get()` / `collection.get()` matches *per-document*
+    # metadata, so the filter never matched anything and result["ids"] came
+    # back empty even though the PDF was stored.
+    # -> Write the metadata onto every single document (chunk) instead.
+    #
+    # FIX 2: PyPDFLoader sets `source` on each chunk to the *full file path*
+    # (e.g. "docs/report.pdf"), but the later filter uses the *file name*
+    # (e.g. "report.pdf").  Overwrite `source` with the file name so that
+    # `where={"source": filename}` really matches this PDF's embeddings.
+    # ----------------------------------------------------------------------
+    doc_metadata = {
+        "source": pdf_file.filename,
+        "user": str(user_id),
+        "created_at": now.strftime("%d/%m/%Y %H:%M:%S"),
+    }
+    for doc in documents:
+        doc.metadata.update(doc_metadata)
+
+    ids = [str(uuid.uuid4()) for _ in range(len(documents))]
+
+    try:
+        vectordb = Chroma.from_documents(
+                    documents,
+                    embedding=OpenAIEmbeddings(
+                        openai_api_key=config["OPENAI_API_KEY"],
+                        model=configs.EMBEDDINGS_MODEL
+                    ),
+                    persist_directory='./trained_db',
+                    collection_name=collection.name,
+                    client=client,
+                    ids=ids,
+                )
+        # PersistentClient already flushes everything to disk; `persist()` is
+        # deprecated/removed in newer versions, so only call it if available.
+        if hasattr(vectordb, "persist"):
+            try:
+                vectordb.persist()
+            except Exception:
+                pass
+
+    except Exception as err:
+        print(f"An error occured: {err=}, {type(err)=}")
+        return {"answer": "An error occured while generating embeddings. Please check terminal for more details."}
+    return vectordb
+
+
+def get_embeddings_for_pdf(vectordb, filename, user_id=None):
+    """
+    Retrieve ONLY the ids + metadata of the embeddings that belong to a given
+    PDF file, instead of fetching every id/metadata pair of the whole
+    collection.
+
+    `include=["metadatas"]` makes ChromaDB return just ids and metadata
+    (no documents, no embedding vectors), which is exactly what is needed
+    in order to delete them afterwards.
+    """
+    where = {"source": filename}
+    if user_id is not None:
+        where = {"$and": [{"source": filename}, {"user": str(user_id)}]}
+    return vectordb.get(where=where, include=["metadatas"])
+
+
+def delete_embeddings_for_pdf(vectordb, filename, user_id=None):
+    """Delete all embeddings belonging to a given PDF file (optionally per user)."""
+    result = get_embeddings_for_pdf(vectordb, filename, user_id=user_id)
+    if result["ids"]:
+        vectordb.delete(ids=result["ids"])
+    return result["ids"]
+
+
+def run_agent(pdf_path, user_id):
+
+    pdf_file = MockPDFFile(pdf_path, os.path.basename(pdf_path))
+
+    documents = read_docs(pdf_file)
+    print(f"    ✓ Loaded {len(documents)} document chunks")
+
+    vectordb = generate_and_store_embeddings(documents, pdf_file, user_id)
+
+    if isinstance(vectordb, dict):
+        return None, pdf_file.filename
+
+    return vectordb, pdf_file.filename
+
+
+if __name__ == "__main__":
+
+    pdf_path = None
+    user_id = "test_user_123"
+
+    if os.path.exists("docs"):
+        for file in os.listdir("docs"):
+            if file.endswith(".pdf"):
+                pdf_path = os.path.join("docs", file)
+                break
+
+    if not pdf_path:
+        print("No PDF file found in docs folder")
+        exit(1)
+
+    vectordb, filename = run_agent(pdf_path, user_id)
+
+    if vectordb is None:
+        print("Agent failed to create embeddings")
+        exit(1)
+
+    # ----------------------------------------------------------------------
+    # FIX 3: query with a `where` filter on the per-document metadata that is
+    # now actually stored, and ask only for ids + metadata.  This returns
+    # exactly the embeddings of *this* PDF file (the ones that were just
+    # added), not all entries of the collection.
+    # ----------------------------------------------------------------------
+    result = get_embeddings_for_pdf(vectordb, filename, user_id=user_id)
+
+    # `result` is a dict like {"ids": [...], "metadatas": [...]}:
+    #   - len(result)        -> number of *keys* in the result dict (2)
+    #   - len(result["ids"]) -> number of matching embeddings (all chunks of
+    #                            this PDF, e.g. equal to the number of chunks
+    #                            printed by run_agent)
+    print(len(result))
+    print(len(result['ids']))
+
+    for doc_id, meta in zip(result["ids"], result["metadatas"]):
+        print(f"  {doc_id} -> {meta}")
+
+    # To remove these embeddings again:
+    # deleted = delete_embeddings_for_pdf(vectordb, filename, user_id=user_id)
+    # print(f"Deleted {len(deleted)} embeddings of '{filename}'")
+
+--------------------------------------------------------------------------------

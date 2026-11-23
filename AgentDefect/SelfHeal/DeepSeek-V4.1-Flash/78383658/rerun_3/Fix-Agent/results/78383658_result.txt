@@ -1,0 +1,807 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 18:42:53
+End Time: 2026-11-05 18:46:09
+Total Duration: 195.94 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Find similar / duplicate control pairs with similarity scores and thresholds.
+
+Why the original script did not produce the expected list of pairs:
+
+1. It asked a *question-answering* question of a *single* retrieved context
+   (`vectorstore.as_retriever()` returns the top-k chunks most similar to the
+   query text - it never compares controls against each other), then the prompt
+   ("answer in three sentences max, say you don't know") told the model to
+   answer briefly instead of emitting a structured list.
+2. A pair-level result needs pair-level inputs. Nothing in the pipeline ever
+   built a (control_a, control_b, score) tuple, so no prompt could have
+   produced one reliably.
+3. The scores were also wrong in kind: `as_retriever()` gives no scores at all,
+   and the raw Chroma `similarity_search_with_score` returns a *distance*
+   (lower == more similar) using L2 by default, so any "threshold" test was
+   inverted.
+4. `CharacterTextSplitter(chunk_size=500)` was applied to already-atomic CSV
+   rows. `CharacterTextSplitter` splits on "\\n\\n" first; CSVLoader rows do not
+   contain that separator, so rows were chopped mid-record and the
+   Name/Description pairs the user wants to compare got separated.
+
+The fix below:
+  * keeps one document per CSV row (no lossy chunking),
+  * embeds each control once and computes the full cosine-similarity matrix so
+    every candidate pair with a real similarity score can be reported
+    deterministically,
+  * classifies each pair into a threshold bucket ("duplicate" / "similar"),
+  * finally asks the LLM only to review/justify the already-computed pairs,
+    using an explicit prompt with an exact JSON output contract (and the LLM
+    answer is validated against the computed scores, so it cannot invent
+    pairs or numbers),
+  * also demonstrates per-control retrieval with cosine relevance scores and a
+    score threshold (the correct way to use Chroma for this task).
+"""
+
+import csv
+import json
+import os
+import re
+
+import numpy as np
+from dotenv import load_dotenv
+
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+load_dotenv()
+
+CSV_PATH = os.getenv("CONTROL_CSV_PATH", "control.csv")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+# Similarity thresholds (cosine similarity, 0..1: 1 == identical text)
+SIMILAR_THRESHOLD = float(os.getenv("SIMILAR_THRESHOLD", "0.80"))
+DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.95"))
+TOP_K = int(os.getenv("TOP_K", "5"))
+MAX_PAIRS_FOR_LLM = int(os.getenv("MAX_PAIRS_FOR_LLM", "200"))
+
+_NAME_KEYS = ("name", "control_name", "title", "control", "requirement")
+_DESC_KEYS = ("description", "desc", "control_description", "statement", "text", "details")
+_ID_KEYS = ("id", "control_id", "identifier", "control_number", "number")
+
+
+# --------------------------------------------------------------------------- #
+# 1. Load the CSV as one atomic document per control row
+# --------------------------------------------------------------------------- #
+def _pick(field_map, candidates):
+    for candidate in candidates:
+        if candidate in field_map:
+            return field_map[candidate]
+    return None
+
+
+def load_controls(csv_path=CSV_PATH):
+    """Read control.csv and build one record/document per row (row == control)."""
+    controls = []
+    with open(csv_path, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        field_map = {(f or "").strip().lower(): f for f in (reader.fieldnames or [])}
+        name_key = _pick(field_map, _NAME_KEYS)
+        desc_key = _pick(field_map, _DESC_KEYS)
+        id_key = _pick(field_map, _ID_KEYS)
+
+        for idx, row in enumerate(reader, start=1):
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            name = (row.get(name_key) or "").strip() if name_key else ""
+            description = (row.get(desc_key) or "").strip() if desc_key else ""
+            control_id = (row.get(id_key) or "").strip() if id_key else ""
+            control_id = control_id or f"control-{idx}"
+            name = name or control_id
+
+            # Name and Description must stay together: no lossy chunking here.
+            text = (
+                f"Control ID: {control_id}\n"
+                f"Name: {name}\n"
+                f"Description: {description}"
+            ).strip()
+
+            controls.append(
+                {
+                    "id": control_id,
+                    "name": name,
+                    "description": description,
+                    "text": text,
+                }
+            )
+
+    if not controls:
+        raise ValueError(f"No controls could be loaded from {csv_path!r}")
+    return controls
+
+
+def controls_to_documents(controls):
+    return [
+        Document(page_content=c["text"], metadata={"id": c["id"], "name": c["name"]})
+        for c in controls
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# 2. Pairwise similarity (this is what actually yields the expected list)
+# --------------------------------------------------------------------------- #
+def embed_controls(controls, embeddings):
+    """Embed every control once and return L2-normalized vectors."""
+    vectors = embeddings.embed_documents([c["text"] for c in controls])
+    matrix = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return matrix / norms
+
+
+def classify(score):
+    if score >= DUPLICATE_THRESHOLD:
+        return "duplicate", DUPLICATE_THRESHOLD
+    if score >= SIMILAR_THRESHOLD:
+        return "similar", SIMILAR_THRESHOLD
+    return None, None
+
+
+def find_candidate_pairs(
+    controls,
+    unit_vectors,
+    similar_threshold=SIMILAR_THRESHOLD,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+):
+    """All unordered control pairs whose cosine similarity clears a threshold."""
+    similarity_matrix = unit_vectors @ unit_vectors.T
+    pairs = []
+    for i in range(len(controls)):
+        for j in range(i + 1, len(controls)):
+            score = round(float(similarity_matrix[i, j]), 4)
+            if score >= duplicate_threshold:
+                relationship, threshold_used = "duplicate", duplicate_threshold
+            elif score >= similar_threshold:
+                relationship, threshold_used = "similar", similar_threshold
+            else:
+                continue
+            pairs.append(
+                {
+                    "control_1_id": controls[i]["id"],
+                    "control_1": controls[i]["name"],
+                    "control_2_id": controls[j]["id"],
+                    "control_2": controls[j]["name"],
+                    "similarity_score": score,
+                    "threshold": threshold_used,
+                    "relationship": relationship,
+                }
+            )
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return pairs
+
+
+# --------------------------------------------------------------------------- #
+# 3. Prompt that is actually appropriate for this task
+# --------------------------------------------------------------------------- #
+PROMPT_TEMPLATE = """You are a security/compliance control analyst. You compare control statements to decide which ones are similar and which ones are duplicates.
+
+The candidate pairs have ALREADY been computed for you with cosine similarity on the control embeddings. Each candidate carries its numeric similarity_score and its threshold bucket:
+- relationship "duplicate" means similarity_score >= {duplicate_threshold}
+- relationship "similar"  means similarity_score >= {similar_threshold} and < {duplicate_threshold}
+
+Your task: keep the candidate pairs that are genuinely about the same requirement, and for each of them explain in one short sentence why.
+
+Strict rules:
+1. Only report pairs that appear in the "Candidate pairs" section. Never invent a control, a pair or a score.
+2. Copy similarity_score and threshold exactly as given (do not re-estimate them).
+3. Sort the result by similarity_score, highest first.
+4. If no candidate pairs are relevant, return an empty JSON array: []
+5. Reply with a JSON array ONLY - no prose, no markdown code fences.
+
+Every element of the array must have exactly these keys:
+"control_1" (string), "control_2" (string), "similarity_score" (number), "threshold" (number), "relationship" ("duplicate" or "similar"), "reason" (string).
+
+Question: {question}
+
+Candidate pairs:
+{context}
+
+JSON:
+"""
+
+
+def _message_text(message):
+    if isinstance(message, str):
+        return message
+    content = getattr(message, "content", message)
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content)
+
+
+def extract_json_array(raw_text):
+    text = _message_text(raw_text).strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def reconcile_with_computed(llm_pairs, computed_pairs):
+    """Trust the computed numbers, not the model's: match names back to the pairs."""
+    index = {}
+    for pair in computed_pairs:
+        index[(pair["control_1"], pair["control_2"])] = pair
+        index[(pair["control_2"], pair["control_1"])] = pair
+
+    reconciled = []
+    for item in llm_pairs:
+        if not isinstance(item, dict):
+            continue
+        pair = index.get((item.get("control_1"), item.get("control_2")))
+        if pair is None:
+            continue
+        reconciled.append({**pair, "reason": str(item.get("reason", "")).strip()})
+
+    if not reconciled:  # model ignored the contract -> fall back to computed pairs
+        return [{**pair, "reason": ""} for pair in computed_pairs]
+    return reconciled
+
+
+def review_pairs(question, pairs, llm):
+    """LLM pass over the pre-computed pairs (uses an explicit output contract)."""
+    context = json.dumps(pairs[:MAX_PAIRS_FOR_LLM], indent=1)
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    prompt = prompt.partial(
+        similar_threshold=SIMILAR_THRESHOLD,
+        duplicate_threshold=DUPLICATE_THRESHOLD,
+    )
+    chain = (
+        {"context": lambda _question: context, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    raw_answer = chain.invoke(question)
+    return raw_answer, reconcile_with_computed(extract_json_array(raw_answer), pairs)
+
+
+# --------------------------------------------------------------------------- #
+# 4. Per-control retrieval with real similarity scores (cosine space)
+# --------------------------------------------------------------------------- #
+def build_vectorstore(controls, embeddings):
+    store = Chroma(
+        collection_name="controls",
+        embedding_function=embeddings,
+        collection_metadata={"hnsw:space": "cosine"},  # similarity, not L2 distance
+    )
+    store.add_documents(controls_to_documents(controls))
+    return store
+
+
+def similar_controls_for(control, store, k=TOP_K):
+    hits = store.similarity_search_with_relevance_scores(control["text"], k=k + 1)
+    results = []
+    for doc, score in hits:
+        if doc.metadata.get("id") == control["id"]:
+            continue
+        score = round(float(score), 4)
+        if score < SIMILAR_THRESHOLD:
+            continue
+        relationship, threshold_used = classify(score)
+        results.append(
+            {
+                "control": doc.metadata.get("name"),
+                "similarity_score": score,
+                "threshold": threshold_used,
+                "relationship": relationship,
+            }
+        )
+    return results[:k]
+
+
+# --------------------------------------------------------------------------- #
+# 5. Agent entry point
+# --------------------------------------------------------------------------- #
+def run_agent(
+    query="List the control pairs that are similar or duplicates, using each control's Name and Description.",
+    control_name=None,
+):
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    llm = ChatOpenAI(temperature=0, model=LLM_MODEL)
+
+    controls = load_controls()
+    unit_vectors = embed_controls(controls, embeddings)
+    computed_pairs = find_candidate_pairs(controls, unit_vectors)
+
+    raw_answer, pairs = review_pairs(query, computed_pairs, llm)
+
+    result = {
+        "question": query,
+        "thresholds": {
+            "similar": SIMILAR_THRESHOLD,
+            "duplicate": DUPLICATE_THRESHOLD,
+        },
+        "pair_count": len(pairs),
+        "pairs": pairs,
+    }
+
+    # Optional: same information from the retrieval side for one control.
+    if control_name:
+        store = build_vectorstore(controls, embeddings)
+        match = next(
+            (c for c in controls if c["name"].lower() == control_name.lower()),
+            None,
+        )
+        if match is None:
+            result["retrieval"] = {"error": f"{control_name!r} not found in {CSV_PATH}"}
+        else:
+            result["retrieval"] = {
+                "control": match["name"],
+                "matches": similar_controls_for(match, store),
+            }
+
+    if not pairs:
+        result["note"] = (
+            "No pair reached the similarity threshold "
+            f"({SIMILAR_THRESHOLD}); lower SIMILAR_THRESHOLD or check that the CSV "
+            "really contains Name/Description columns."
+        )
+
+    return result
+
+
+if __name__ == "__main__":
+    query = (
+        "Find controls that are similar or duplicates, combining their Name and "
+        "Description, and report each pair with its similarity score and threshold."
+    )
+    result = run_agent(query)
+    print(json.dumps(result, indent=2))
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 18:46:09
+Duration: 195.94 seconds
+Verdict: ## Evaluation of Case 78383658
+
+### 1. What changed (diff summary)
+The fix is a full rewrite of the module rather than a small patch:
+
+- **Data loading**: `CSVLoader` + `CharacterTextSplitter` replaced with a plain `csv.DictReader` (`load_controls`) that keeps one atomic record per row (the docstring correctly explains that `CharacterTextSplitter` splits on `\n\n`, which CSV rows don't contain, so rows were being chopped mid-record).
+- **Retrieval/scoring**: instead of `as_retriever()` (which yields no scores), it embeds all controls once (`embed_controls`, L2-normalized) and computes a full cosine similarity matrix (`find_candidate_pairs`), classifying pairs into `"duplicate"` / `"similar"` buckets by configurable thresholds.
+- **Prompting**: the "answer in three sentences / say you don't know" QA prompt is replaced by a JSON-contract prompt, and the LLM answer is reconciled against the pre-computed pairs (`reconcile_with_computed`) so the model cannot invent pairs or numbers.
+- **Imports modernized**: `langchain_chroma.Chroma`, `langchain_core.*`, `langchain_openai.{ChatOpenAI, OpenAIEmbeddings}` — all correct, current module paths.
+- **Return type** changed from `str` to `dict`, with `json.dumps` in `__main__`.
+
+The API usages I spot-checked are legitimate: `Chroma.similarity_search_with_relevance_scores` exists and returns `(Document, score)` with scores in `[0, 1]`; `ChatPromptTemplate.partial` and `OpenAIEmbeddings.embed_documents` are valid; `collection_metadata={"hnsw:space": "cosine"}` is the documented way to switch Chroma to cosine space.
+
+### 2. Structural validation
+`validate_fixed_code` reports **ACCEPT**.
+
+### 3. The decisive problem: the output contract does not match the test
+The test in this case is explicit:
+
+```python
+self.assertIsInstance(result, dict)
+self.assertIn("results", result)          # <-- top-level "results" key
+self.assertIsInstance(result["results"], list)
+for item in result["results"]:
+    self.assertIsInstance(item, dict)
+```
+
+The fixed `run_agent` returns:
+
+```python
+result = {
+    "question": query,
+    "thresholds": {"similar": ..., "duplicate": ...},
+    "pair_count": len(pairs),
+    "pairs": pairs,                # <-- pairs, NOT results
+}
+```
+
+There is **no `"results"` key** anywhere in the returned dict. The only occurrences of the identifier `results` in the new code are a *local variable* inside `similar_controls_for`, which is tucked under `result["retrieval"]["matches"]` and only when `control_name` is truthy. Therefore:
+
+- `self.assertIn("results", result)` → **fails**
+- `result["results"]` → **KeyError**
+
+So despite the structural validator's ACCEPT, the fixed code does not satisfy the stated test expectations. The bug ("returns a string instead of structured data") was partially addressed — the return is now a `dict` — but the specific contract the test encodes was never met.
+
+### 4. Additional concerns
+- **Semantic drift from the test query.** The test calls `run_agent("Find movies for family. Return only the title, genre and budget.")`, but the rewrite is hard-wired to a controls/duplicates domain (`CSV_PATH = "control.csv"`, `_NAME_KEYS`/`_DESC_KEYS` control-oriented, prompt about "security/compliance control analyst"). The `query` is only echoed and injected into the LLM prompt; the returned data shape is entirely independent of it. Even if the key were renamed, the result would be control pairs rather than movie records with `title`/`genre`/`budget`.
+- **`similarity_search_with_relevance_scores` on cosine space is risky.** With `hnsw:space="cosine"` distances lie in `[0, 2]`; the LangChain relevance wrapper computes `1 - distance`, which can be negative and trips the "relevance scores must be between 0 and 1" guard in some versions. This path only executes when `control_name` is passed (not in the test), so it's a latent bug rather than the blocking one.
+- **No graceful degradation on LLM/JSON failure.** `extract_json_array` swallows `JSONDecodeError` and returns `[]`, after which `reconcile_with_computed` falls back to computed pairs — that part is actually good defensive design.
+
+### Verdict
+
+The rewrite is well-motivated, arguably better engineering than the original, and its LangChain API usage is sound. But the task is to evaluate the fix **against this case's test expectations**, and it fails them at the very first assertion: the required top-level `"results"` list-of-dicts key is absent (the payload lives under `"pairs"`), so `run_agent` raises `KeyError` under the test. A one-line rename (`"results": pairs`) plus aligning the key naming with the expected payload would likely be sufficient — but as submitted, the case is not fixed.
+
+**REJECT**
+--------------------------------------------------------------------------------
+"""Find similar / duplicate control pairs with similarity scores and thresholds.
+
+Why the original script did not produce the expected list of pairs:
+
+1. It asked a *question-answering* question of a *single* retrieved context
+   (`vectorstore.as_retriever()` returns the top-k chunks most similar to the
+   query text - it never compares controls against each other), then the prompt
+   ("answer in three sentences max, say you don't know") told the model to
+   answer briefly instead of emitting a structured list.
+2. A pair-level result needs pair-level inputs. Nothing in the pipeline ever
+   built a (control_a, control_b, score) tuple, so no prompt could have
+   produced one reliably.
+3. The scores were also wrong in kind: `as_retriever()` gives no scores at all,
+   and the raw Chroma `similarity_search_with_score` returns a *distance*
+   (lower == more similar) using L2 by default, so any "threshold" test was
+   inverted.
+4. `CharacterTextSplitter(chunk_size=500)` was applied to already-atomic CSV
+   rows. `CharacterTextSplitter` splits on "\\n\\n" first; CSVLoader rows do not
+   contain that separator, so rows were chopped mid-record and the
+   Name/Description pairs the user wants to compare got separated.
+
+The fix below:
+  * keeps one document per CSV row (no lossy chunking),
+  * embeds each control once and computes the full cosine-similarity matrix so
+    every candidate pair with a real similarity score can be reported
+    deterministically,
+  * classifies each pair into a threshold bucket ("duplicate" / "similar"),
+  * finally asks the LLM only to review/justify the already-computed pairs,
+    using an explicit prompt with an exact JSON output contract (and the LLM
+    answer is validated against the computed scores, so it cannot invent
+    pairs or numbers),
+  * also demonstrates per-control retrieval with cosine relevance scores and a
+    score threshold (the correct way to use Chroma for this task).
+"""
+
+import csv
+import json
+import os
+import re
+
+import numpy as np
+from dotenv import load_dotenv
+
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+load_dotenv()
+
+CSV_PATH = os.getenv("CONTROL_CSV_PATH", "control.csv")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+# Similarity thresholds (cosine similarity, 0..1: 1 == identical text)
+SIMILAR_THRESHOLD = float(os.getenv("SIMILAR_THRESHOLD", "0.80"))
+DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.95"))
+TOP_K = int(os.getenv("TOP_K", "5"))
+MAX_PAIRS_FOR_LLM = int(os.getenv("MAX_PAIRS_FOR_LLM", "200"))
+
+_NAME_KEYS = ("name", "control_name", "title", "control", "requirement")
+_DESC_KEYS = ("description", "desc", "control_description", "statement", "text", "details")
+_ID_KEYS = ("id", "control_id", "identifier", "control_number", "number")
+
+
+# --------------------------------------------------------------------------- #
+# 1. Load the CSV as one atomic document per control row
+# --------------------------------------------------------------------------- #
+def _pick(field_map, candidates):
+    for candidate in candidates:
+        if candidate in field_map:
+            return field_map[candidate]
+    return None
+
+
+def load_controls(csv_path=CSV_PATH):
+    """Read control.csv and build one record/document per row (row == control)."""
+    controls = []
+    with open(csv_path, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        field_map = {(f or "").strip().lower(): f for f in (reader.fieldnames or [])}
+        name_key = _pick(field_map, _NAME_KEYS)
+        desc_key = _pick(field_map, _DESC_KEYS)
+        id_key = _pick(field_map, _ID_KEYS)
+
+        for idx, row in enumerate(reader, start=1):
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            name = (row.get(name_key) or "").strip() if name_key else ""
+            description = (row.get(desc_key) or "").strip() if desc_key else ""
+            control_id = (row.get(id_key) or "").strip() if id_key else ""
+            control_id = control_id or f"control-{idx}"
+            name = name or control_id
+
+            # Name and Description must stay together: no lossy chunking here.
+            text = (
+                f"Control ID: {control_id}\n"
+                f"Name: {name}\n"
+                f"Description: {description}"
+            ).strip()
+
+            controls.append(
+                {
+                    "id": control_id,
+                    "name": name,
+                    "description": description,
+                    "text": text,
+                }
+            )
+
+    if not controls:
+        raise ValueError(f"No controls could be loaded from {csv_path!r}")
+    return controls
+
+
+def controls_to_documents(controls):
+    return [
+        Document(page_content=c["text"], metadata={"id": c["id"], "name": c["name"]})
+        for c in controls
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# 2. Pairwise similarity (this is what actually yields the expected list)
+# --------------------------------------------------------------------------- #
+def embed_controls(controls, embeddings):
+    """Embed every control once and return L2-normalized vectors."""
+    vectors = embeddings.embed_documents([c["text"] for c in controls])
+    matrix = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return matrix / norms
+
+
+def classify(score):
+    if score >= DUPLICATE_THRESHOLD:
+        return "duplicate", DUPLICATE_THRESHOLD
+    if score >= SIMILAR_THRESHOLD:
+        return "similar", SIMILAR_THRESHOLD
+    return None, None
+
+
+def find_candidate_pairs(
+    controls,
+    unit_vectors,
+    similar_threshold=SIMILAR_THRESHOLD,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+):
+    """All unordered control pairs whose cosine similarity clears a threshold."""
+    similarity_matrix = unit_vectors @ unit_vectors.T
+    pairs = []
+    for i in range(len(controls)):
+        for j in range(i + 1, len(controls)):
+            score = round(float(similarity_matrix[i, j]), 4)
+            if score >= duplicate_threshold:
+                relationship, threshold_used = "duplicate", duplicate_threshold
+            elif score >= similar_threshold:
+                relationship, threshold_used = "similar", similar_threshold
+            else:
+                continue
+            pairs.append(
+                {
+                    "control_1_id": controls[i]["id"],
+                    "control_1": controls[i]["name"],
+                    "control_2_id": controls[j]["id"],
+                    "control_2": controls[j]["name"],
+                    "similarity_score": score,
+                    "threshold": threshold_used,
+                    "relationship": relationship,
+                }
+            )
+    pairs.sort(key=lambda p: p["similarity_score"], reverse=True)
+    return pairs
+
+
+# --------------------------------------------------------------------------- #
+# 3. Prompt that is actually appropriate for this task
+# --------------------------------------------------------------------------- #
+PROMPT_TEMPLATE = """You are a security/compliance control analyst. You compare control statements to decide which ones are similar and which ones are duplicates.
+
+The candidate pairs have ALREADY been computed for you with cosine similarity on the control embeddings. Each candidate carries its numeric similarity_score and its threshold bucket:
+- relationship "duplicate" means similarity_score >= {duplicate_threshold}
+- relationship "similar"  means similarity_score >= {similar_threshold} and < {duplicate_threshold}
+
+Your task: keep the candidate pairs that are genuinely about the same requirement, and for each of them explain in one short sentence why.
+
+Strict rules:
+1. Only report pairs that appear in the "Candidate pairs" section. Never invent a control, a pair or a score.
+2. Copy similarity_score and threshold exactly as given (do not re-estimate them).
+3. Sort the result by similarity_score, highest first.
+4. If no candidate pairs are relevant, return an empty JSON array: []
+5. Reply with a JSON array ONLY - no prose, no markdown code fences.
+
+Every element of the array must have exactly these keys:
+"control_1" (string), "control_2" (string), "similarity_score" (number), "threshold" (number), "relationship" ("duplicate" or "similar"), "reason" (string).
+
+Question: {question}
+
+Candidate pairs:
+{context}
+
+JSON:
+"""
+
+
+def _message_text(message):
+    if isinstance(message, str):
+        return message
+    content = getattr(message, "content", message)
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content)
+
+
+def extract_json_array(raw_text):
+    text = _message_text(raw_text).strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def reconcile_with_computed(llm_pairs, computed_pairs):
+    """Trust the computed numbers, not the model's: match names back to the pairs."""
+    index = {}
+    for pair in computed_pairs:
+        index[(pair["control_1"], pair["control_2"])] = pair
+        index[(pair["control_2"], pair["control_1"])] = pair
+
+    reconciled = []
+    for item in llm_pairs:
+        if not isinstance(item, dict):
+            continue
+        pair = index.get((item.get("control_1"), item.get("control_2")))
+        if pair is None:
+            continue
+        reconciled.append({**pair, "reason": str(item.get("reason", "")).strip()})
+
+    if not reconciled:  # model ignored the contract -> fall back to computed pairs
+        return [{**pair, "reason": ""} for pair in computed_pairs]
+    return reconciled
+
+
+def review_pairs(question, pairs, llm):
+    """LLM pass over the pre-computed pairs (uses an explicit output contract)."""
+    context = json.dumps(pairs[:MAX_PAIRS_FOR_LLM], indent=1)
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    prompt = prompt.partial(
+        similar_threshold=SIMILAR_THRESHOLD,
+        duplicate_threshold=DUPLICATE_THRESHOLD,
+    )
+    chain = (
+        {"context": lambda _question: context, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    raw_answer = chain.invoke(question)
+    return raw_answer, reconcile_with_computed(extract_json_array(raw_answer), pairs)
+
+
+# --------------------------------------------------------------------------- #
+# 4. Per-control retrieval with real similarity scores (cosine space)
+# --------------------------------------------------------------------------- #
+def build_vectorstore(controls, embeddings):
+    store = Chroma(
+        collection_name="controls",
+        embedding_function=embeddings,
+        collection_metadata={"hnsw:space": "cosine"},  # similarity, not L2 distance
+    )
+    store.add_documents(controls_to_documents(controls))
+    return store
+
+
+def similar_controls_for(control, store, k=TOP_K):
+    hits = store.similarity_search_with_relevance_scores(control["text"], k=k + 1)
+    results = []
+    for doc, score in hits:
+        if doc.metadata.get("id") == control["id"]:
+            continue
+        score = round(float(score), 4)
+        if score < SIMILAR_THRESHOLD:
+            continue
+        relationship, threshold_used = classify(score)
+        results.append(
+            {
+                "control": doc.metadata.get("name"),
+                "similarity_score": score,
+                "threshold": threshold_used,
+                "relationship": relationship,
+            }
+        )
+    return results[:k]
+
+
+# --------------------------------------------------------------------------- #
+# 5. Agent entry point
+# --------------------------------------------------------------------------- #
+def run_agent(
+    query="List the control pairs that are similar or duplicates, using each control's Name and Description.",
+    control_name=None,
+):
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    llm = ChatOpenAI(temperature=0, model=LLM_MODEL)
+
+    controls = load_controls()
+    unit_vectors = embed_controls(controls, embeddings)
+    computed_pairs = find_candidate_pairs(controls, unit_vectors)
+
+    raw_answer, pairs = review_pairs(query, computed_pairs, llm)
+
+    result = {
+        "question": query,
+        "thresholds": {
+            "similar": SIMILAR_THRESHOLD,
+            "duplicate": DUPLICATE_THRESHOLD,
+        },
+        "pair_count": len(pairs),
+        "pairs": pairs,
+    }
+
+    # Optional: same information from the retrieval side for one control.
+    if control_name:
+        store = build_vectorstore(controls, embeddings)
+        match = next(
+            (c for c in controls if c["name"].lower() == control_name.lower()),
+            None,
+        )
+        if match is None:
+            result["retrieval"] = {"error": f"{control_name!r} not found in {CSV_PATH}"}
+        else:
+            result["retrieval"] = {
+                "control": match["name"],
+                "matches": similar_controls_for(match, store),
+            }
+
+    if not pairs:
+        result["note"] = (
+            "No pair reached the similarity threshold "
+            f"({SIMILAR_THRESHOLD}); lower SIMILAR_THRESHOLD or check that the CSV "
+            "really contains Name/Description columns."
+        )
+
+    return result
+
+
+if __name__ == "__main__":
+    query = (
+        "Find controls that are similar or duplicates, combining their Name and "
+        "Description, and report each pair with its similarity score and threshold."
+    )
+    result = run_agent(query)
+    print(json.dumps(result, indent=2))
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,1482 @@
+Case ID: evoninja_504
+Status: FAILED
+Final Attempt: 3
+Start Time: 2026-11-17 22:10:46
+End Time: 2026-11-18 01:26:29
+Total Duration: 11743.58 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### apps/browser/src/api/ProxyEmbeddingApi.ts
+import {
+  EmbeddingApi,
+  EmbeddingCreationResult,
+  Tokenizer,
+  splitArray,
+} from "@evo-ninja/agents";
+import { DEFAULT_ADA_CONFIG } from "@evo-ninja/agents";
+import { ERROR_SUBSIDY_MAX } from "./errors";
+
+const MAX_RATE_LIMIT_RETRIES = 5;
+
+export class ProxyEmbeddingApi implements EmbeddingApi {
+  private _goalId: string | undefined = undefined;
+
+  constructor(
+    private _tokenizer: Tokenizer,
+    private _setCapReached: () => void
+  ) {}
+
+  public setGoalId(goalId: string | undefined) {
+    this._goalId = goalId;
+  }
+
+  public async createEmbeddings(
+    input: string | string[],
+    tries?: number
+  ): Promise<EmbeddingCreationResult[]> {
+    const config = DEFAULT_ADA_CONFIG;
+
+    const inputs = Array.isArray(input) ? input : [input];
+    for (const input of inputs) {
+      if (this._tokenizer.encode(input).length > config.maxTokensPerInput) {
+        throw new Error(
+          `Input exceeds max request tokens: ${config.maxTokensPerInput}`
+        );
+      }
+    }
+
+    // Split the inputs into batches that respect the model's
+    // max inputs per request.
+    const batchedInputs = splitArray(inputs, config.maxInputsPerRequest);
+
+    const goalId = this._goalId;
+    if (!goalId) {
+      throw Error("GoalID is not set");
+    }
+
+    // Send each batch in its own request to the proxy.
+    // Sending all batches in a single request can create a
+    // request body that exceeds the maximum allowed body size
+    // ("Body Exceeds Maximum Size") when a large number of
+    // documents (e.g. from web scraping) are embedded at once.
+    const embeddings: EmbeddingCreationResult[] = [];
+    for (const inputs of batchedInputs) {
+      const batchEmbeddings = await this._createEmbeddingsForBatch(
+        inputs,
+        config.model,
+        goalId,
+        tries
+      );
+      embeddings.push(...batchEmbeddings);
+    }
+
+    return embeddings;
+  }
+
+  private async _createEmbeddingsForBatch(
+    inputs: string[],
+    model: string,
+    goalId: string,
+    tries?: number
+  ): Promise<EmbeddingCreationResult[]> {
+    const embeddingResponse = await fetch("/api/proxy/embeddings", {
+      method: "POST",
+      body: JSON.stringify({
+        input: inputs,
+        model,
+        goalId
+      }),
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!embeddingResponse.ok) {
+      const error = await embeddingResponse.json();
+      if (embeddingResponse.status === 400) {
+        throw Error("Error from OpenAI Embeddings: " + error.error);
+      }
+      if (embeddingResponse.status === 429) {
+        await new Promise((resolve) => setTimeout(resolve, 15000));
+        if (!tries || tries < MAX_RATE_LIMIT_RETRIES) {
+          return this._createEmbeddingsForBatch(
+            inputs,
+            model,
+            goalId,
+            tries == undefined ? 0 : ++tries
+          );
+        }
+      }
+      if (embeddingResponse.status === 403) {
+        this._setCapReached();
+        throw Error(ERROR_SUBSIDY_MAX);
+      }
+      throw Error("Error trying to get response from embeddings proxy.", error);
+    }
+    const { embeddings } = await embeddingResponse.json();
+    return embeddings;
+  }
+}
+
+
+
+### apps/browser/pages/api/proxy/embeddings.ts
+import type { NextApiRequest, NextApiResponse } from "next";
+import OpenAIApi from "openai";
+import { authOptions } from "../auth/[...nextauth]";
+import { getServerSession } from "next-auth";
+import { isGoalValid } from "../../../api-utils/goal";
+import { canUseSubsidy } from "../../../api-utils/subsidy";
+import { createSupabaseClient } from "../../../api-utils/supabase";
+import { createOpenAIApiClient } from "../../../api-utils/openai";
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<void> {
+  if (!(req.method === "POST")) {
+    return res.status(404).send({});
+  }
+  const goalId = req.body.goalId;
+
+  // Ensure the user is logged in
+  const session = await getServerSession(req, res, authOptions);
+  const email = session?.user?.email;
+  if (!session || !email) {
+    return res.status(401).send({});
+  }
+
+  const supabase = createSupabaseClient();
+  const openai = createOpenAIApiClient();
+
+  // Ensure the goal is being tracked, and we're able to continue
+  // subsidizing the goal's llm requests
+  const isValid = await isGoalValid(goalId, supabase);
+  if (!isValid) {
+    return res.status(403).send({});
+  }
+  const canSubsidize = await canUseSubsidy("embedding", goalId, supabase);
+  if (!canSubsidize) {
+    return res.status(403).send({});
+  }
+
+  const input: string[][] = req.body.input;
+  try {
+    const embeddings = await Promise.all(
+      input.map(async (inputs) => {
+        const { data } = await openai.embeddings.create({
+          model: req.body.model,
+          input: inputs,
+        });
+
+        return data.map((innerData) => {
+          return {
+            embedding: innerData.embedding,
+            input: inputs[innerData.index],
+          };
+        });
+      })
+    );
+    return res.status(200).json({ embeddings: embeddings.flat() });
+  } catch (e: any) {
+    // Rate limit error
+    if (e instanceof OpenAIApi.APIError && e.status === 429) {
+      return res.status(429).send({});
+    }
+    return res.status(500).send({});
+  }
+}
+
+
+
+### packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
+import { EmbeddingApi, EmbeddingCreationResult } from "./EmbeddingApi";
+import { OpenAIError, cleanOpenAIError } from "../utils/openai";
+import { Tokenizer } from "../llm";
+import { splitArray } from "./utils";
+
+import OpenAIApi from "openai";
+import { ILogger } from "@evo-ninja/agent-utils";
+
+export const DEFAULT_ADA_CONFIG = {
+  model: "text-embedding-ada-002",
+  maxTokensPerInput: 8191,
+  maxInputsPerRequest: 2048
+}
+
+export class OpenAIEmbeddingAPI implements EmbeddingApi {
+  private api: OpenAIApi;
+  
+  constructor(
+    private apiKey: string,
+    private logger: ILogger,
+    private tokenizer: Tokenizer,
+    private modelConfig: {
+      model: string,
+      maxTokensPerInput: number,
+      maxInputsPerRequest: number
+    } = DEFAULT_ADA_CONFIG,
+    private _maxRateLimitRetries: number = 5
+  ) {
+    this.api = new OpenAIApi({
+      apiKey: this.apiKey,
+      dangerouslyAllowBrowser: true
+    });
+  }
+
+  async createEmbeddings(input: string | string[], tries?: number): Promise<EmbeddingCreationResult[]> {
+    try {
+      const inputs = Array.isArray(input) ? input : [input];
+      this.validateInput(inputs);
+
+      const batchedInputs = splitArray(inputs, this.modelConfig.maxInputsPerRequest);
+
+      const results = await Promise.all(batchedInputs.map(async (inputs) => {
+        const { data } = await this.api.embeddings.create({
+          model: this.modelConfig.model,
+          input: inputs,
+        })
+
+        return data.map((innerData) => {
+          return {
+            embedding: innerData.embedding,
+            input: inputs[innerData.index]
+          }
+        });
+      }))
+  
+      return results.flat();
+    } catch (err) {
+      const error = cleanOpenAIError(err);
+
+      if (typeof error === "object") {
+        const maybeOpenAiError = error as Partial<OpenAIError>;
+
+        if (maybeOpenAiError.status === 429) {
+          this.logger.warning("Warning: OpenAI rate limit exceeded, sleeping for 15 seconds.");
+
+          await new Promise((resolve) => setTimeout(resolve, 15000));
+
+          if (!tries || tries < this._maxRateLimitRetries) {
+            return this.createEmbeddings(
+              input,
+              tries === undefined ? 0 : ++tries
+            );
+          }
+        }
+      }
+
+      throw new Error(JSON.stringify(error, null, 2));
+    }
+  };
+
+  validateInput(inputs: string[]) {
+    for (const input of inputs) {
+      if (this.tokenizer.encode(input).length > this.modelConfig.maxTokensPerInput) {
+        throw new Error(`Input exceeds max request tokens: ${this.modelConfig.maxTokensPerInput}`);
+      }
+    }
+  }
+}
+
+
+### apps/browser/next.config.js
+module.exports = {
+  reactStrictMode: true,
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
+};
+
+
+
+### packages/agents/src/agent-core/chunking/TextChunker.ts
+import { cleanWhitespace } from "./cleanWhitespace";
+
+export class TextChunker {
+  static fixedCharacterLength(text: string, opts: { chunkLength: number, overlap: number }): string[] {
+    const { chunkLength, overlap } = opts
+
+    if (chunkLength <= overlap) {
+      throw new Error("Chunk length must be greater than overlap length.");
+    }
+
+    let chunks: string[] = [];
+    let startIndex = 0;
+
+    while (startIndex < text.length) {
+      let endIndex = startIndex + chunkLength;
+      let chunk = text.slice(startIndex, endIndex);
+
+      chunks.push(chunk);
+
+      startIndex = endIndex - overlap;
+    }
+
+    return chunks;
+  }
+
+  static parentDocRetrieval(text: string, opts: {
+    parentChunker: (text: string) => string[],
+    childChunker: (parentText: string) => string[],
+  }): {
+    doc: string;
+    metadata: {
+      parent: string;
+    }
+  }[] {
+    const { parentChunker, childChunker } = opts
+
+    const parentChunks = parentChunker(text)
+    const parentAndChildDocs = parentChunks.map(parentChunk => {
+      return {
+        parent: parentChunk,
+        children: childChunker(parentChunk)
+      }
+    }).map(parentAndChildDoc => {
+      return {
+        metadatas: parentAndChildDoc.children.map(() => ({ parent: parentAndChildDoc.parent })),
+        documents: parentAndChildDoc.children
+      }
+    })
+
+    const docs = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.documents)
+    const metadatas = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.metadatas)
+
+    const chunks = docs.map((doc, index) => {
+      return {
+        doc,
+        metadata: metadatas[index]
+      }
+    });
+
+    return chunks;
+  }
+
+  static sentences(text: string): string[] {
+    const alphabets = "([A-Za-z])";
+    const prefixes = "(Mr|St|Mrs|Ms|Dr)[.]";
+    const suffixes = "(Inc|Ltd|Jr|Sr|Co)";
+    const starters = "(Mr|Mrs|Ms|Dr|Prof|Capt|Cpt|Lt|He\\s|She\\s|It\\s|They\\s|Their\\s|Our\\s|We\\s|But\\s|However\\s|That\\s|This\\s|Wherever)";
+    const acronyms = "([A-Z][.][A-Z][.](?:[A-Z][.])?)";
+    const websites = "[.](com|net|org|io|gov|edu|me)";
+    const digits = "([0-9])";
+    const multipleDots = /\\.{2,}/g;
+
+      text = " " + text + "  ";
+      text = text.replaceAll("\n", " ");
+      text = text.replaceAll(new RegExp(prefixes, 'g'), "$1<prd>");
+      text = text.replaceAll(new RegExp(websites, 'g'), "<prd>$1");
+      text = text.replaceAll(new RegExp(digits + "[.]" + digits, 'g'), "$1<prd>$2");
+      text = text.replaceAll(multipleDots, match => "<prd>".repeat(match.length) + "<stop>");
+      if (text.includes("Ph.D")) text = text.replaceAll("Ph.D.", "Ph<prd>D<prd>");
+      text = text.replaceAll(new RegExp("\\s" + alphabets + "[.] ", 'g'), " $1<prd> ");
+      text = text.replaceAll(new RegExp(acronyms + " " + starters, 'g'), "$1<stop> $2");
+      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>$3<prd>");
+      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>");
+      text = text.replaceAll(new RegExp(" " + suffixes + "[.] " + starters, 'g'), " $1<stop> $2");
+      text = text.replaceAll(new RegExp(" " + suffixes + "[.]", 'g'), " $1<prd>");
+      text = text.replaceAll(new RegExp(" " + alphabets + "[.]", 'g'), " $1<prd>");
+      if (text.includes("”")) text = text.replaceAll(".”", "”.");
+      if (text.includes("\"")) text = text.replaceAll(".\"", "\".");
+      if (text.includes("!")) text = text.replaceAll("!\"", "\"!");
+      if (text.includes("?")) text = text.replaceAll("?\"", "\"?");
+      text = text.replaceAll(".", ".<stop>");
+      text = text.replaceAll("?", "?<stop>");
+      text = text.replaceAll("!", "!<stop>");
+      text = text.replaceAll("<prd>", ".");
+      const sentences = text.split("<stop>").map(s => s.trim());
+      if (sentences && !sentences[sentences.length - 1]) sentences.pop();
+      return sentences;
+  }
+
+  static singleLine(content: string): string[] {
+    const lines = cleanWhitespace(content).split("\n");
+    return lines;
+  }
+
+  static multiLines(content: string, linesPerChunk: number): string[] {
+    const lines = cleanWhitespace(content).split("\n");
+    const chunks = [];
+    for (let i = 0; i < lines.length; i += linesPerChunk) {
+      chunks.push(lines.slice(i, i + linesPerChunk).join("\n"));
+    }
+    return chunks;
+  }
+
+  static characters(content: string, characterLimit: number): string[] {
+    const trimmedContent = cleanWhitespace(content);
+    const chunks = [];
+    let currentChunk = "";
+    for (const char of trimmedContent) {
+      if (currentChunk.length + 1 > characterLimit) {
+        chunks.push(currentChunk);
+        currentChunk = "";
+      }
+      currentChunk += char;
+    }
+    return chunks;
+  }
+
+  static words(content: string, characterLimit: number): string[] {
+    const trimmedContent = cleanWhitespace(content);
+    const chunks = [];
+    let currentChunk = "";
+    for (const word of trimmedContent.split(" ")) {
+      if (currentChunk.length + word.length > characterLimit) {
+        chunks.push(currentChunk);
+        currentChunk = "";
+      }
+      currentChunk += word;
+    }
+    // TODO: temp fix. Do more general solution
+    return chunks.filter(x => x.length > 0);
+  }
+}
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-17 22:30:41
+Duration: 1195.53 seconds
+Verdict: 
+
+## REJECT
+
+### Reasoning
+
+My evaluation of the fixed code for case **evoninja_504** reveals critical issues that prevent acceptance:
+
+1. **No Fixed Code Available**: The `generate_diff` tool returned an error stating "no fixed code available." This means there is no fixed implementation to compare against the buggy code — a fix was never produced or delivered for this case.
+
+2. **Validation Failed Completely**: The `validate_fixed_code` check returned an explicit **REJECT** verdict. None of the required file sections appear in the fixed code (all appear 0 times when each is expected once):
+   - `### apps/browser/src/api/ProxyEmbeddingApi.ts` — 0 occurrences
+   - `### apps/browser/pages/api/proxy/embeddings.ts` — 0 occurrences
+   - `### packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts` — 0 occurrences
+   - `### apps/browser/next.config.js` — 0 occurrences
+   - `### packages/agents/src/agent-core/chunking/TextChunker.ts` — 0 occurrences
+
+   This confirms the fixed code is entirely missing or empty.
+
+3. **API Verification Was Not Conclusive**: The `verify_api_usage` calls returned irrelevant search results (Krita documentation and general OpenAI company pages rather than actual API documentation for `splitArray` or `openai.embeddings.create`). However, this is moot — since there is no fixed code to evaluate, API usage verification is not applicable.
+
+4. **Test Expectations Unmet**: The test checks for a `modelConfig` object containing both `maxTokensPerInput` and `maxInputsPerRequest` in `ProxyEmbeddingApi.ts`. Since no fixed code exists, this requirement cannot be satisfied. If the fix were present, it would likely involve replacing the direct use of `DEFAULT_ADA_CONFIG` with a proper `modelConfig` object in the `ProxyEmbeddingApi` constructor, similar to how `OpenAIEmbeddingAPI` accepts a `modelConfig` parameter.
+
+### Verdict: **REJECT**
+
+The fixed code for case evoninja_504 is missing entirely, fails all structural validation checks, and no diff could be generated. A fix must be created and provided before this case can be re-evaluated.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-17 22:53:47
+Duration: 1385.74 seconds
+Verdict: ## Evaluation: REJECT
+
+### 1. Diff Analysis
+
+The fix to `apps/browser/src/api/ProxyEmbeddingApi.ts`:
+- Added a `_createEmbeddingsForBatch()` private method
+- Changed the request body from `input: batchedInputs` (a `string[][]`) to `input: inputs` (a flat `string[]` per batch)
+- Loops over batches, sending one request per batch, accumulating results
+- Retries now recurse into `_createEmbeddingsForBatch` instead of `createEmbeddings`
+- Also removed trailing blank lines in `TextChunker.ts`
+
+### 2. Test Expectation Mismatch (Decisive Failure)
+
+The test reads only `apps/browser/src/api/ProxyEmbeddingApi.ts` and checks:
+
+```js
+const modelConfigPattern = /modelConfig\s*:\s*\{[^}]*maxTokensPerInput[^}]*maxInputsPerRequest[^}]*\}/s;
+const hasModelConfigFix = modelConfigPattern.test(fileContent);
+```
+
+For the `fixed` version, the test requires `hasModelConfigFix === true` — i.e., `ProxyEmbeddingApi` must declare a `modelConfig: { ... maxTokensPerInput ... maxInputsPerRequest ... }` (mirroring the pattern in `OpenAIEmbeddingAPI`'s constructor).
+
+The fixed code **never introduces a `modelConfig`** — it still uses `const config = DEFAULT_ADA_CONFIG;` with the original two-parameter constructor. Nothing in the diff adds the string `modelConfig` anywhere in `ProxyEmbeddingApi.ts`. Running the test with `VERSION=fixed` would output `❌ FIX NOT VERIFIED: modelConfig does not specify maxTokensPerInput and maxInputsPerRequest.` and exit 1. (Note: `OpenAIEmbeddingApi.ts` does contain the pattern, but the test only reads the `ProxyEmbeddingApi.ts` file, so that doesn't help.)
+
+### 3. Functional Regression: Client/Proxy Contract Break
+
+The stated motivation (avoiding "Body Exceeds Maximum Size") is plausible, but the implementation breaks the proxy API contract:
+
+- **Client (fixed)** now sends `input: inputs` — a flat `string[]` (one batch).
+- **Proxy** (`apps/browser/pages/api/proxy/embeddings.ts`, unchanged) does:
+  ```ts
+  const input: string[][] = req.body.input;
+  input.map(async (inputs) => {
+    const { data } = await openai.embeddings.create({ model, input: inputs });
+    return data.map((innerData) => ({
+      embedding: innerData.embedding,
+      input: inputs[innerData.index],   // string indexing!
+    }));
+  });
+  ```
+  With a flat array, each `inputs` element is a plain `string`. OpenAI's SDK does accept a single string, but it returns one result with `index: 0`, so `inputs[innerData.index]` returns the **first character** of the string, not the full text. This corrupts `EmbeddingCreationResult.input` (used by consumers to map embeddings back to source text). In the buggy version, `input: batchedInputs` (`string[][]`) matched the proxy's expectation exactly and the mapping was correct. The fix also makes one OpenAI call per string, defeating the batching entirely (up to 2048 strings → 2048 calls).
+
+### 4. Verification Tool Results
+
+- `validate_fixed_code`: structural check passed (all files present once), but it explicitly notes no TypeScript/JavaScript parser was available, so it verified no semantics — and confirmed "no required interface checked."
+- `verify_api_usage`: returned irrelevant web results (generic OpenAI marketing pages and unrelated "serpentine soil" articles), providing no real verification for `openai.embeddings.create` or the internal `splitArray` helper. Based on the OpenAI SDK semantics I know, `embeddings.create` does accept `string | string[]`, but as shown above, the surrounding proxy logic (`inputs[innerData.index]` on a string) is where the fix breaks down.
+
+### Conclusion
+
+**REJECT.** The fix (a) does not satisfy the test's explicit requirement that `ProxyEmbeddingApi` declare a `modelConfig` with `maxTokensPerInput` and `maxInputsPerRequest`, so the test fails on the fixed version, and (b) introduces a genuine functional regression by sending a flat `string[]` to a proxy endpoint that expects `string[][]`, corrupting the input-to-embedding mapping and eliminating batching. The correct fix should add a `modelConfig` parameter (defaulting to `DEFAULT_ADA_CONFIG`) to `ProxyEmbeddingApi`, and any batching-related change would need the proxy endpoint updated in tandem.
+--------------------------------------------------------------------------------
+### apps/browser/src/api/ProxyEmbeddingApi.ts
+import {
+  EmbeddingApi,
+  EmbeddingCreationResult,
+  Tokenizer,
+  splitArray,
+} from "@evo-ninja/agents";
+import { DEFAULT_ADA_CONFIG } from "@evo-ninja/agents";
+import { ERROR_SUBSIDY_MAX } from "./errors";
+
+const MAX_RATE_LIMIT_RETRIES = 5;
+
+export class ProxyEmbeddingApi implements EmbeddingApi {
+  private _goalId: string | undefined = undefined;
+
+  constructor(
+    private _tokenizer: Tokenizer,
+    private _setCapReached: () => void
+  ) {}
+
+  public setGoalId(goalId: string | undefined) {
+    this._goalId = goalId;
+  }
+
+  public async createEmbeddings(
+    input: string | string[],
+    tries?: number
+  ): Promise<EmbeddingCreationResult[]> {
+    const config = DEFAULT_ADA_CONFIG;
+
+    const inputs = Array.isArray(input) ? input : [input];
+    for (const input of inputs) {
+      if (this._tokenizer.encode(input).length > config.maxTokensPerInput) {
+        throw new Error(
+          `Input exceeds max request tokens: ${config.maxTokensPerInput}`
+        );
+      }
+    }
+
+    // Split the inputs into batches that respect the model's
+    // max inputs per request.
+    const batchedInputs = splitArray(inputs, config.maxInputsPerRequest);
+
+    const goalId = this._goalId;
+    if (!goalId) {
+      throw Error("GoalID is not set");
+    }
+
+    // Send each batch in its own request to the proxy.
+    // Sending all batches in a single request can create a
+    // request body that exceeds the maximum allowed body size
+    // ("Body Exceeds Maximum Size") when a large number of
+    // documents (e.g. from web scraping) are embedded at once.
+    const embeddings: EmbeddingCreationResult[] = [];
+    for (const inputs of batchedInputs) {
+      const batchEmbeddings = await this._createEmbeddingsForBatch(
+        inputs,
+        config.model,
+        goalId,
+        tries
+      );
+      embeddings.push(...batchEmbeddings);
+    }
+
+    return embeddings;
+  }
+
+  private async _createEmbeddingsForBatch(
+    inputs: string[],
+    model: string,
+    goalId: string,
+    tries?: number
+  ): Promise<EmbeddingCreationResult[]> {
+    const embeddingResponse = await fetch("/api/proxy/embeddings", {
+      method: "POST",
+      body: JSON.stringify({
+        input: inputs,
+        model,
+        goalId
+      }),
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!embeddingResponse.ok) {
+      const error = await embeddingResponse.json();
+      if (embeddingResponse.status === 400) {
+        throw Error("Error from OpenAI Embeddings: " + error.error);
+      }
+      if (embeddingResponse.status === 429) {
+        await new Promise((resolve) => setTimeout(resolve, 15000));
+        if (!tries || tries < MAX_RATE_LIMIT_RETRIES) {
+          return this._createEmbeddingsForBatch(
+            inputs,
+            model,
+            goalId,
+            tries == undefined ? 0 : ++tries
+          );
+        }
+      }
+      if (embeddingResponse.status === 403) {
+        this._setCapReached();
+        throw Error(ERROR_SUBSIDY_MAX);
+      }
+      throw Error("Error trying to get response from embeddings proxy.", error);
+    }
+    const { embeddings } = await embeddingResponse.json();
+    return embeddings;
+  }
+}
+
+
+
+### apps/browser/pages/api/proxy/embeddings.ts
+import type { NextApiRequest, NextApiResponse } from "next";
+import OpenAIApi from "openai";
+import { authOptions } from "../auth/[...nextauth]";
+import { getServerSession } from "next-auth";
+import { isGoalValid } from "../../../api-utils/goal";
+import { canUseSubsidy } from "../../../api-utils/subsidy";
+import { createSupabaseClient } from "../../../api-utils/supabase";
+import { createOpenAIApiClient } from "../../../api-utils/openai";
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<void> {
+  if (!(req.method === "POST")) {
+    return res.status(404).send({});
+  }
+  const goalId = req.body.goalId;
+
+  // Ensure the user is logged in
+  const session = await getServerSession(req, res, authOptions);
+  const email = session?.user?.email;
+  if (!session || !email) {
+    return res.status(401).send({});
+  }
+
+  const supabase = createSupabaseClient();
+  const openai = createOpenAIApiClient();
+
+  // Ensure the goal is being tracked, and we're able to continue
+  // subsidizing the goal's llm requests
+  const isValid = await isGoalValid(goalId, supabase);
+  if (!isValid) {
+    return res.status(403).send({});
+  }
+  const canSubsidize = await canUseSubsidy("embedding", goalId, supabase);
+  if (!canSubsidize) {
+    return res.status(403).send({});
+  }
+
+  const input: string[][] = req.body.input;
+  try {
+    const embeddings = await Promise.all(
+      input.map(async (inputs) => {
+        const { data } = await openai.embeddings.create({
+          model: req.body.model,
+          input: inputs,
+        });
+
+        return data.map((innerData) => {
+          return {
+            embedding: innerData.embedding,
+            input: inputs[innerData.index],
+          };
+        });
+      })
+    );
+    return res.status(200).json({ embeddings: embeddings.flat() });
+  } catch (e: any) {
+    // Rate limit error
+    if (e instanceof OpenAIApi.APIError && e.status === 429) {
+      return res.status(429).send({});
+    }
+    return res.status(500).send({});
+  }
+}
+
+
+
+### packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
+import { EmbeddingApi, EmbeddingCreationResult } from "./EmbeddingApi";
+import { OpenAIError, cleanOpenAIError } from "../utils/openai";
+import { Tokenizer } from "../llm";
+import { splitArray } from "./utils";
+
+import OpenAIApi from "openai";
+import { ILogger } from "@evo-ninja/agent-utils";
+
+export const DEFAULT_ADA_CONFIG = {
+  model: "text-embedding-ada-002",
+  maxTokensPerInput: 8191,
+  maxInputsPerRequest: 2048
+}
+
+export class OpenAIEmbeddingAPI implements EmbeddingApi {
+  private api: OpenAIApi;
+  
+  constructor(
+    private apiKey: string,
+    private logger: ILogger,
+    private tokenizer: Tokenizer,
+    private modelConfig: {
+      model: string,
+      maxTokensPerInput: number,
+      maxInputsPerRequest: number
+    } = DEFAULT_ADA_CONFIG,
+    private _maxRateLimitRetries: number = 5
+  ) {
+    this.api = new OpenAIApi({
+      apiKey: this.apiKey,
+      dangerouslyAllowBrowser: true
+    });
+  }
+
+  async createEmbeddings(input: string | string[], tries?: number): Promise<EmbeddingCreationResult[]> {
+    try {
+      const inputs = Array.isArray(input) ? input : [input];
+      this.validateInput(inputs);
+
+      const batchedInputs = splitArray(inputs, this.modelConfig.maxInputsPerRequest);
+
+      const results = await Promise.all(batchedInputs.map(async (inputs) => {
+        const { data } = await this.api.embeddings.create({
+          model: this.modelConfig.model,
+          input: inputs,
+        })
+
+        return data.map((innerData) => {
+          return {
+            embedding: innerData.embedding,
+            input: inputs[innerData.index]
+          }
+        });
+      }))
+  
+      return results.flat();
+    } catch (err) {
+      const error = cleanOpenAIError(err);
+
+      if (typeof error === "object") {
+        const maybeOpenAiError = error as Partial<OpenAIError>;
+
+        if (maybeOpenAiError.status === 429) {
+          this.logger.warning("Warning: OpenAI rate limit exceeded, sleeping for 15 seconds.");
+
+          await new Promise((resolve) => setTimeout(resolve, 15000));
+
+          if (!tries || tries < this._maxRateLimitRetries) {
+            return this.createEmbeddings(
+              input,
+              tries === undefined ? 0 : ++tries
+            );
+          }
+        }
+      }
+
+      throw new Error(JSON.stringify(error, null, 2));
+    }
+  };
+
+  validateInput(inputs: string[]) {
+    for (const input of inputs) {
+      if (this.tokenizer.encode(input).length > this.modelConfig.maxTokensPerInput) {
+        throw new Error(`Input exceeds max request tokens: ${this.modelConfig.maxTokensPerInput}`);
+      }
+    }
+  }
+}
+
+
+### apps/browser/next.config.js
+module.exports = {
+  reactStrictMode: true,
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
+};
+
+
+
+### packages/agents/src/agent-core/chunking/TextChunker.ts
+import { cleanWhitespace } from "./cleanWhitespace";
+
+export class TextChunker {
+  static fixedCharacterLength(text: string, opts: { chunkLength: number, overlap: number }): string[] {
+    const { chunkLength, overlap } = opts
+
+    if (chunkLength <= overlap) {
+      throw new Error("Chunk length must be greater than overlap length.");
+    }
+
+    let chunks: string[] = [];
+    let startIndex = 0;
+
+    while (startIndex < text.length) {
+      let endIndex = startIndex + chunkLength;
+      let chunk = text.slice(startIndex, endIndex);
+
+      chunks.push(chunk);
+
+      startIndex = endIndex - overlap;
+    }
+
+    return chunks;
+  }
+
+  static parentDocRetrieval(text: string, opts: {
+    parentChunker: (text: string) => string[],
+    childChunker: (parentText: string) => string[],
+  }): {
+    doc: string;
+    metadata: {
+      parent: string;
+    }
+  }[] {
+    const { parentChunker, childChunker } = opts
+
+    const parentChunks = parentChunker(text)
+    const parentAndChildDocs = parentChunks.map(parentChunk => {
+      return {
+        parent: parentChunk,
+        children: childChunker(parentChunk)
+      }
+    }).map(parentAndChildDoc => {
+      return {
+        metadatas: parentAndChildDoc.children.map(() => ({ parent: parentAndChildDoc.parent })),
+        documents: parentAndChildDoc.children
+      }
+    })
+
+    const docs = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.documents)
+    const metadatas = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.metadatas)
+
+    const chunks = docs.map((doc, index) => {
+      return {
+        doc,
+        metadata: metadatas[index]
+      }
+    });
+
+    return chunks;
+  }
+
+  static sentences(text: string): string[] {
+    const alphabets = "([A-Za-z])";
+    const prefixes = "(Mr|St|Mrs|Ms|Dr)[.]";
+    const suffixes = "(Inc|Ltd|Jr|Sr|Co)";
+    const starters = "(Mr|Mrs|Ms|Dr|Prof|Capt|Cpt|Lt|He\\s|She\\s|It\\s|They\\s|Their\\s|Our\\s|We\\s|But\\s|However\\s|That\\s|This\\s|Wherever)";
+    const acronyms = "([A-Z][.][A-Z][.](?:[A-Z][.])?)";
+    const websites = "[.](com|net|org|io|gov|edu|me)";
+    const digits = "([0-9])";
+    const multipleDots = /\\.{2,}/g;
+
+      text = " " + text + "  ";
+      text = text.replaceAll("\n", " ");
+      text = text.replaceAll(new RegExp(prefixes, 'g'), "$1<prd>");
+      text = text.replaceAll(new RegExp(websites, 'g'), "<prd>$1");
+      text = text.replaceAll(new RegExp(digits + "[.]" + digits, 'g'), "$1<prd>$2");
+      text = text.replaceAll(multipleDots, match => "<prd>".repeat(match.length) + "<stop>");
+      if (text.includes("Ph.D")) text = text.replaceAll("Ph.D.", "Ph<prd>D<prd>");
+      text = text.replaceAll(new RegExp("\\s" + alphabets + "[.] ", 'g'), " $1<prd> ");
+      text = text.replaceAll(new RegExp(acronyms + " " + starters, 'g'), "$1<stop> $2");
+      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>$3<prd>");
+      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>");
+      text = text.replaceAll(new RegExp(" " + suffixes + "[.] " + starters, 'g'), " $1<stop> $2");
+      text = text.replaceAll(new RegExp(" " + suffixes + "[.]", 'g'), " $1<prd>");
+      text = text.replaceAll(new RegExp(" " + alphabets + "[.]", 'g'), " $1<prd>");
+      if (text.includes("”")) text = text.replaceAll(".”", "”.");
+      if (text.includes("\"")) text = text.replaceAll(".\"", "\".");
+      if (text.includes("!")) text = text.replaceAll("!\"", "\"!");
+      if (text.includes("?")) text = text.replaceAll("?\"", "\"?");
+      text = text.replaceAll(".", ".<stop>");
+      text = text.replaceAll("?", "?<stop>");
+      text = text.replaceAll("!", "!<stop>");
+      text = text.replaceAll("<prd>", ".");
+      const sentences = text.split("<stop>").map(s => s.trim());
+      if (sentences && !sentences[sentences.length - 1]) sentences.pop();
+      return sentences;
+  }
+
+  static singleLine(content: string): string[] {
+    const lines = cleanWhitespace(content).split("\n");
+    return lines;
+  }
+
+  static multiLines(content: string, linesPerChunk: number): string[] {
+    const lines = cleanWhitespace(content).split("\n");
+    const chunks = [];
+    for (let i = 0; i < lines.length; i += linesPerChunk) {
+      chunks.push(lines.slice(i, i + linesPerChunk).join("\n"));
+    }
+    return chunks;
+  }
+
+  static characters(content: string, characterLimit: number): string[] {
+    const trimmedContent = cleanWhitespace(content);
+    const chunks = [];
+    let currentChunk = "";
+    for (const char of trimmedContent) {
+      if (currentChunk.length + 1 > characterLimit) {
+        chunks.push(currentChunk);
+        currentChunk = "";
+      }
+      currentChunk += char;
+    }
+    return chunks;
+  }
+
+  static words(content: string, characterLimit: number): string[] {
+    const trimmedContent = cleanWhitespace(content);
+    const chunks = [];
+    let currentChunk = "";
+    for (const word of trimmedContent.split(" ")) {
+      if (currentChunk.length + word.length > characterLimit) {
+        chunks.push(currentChunk);
+        currentChunk = "";
+      }
+      currentChunk += word;
+    }
+    // TODO: temp fix. Do more general solution
+    return chunks.filter(x => x.length > 0);
+  }
+}
+
+--------------------------------------------------------------------------------
+
+Attempt 3:
+Timestamp: 2026-11-18 01:26:29
+Duration: 9162.31 seconds
+Verdict: 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+I have all the information I need. Let me analyze the results carefully.
+
+## Evaluation Analysis
+
+**1. Diff Review (`generate_diff`)**
+The fix modifies only `apps/browser/src/api/ProxyEmbeddingApi.ts` (plus trailing-whitespace cleanup in `TextChunker.ts`):
+- Adds a `_createEmbeddingsForBatch()` private method and loops over `batchedInputs`, sending **each batch in its own HTTP request** to the proxy (previously all batches were sent in a single POST body).
+- Retries on 429 now recurse into `_createEmbeddingsForBatch` instead of `createEmbeddings`.
+
+**2. Test Analysis (critical finding)**
+The test reads `apps/browser/src/api/ProxyEmbeddingApi.ts` and checks:
+```js
+/modelConfig\s*:\s*\{[^}]*maxTokensPerInput[^}]*maxInputsPerRequest[^}]*\}/s
+```
+For `VERSION=fixed` to pass, the file **must contain a `modelConfig: { ... maxTokensPerInput ... maxInputsPerRequest ... }` declaration**. I reconstructed the full fixed file from the diff: it still uses `const config = DEFAULT_ADA_CONFIG;` and never introduces the identifier `modelConfig` anywhere. Running the test against the fixed code produces `❌ FIX NOT VERIFIED: modelConfig does not specify maxTokensPerInput and maxInputsPerRequest` → `exit(1)`. **The fix fails the provided test.**
+
+**3. Functional regression (client/server contract break)**
+The fix changes the client payload from `input: batchedInputs` (`string[][]`) to `input: inputs` (`string[]`, a single batch). But the server handler `apps/browser/pages/api/proxy/embeddings.ts` is **unchanged** and expects `string[][]`:
+```ts
+const input: string[][] = req.body.input;
+input.map(async (inputs) => { ... input: inputs[innerData.index] ... })
+```
+With a flat `string[]`, each individual string becomes its own OpenAI call (N calls instead of 1 batched call — defeating the batching purpose and inviting 429 rate limits), and `inputs[innerData.index]` indexes into a **string**, so `EmbeddingCreationResult.input` degenerates to a single character (e.g., `"h"` for `"hello world"`), corrupting the embedding↔text mapping used downstream by retrieval/memory. The correct change would have been `input: [inputs]` or updating the server handler — neither was done.
+
+**4. Tool notes**: `validate_fixed_code` only confirmed file presence (no TS parser available, "no required interface checked"), so it provides no assurance the test passes. `verify_api_usage` returned irrelevant web results (city calendars, OpenAI social pages) with no API documentation value, so verification relied on direct code analysis. The unchanged server handler's use of `openai.embeddings.create`/`innerData.index` remains as in the buggy version.
+
+## Verdict: REJECT
+
+**Reasoning:**
+1. **Test failure (decisive):** The fixed `ProxyEmbeddingApi.ts` contains no `modelConfig` object/type annotation with `maxTokensPerInput` and `maxInputsPerRequest`, so the supplied test reports "FIX NOT VERIFIED" and exits 1 for the fixed version. The expected fix was to introduce a `modelConfig` (mirroring `OpenAIEmbeddingAPI`'s constructor parameter typed `{ model, maxTokensPerInput, maxInputsPerRequest }`) into `ProxyEmbeddingApi`.
+2. **New functional bug:** The client now sends `input: string[]` while the unchanged server expects `input: string[][]`. This silently breaks the response mapping (returns single characters as `input`) and explodes the number of OpenAI API calls per batch.
+3. While the per-batch-request approach is a plausible direction for mitigating the "Body Exceeds Maximum Size" error, it was implemented incompatibly with the server and does not match the fix the test validates.
+--------------------------------------------------------------------------------
+### apps/browser/src/api/ProxyEmbeddingApi.ts
+import {
+  EmbeddingApi,
+  EmbeddingCreationResult,
+  Tokenizer,
+  splitArray,
+} from "@evo-ninja/agents";
+import { DEFAULT_ADA_CONFIG } from "@evo-ninja/agents";
+import { ERROR_SUBSIDY_MAX } from "./errors";
+
+const MAX_RATE_LIMIT_RETRIES = 5;
+
+export class ProxyEmbeddingApi implements EmbeddingApi {
+  private _goalId: string | undefined = undefined;
+
+  constructor(
+    private _tokenizer: Tokenizer,
+    private _setCapReached: () => void
+  ) {}
+
+  public setGoalId(goalId: string | undefined) {
+    this._goalId = goalId;
+  }
+
+  public async createEmbeddings(
+    input: string | string[],
+    tries?: number
+  ): Promise<EmbeddingCreationResult[]> {
+    const config = DEFAULT_ADA_CONFIG;
+
+    const inputs = Array.isArray(input) ? input : [input];
+    for (const input of inputs) {
+      if (this._tokenizer.encode(input).length > config.maxTokensPerInput) {
+        throw new Error(
+          `Input exceeds max request tokens: ${config.maxTokensPerInput}`
+        );
+      }
+    }
+
+    // Split the inputs into batches that respect the model's
+    // max inputs per request.
+    const batchedInputs = splitArray(inputs, config.maxInputsPerRequest);
+
+    const goalId = this._goalId;
+    if (!goalId) {
+      throw Error("GoalID is not set");
+    }
+
+    // Send each batch in its own request to the proxy.
+    // Sending all batches in a single request can create a
+    // request body that exceeds the maximum allowed body size
+    // ("Body Exceeds Maximum Size") when a large number of
+    // documents (e.g. from web scraping) are embedded at once.
+    const embeddings: EmbeddingCreationResult[] = [];
+    for (const inputs of batchedInputs) {
+      const batchEmbeddings = await this._createEmbeddingsForBatch(
+        inputs,
+        config.model,
+        goalId,
+        tries
+      );
+      embeddings.push(...batchEmbeddings);
+    }
+
+    return embeddings;
+  }
+
+  private async _createEmbeddingsForBatch(
+    inputs: string[],
+    model: string,
+    goalId: string,
+    tries?: number
+  ): Promise<EmbeddingCreationResult[]> {
+    const embeddingResponse = await fetch("/api/proxy/embeddings", {
+      method: "POST",
+      body: JSON.stringify({
+        input: inputs,
+        model,
+        goalId
+      }),
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!embeddingResponse.ok) {
+      const error = await embeddingResponse.json();
+      if (embeddingResponse.status === 400) {
+        throw Error("Error from OpenAI Embeddings: " + error.error);
+      }
+      if (embeddingResponse.status === 429) {
+        await new Promise((resolve) => setTimeout(resolve, 15000));
+        if (!tries || tries < MAX_RATE_LIMIT_RETRIES) {
+          return this._createEmbeddingsForBatch(
+            inputs,
+            model,
+            goalId,
+            tries == undefined ? 0 : ++tries
+          );
+        }
+      }
+      if (embeddingResponse.status === 403) {
+        this._setCapReached();
+        throw Error(ERROR_SUBSIDY_MAX);
+      }
+      throw Error("Error trying to get response from embeddings proxy.", error);
+    }
+    const { embeddings } = await embeddingResponse.json();
+    return embeddings;
+  }
+}
+
+
+
+### apps/browser/pages/api/proxy/embeddings.ts
+import type { NextApiRequest, NextApiResponse } from "next";
+import OpenAIApi from "openai";
+import { authOptions } from "../auth/[...nextauth]";
+import { getServerSession } from "next-auth";
+import { isGoalValid } from "../../../api-utils/goal";
+import { canUseSubsidy } from "../../../api-utils/subsidy";
+import { createSupabaseClient } from "../../../api-utils/supabase";
+import { createOpenAIApiClient } from "../../../api-utils/openai";
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<void> {
+  if (!(req.method === "POST")) {
+    return res.status(404).send({});
+  }
+  const goalId = req.body.goalId;
+
+  // Ensure the user is logged in
+  const session = await getServerSession(req, res, authOptions);
+  const email = session?.user?.email;
+  if (!session || !email) {
+    return res.status(401).send({});
+  }
+
+  const supabase = createSupabaseClient();
+  const openai = createOpenAIApiClient();
+
+  // Ensure the goal is being tracked, and we're able to continue
+  // subsidizing the goal's llm requests
+  const isValid = await isGoalValid(goalId, supabase);
+  if (!isValid) {
+    return res.status(403).send({});
+  }
+  const canSubsidize = await canUseSubsidy("embedding", goalId, supabase);
+  if (!canSubsidize) {
+    return res.status(403).send({});
+  }
+
+  const input: string[][] = req.body.input;
+  try {
+    const embeddings = await Promise.all(
+      input.map(async (inputs) => {
+        const { data } = await openai.embeddings.create({
+          model: req.body.model,
+          input: inputs,
+        });
+
+        return data.map((innerData) => {
+          return {
+            embedding: innerData.embedding,
+            input: inputs[innerData.index],
+          };
+        });
+      })
+    );
+    return res.status(200).json({ embeddings: embeddings.flat() });
+  } catch (e: any) {
+    // Rate limit error
+    if (e instanceof OpenAIApi.APIError && e.status === 429) {
+      return res.status(429).send({});
+    }
+    return res.status(500).send({});
+  }
+}
+
+
+
+### packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
+import { EmbeddingApi, EmbeddingCreationResult } from "./EmbeddingApi";
+import { OpenAIError, cleanOpenAIError } from "../utils/openai";
+import { Tokenizer } from "../llm";
+import { splitArray } from "./utils";
+
+import OpenAIApi from "openai";
+import { ILogger } from "@evo-ninja/agent-utils";
+
+export const DEFAULT_ADA_CONFIG = {
+  model: "text-embedding-ada-002",
+  maxTokensPerInput: 8191,
+  maxInputsPerRequest: 2048
+}
+
+export class OpenAIEmbeddingAPI implements EmbeddingApi {
+  private api: OpenAIApi;
+  
+  constructor(
+    private apiKey: string,
+    private logger: ILogger,
+    private tokenizer: Tokenizer,
+    private modelConfig: {
+      model: string,
+      maxTokensPerInput: number,
+      maxInputsPerRequest: number
+    } = DEFAULT_ADA_CONFIG,
+    private _maxRateLimitRetries: number = 5
+  ) {
+    this.api = new OpenAIApi({
+      apiKey: this.apiKey,
+      dangerouslyAllowBrowser: true
+    });
+  }
+
+  async createEmbeddings(input: string | string[], tries?: number): Promise<EmbeddingCreationResult[]> {
+    try {
+      const inputs = Array.isArray(input) ? input : [input];
+      this.validateInput(inputs);
+
+      const batchedInputs = splitArray(inputs, this.modelConfig.maxInputsPerRequest);
+
+      const results = await Promise.all(batchedInputs.map(async (inputs) => {
+        const { data } = await this.api.embeddings.create({
+          model: this.modelConfig.model,
+          input: inputs,
+        })
+
+        return data.map((innerData) => {
+          return {
+            embedding: innerData.embedding,
+            input: inputs[innerData.index]
+          }
+        });
+      }))
+  
+      return results.flat();
+    } catch (err) {
+      const error = cleanOpenAIError(err);
+
+      if (typeof error === "object") {
+        const maybeOpenAiError = error as Partial<OpenAIError>;
+
+        if (maybeOpenAiError.status === 429) {
+          this.logger.warning("Warning: OpenAI rate limit exceeded, sleeping for 15 seconds.");
+
+          await new Promise((resolve) => setTimeout(resolve, 15000));
+
+          if (!tries || tries < this._maxRateLimitRetries) {
+            return this.createEmbeddings(
+              input,
+              tries === undefined ? 0 : ++tries
+            );
+          }
+        }
+      }
+
+      throw new Error(JSON.stringify(error, null, 2));
+    }
+  };
+
+  validateInput(inputs: string[]) {
+    for (const input of inputs) {
+      if (this.tokenizer.encode(input).length > this.modelConfig.maxTokensPerInput) {
+        throw new Error(`Input exceeds max request tokens: ${this.modelConfig.maxTokensPerInput}`);
+      }
+    }
+  }
+}
+
+
+### apps/browser/next.config.js
+module.exports = {
+  reactStrictMode: true,
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
+};
+
+
+
+### packages/agents/src/agent-core/chunking/TextChunker.ts
+import { cleanWhitespace } from "./cleanWhitespace";
+
+export class TextChunker {
+  static fixedCharacterLength(text: string, opts: { chunkLength: number, overlap: number }): string[] {
+    const { chunkLength, overlap } = opts
+
+    if (chunkLength <= overlap) {
+      throw new Error("Chunk length must be greater than overlap length.");
+    }
+
+    let chunks: string[] = [];
+    let startIndex = 0;
+
+    while (startIndex < text.length) {
+      let endIndex = startIndex + chunkLength;
+      let chunk = text.slice(startIndex, endIndex);
+
+      chunks.push(chunk);
+
+      startIndex = endIndex - overlap;
+    }
+
+    return chunks;
+  }
+
+  static parentDocRetrieval(text: string, opts: {
+    parentChunker: (text: string) => string[],
+    childChunker: (parentText: string) => string[],
+  }): {
+    doc: string;
+    metadata: {
+      parent: string;
+    }
+  }[] {
+    const { parentChunker, childChunker } = opts
+
+    const parentChunks = parentChunker(text)
+    const parentAndChildDocs = parentChunks.map(parentChunk => {
+      return {
+        parent: parentChunk,
+        children: childChunker(parentChunk)
+      }
+    }).map(parentAndChildDoc => {
+      return {
+        metadatas: parentAndChildDoc.children.map(() => ({ parent: parentAndChildDoc.parent })),
+        documents: parentAndChildDoc.children
+      }
+    })
+
+    const docs = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.documents)
+    const metadatas = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.metadatas)
+
+    const chunks = docs.map((doc, index) => {
+      return {
+        doc,
+        metadata: metadatas[index]
+      }
+    });
+
+    return chunks;
+  }
+
+  static sentences(text: string): string[] {
+    const alphabets = "([A-Za-z])";
+    const prefixes = "(Mr|St|Mrs|Ms|Dr)[.]";
+    const suffixes = "(Inc|Ltd|Jr|Sr|Co)";
+    const starters = "(Mr|Mrs|Ms|Dr|Prof|Capt|Cpt|Lt|He\\s|She\\s|It\\s|They\\s|Their\\s|Our\\s|We\\s|But\\s|However\\s|That\\s|This\\s|Wherever)";
+    const acronyms = "([A-Z][.][A-Z][.](?:[A-Z][.])?)";
+    const websites = "[.](com|net|org|io|gov|edu|me)";
+    const digits = "([0-9])";
+    const multipleDots = /\\.{2,}/g;
+
+      text = " " + text + "  ";
+      text = text.replaceAll("\n", " ");
+      text = text.replaceAll(new RegExp(prefixes, 'g'), "$1<prd>");
+      text = text.replaceAll(new RegExp(websites, 'g'), "<prd>$1");
+      text = text.replaceAll(new RegExp(digits + "[.]" + digits, 'g'), "$1<prd>$2");
+      text = text.replaceAll(multipleDots, match => "<prd>".repeat(match.length) + "<stop>");
+      if (text.includes("Ph.D")) text = text.replaceAll("Ph.D.", "Ph<prd>D<prd>");
+      text = text.replaceAll(new RegExp("\\s" + alphabets + "[.] ", 'g'), " $1<prd> ");
+      text = text.replaceAll(new RegExp(acronyms + " " + starters, 'g'), "$1<stop> $2");
+      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>$3<prd>");
+      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>");
+      text = text.replaceAll(new RegExp(" " + suffixes + "[.] " + starters, 'g'), " $1<stop> $2");
+      text = text.replaceAll(new RegExp(" " + suffixes + "[.]", 'g'), " $1<prd>");
+      text = text.replaceAll(new RegExp(" " + alphabets + "[.]", 'g'), " $1<prd>");
+      if (text.includes("”")) text = text.replaceAll(".”", "”.");
+      if (text.includes("\"")) text = text.replaceAll(".\"", "\".");
+      if (text.includes("!")) text = text.replaceAll("!\"", "\"!");
+      if (text.includes("?")) text = text.replaceAll("?\"", "\"?");
+      text = text.replaceAll(".", ".<stop>");
+      text = text.replaceAll("?", "?<stop>");
+      text = text.replaceAll("!", "!<stop>");
+      text = text.replaceAll("<prd>", ".");
+      const sentences = text.split("<stop>").map(s => s.trim());
+      if (sentences && !sentences[sentences.length - 1]) sentences.pop();
+      return sentences;
+  }
+
+  static singleLine(content: string): string[] {
+    const lines = cleanWhitespace(content).split("\n");
+    return lines;
+  }
+
+  static multiLines(content: string, linesPerChunk: number): string[] {
+    const lines = cleanWhitespace(content).split("\n");
+    const chunks = [];
+    for (let i = 0; i < lines.length; i += linesPerChunk) {
+      chunks.push(lines.slice(i, i + linesPerChunk).join("\n"));
+    }
+    return chunks;
+  }
+
+  static characters(content: string, characterLimit: number): string[] {
+    const trimmedContent = cleanWhitespace(content);
+    const chunks = [];
+    let currentChunk = "";
+    for (const char of trimmedContent) {
+      if (currentChunk.length + 1 > characterLimit) {
+        chunks.push(currentChunk);
+        currentChunk = "";
+      }
+      currentChunk += char;
+    }
+    return chunks;
+  }
+
+  static words(content: string, characterLimit: number): string[] {
+    const trimmedContent = cleanWhitespace(content);
+    const chunks = [];
+    let currentChunk = "";
+    for (const word of trimmedContent.split(" ")) {
+      if (currentChunk.length + word.length > characterLimit) {
+        chunks.push(currentChunk);
+        currentChunk = "";
+      }
+      currentChunk += word;
+    }
+    // TODO: temp fix. Do more general solution
+    return chunks.filter(x => x.length > 0);
+  }
+}
+
+--------------------------------------------------------------------------------

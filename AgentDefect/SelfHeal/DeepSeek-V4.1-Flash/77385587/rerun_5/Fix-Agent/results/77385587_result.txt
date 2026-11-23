@@ -1,0 +1,350 @@
+Case ID: 77385587
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 19:58:56
+End Time: 2026-11-05 20:00:34
+Total Duration: 97.80 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""
+Persist a LangChain ParentDocumentRetriever (parent docs + child chunks) so it can be
+restored later WITHOUT re-running `add_documents`.
+
+Why the original code was wrong / output did not match expectations
+--------------------------------------------------------------------
+1. `docstore=InMemoryStore()` -> the parent documents only lived in RAM. Restarting the
+   script threw them away, so the retriever could never be restored.
+   Fix: back the docstore with `LocalFileStore` + `create_kv_docstore`, and let Chroma
+   persist the child chunks (its `persist_directory`). Both halves are now on disk.
+2. `retriever.add_documents(docs)` was always executed. When restoring you must NOT
+   re-ingest, otherwise you duplicate children/parents on every run.
+   Fix: ingest only when the persistent stores are empty (first run), otherwise just
+   rebuild the retriever objects and query them.
+3. The result was produced by `vector_db.max_marginal_relevance_search(query, k=3)`,
+   i.e. a raw similarity search over the *child chunks* collection. That is why the
+   output was small child chunks instead of the expected full/parent documents.
+   Fix: query the retriever itself (`retriever.invoke(query)`), which performs the
+   child lookup and then resolves the ids back to the *parent* documents.
+"""
+
+import os
+
+import nltk
+from dotenv import load_dotenv
+
+# embeddings (prefer the non-deprecated package, fall back to the community shim)
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:  # pragma: no cover
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+
+from langchain_text_splitters import NLTKTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.retrievers import ParentDocumentRetriever
+
+# Persistent docstore: replaces InMemoryStore
+from langchain.storage import LocalFileStore, create_kv_docstore
+
+from langchain_core.documents import Document
+
+load_dotenv()
+
+CHROMA_DIR = "./chroma_db_child"      # persists the child chunks (vectors + text)
+DOCSTORE_DIR = "./parent_doc_store"   # persists the parent documents (key/value)
+HF_CACHE = "./hf_cache"
+COLLECTION = "full_documents"
+
+
+def _build_retriever(persist_child_dir=CHROMA_DIR,
+                     persist_docstore_dir=DOCSTORE_DIR,
+                     hf_embed_path=HF_CACHE,
+                     child_chunk_size=400):
+    """Rebuild the retriever from the on-disk vector store + on-disk docstore."""
+    embedding_function = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-large-en-v1.5",
+        cache_folder=hf_embed_path,
+    )
+
+    child_splitter = NLTKTextSplitter(chunk_size=child_chunk_size)
+
+    # Child chunks live in Chroma, persisted to persist_child_dir
+    vectorstore = Chroma(
+        collection_name=COLLECTION,
+        embedding_function=embedding_function,
+        persist_directory=persist_child_dir,
+    )
+
+    # Parent documents live in a persistent key/value store instead of InMemoryStore
+    fs = LocalFileStore(persist_docstore_dir)
+    store = create_kv_docstore(fs)
+
+    retriever = ParentDocumentRetriever(
+        vectorstore=vectorstore,
+        docstore=store,
+        child_splitter=child_splitter,
+        search_kwargs={"k": 3},
+    )
+
+    return retriever, vectorstore, store
+
+
+def run_agent(query, ingest_if_empty=True):
+    # NLTK tokenizer data is required by NLTKTextSplitter
+    nltk.download("punkt", quiet=True)
+    nltk.download("punkt_tab", quiet=True)
+
+    docs = [
+        Document(page_content="Artificial Intelligence (AI) is technology that enables computers and machines to simulate human intelligence."),
+        Document(page_content="Machine learning (ML) is a type of Artificial Intelligence (AI) that teaches computers to find patterns in large datasets and make decisions or predictions without being explicitly programmed for every scenario, learning and improving from experience, much like humans do."),
+        Document(page_content="RAG most commonly refers to Retrieval-Augmented Generation, an AI technique that improves large language models (LLMs) by letting them access and use external, up-to-date information (like documents or databases) to generate more accurate, context-aware, and factual answers, preventing hallucinations and tailoring responses to specific knowledge bases without needing costly retraining."),
+    ]
+
+    retriever, vectorstore, store = _build_retriever()
+
+    # --- (Re)ingestion only when the persisted stores are empty -----------------
+    # `add_documents` writes the parent docs into the LocalFileStore-backed docstore
+    # and the child chunks into Chroma, so both survive process restarts.
+    docstore_empty = next(iter(store.yield_keys()), None) is None
+    if ingest_if_empty and docstore_empty:
+        retriever.add_documents(docs)
+
+    # Make sure everything is flushed to disk (no-op on newer Chroma versions).
+    if hasattr(vectorstore, "persist"):
+        try:
+            vectorstore.persist()
+        except Exception:
+            pass
+
+    # --- Query the retriever, not the raw vector store -------------------------
+    # This returns the PARENT documents (full text) built from the matching children,
+    # which is what a ParentDocumentRetriever is supposed to return.
+    if hasattr(retriever, "invoke"):
+        matching_doc = retriever.invoke(query)
+    else:  # older LangChain versions
+        matching_doc = retriever.get_relevant_documents(query)
+
+    return matching_doc
+
+
+if __name__ == "__main__":
+    os.makedirs(CHROMA_DIR, exist_ok=True)
+    os.makedirs(DOCSTORE_DIR, exist_ok=True)
+
+    query = "What is RAG?"
+
+    # First run: builds + persists both parent docs and child chunks.
+    result = run_agent(query)
+    print("Run 1 (ingested + retrieved parents):")
+    for i, doc in enumerate(result, start=1):
+        print(f"  [{i}] {doc.page_content[:300]}...")
+        print(f"      metadata: {doc.metadata}")
+
+    # Second run: nothing is re-added, everything is restored from disk.
+    restored = run_agent(query)
+    print("\nRun 2 (restored from disk, no add_documents):")
+    for i, doc in enumerate(restored, start=1):
+        print(f"  [{i}] {doc.page_content[:300]}...")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 20:00:34
+Duration: 97.80 seconds
+Verdict: ## Evaluation
+
+### 1. Diff review
+The fix restructures the module substantially:
+- Replaces `InMemoryStore` with `LocalFileStore` + `create_kv_docstore` (persistent docstore) — a reasonable idea.
+- Switches imports to newer package paths (`langchain_huggingface`, `langchain_text_splitters`, `langchain_community.vectorstores`, `langchain_core.documents`) — good modernization.
+- Queries `retriever.invoke(query)` instead of `vector_db.max_marginal_relevance_search(...)` — arguably better semantics (returns parents).
+- Only ingests when the docstore is empty.
+
+### 2. Structural validation
+`validate_fixed_code` reports ACCEPT, but that only checks structure/output format — it is not a substitute for checking the test contract.
+
+### 3. **Critical contract violation (test compatibility)**
+
+The test is:
+
+```python
+run_agent(query, store_location=store_path_1)
+run_agent(query, store_location=store_path_2)
+...
+self.assertTrue(os.path.isdir(store_path_1))
+self.assertTrue(os.path.isdir(store_path_2))
+self.assertGreaterEqual(len(files_1), 3)
+self.assertGreaterEqual(len(files_2), 3)
+```
+
+The fixed code's signature is:
+
+```python
+def run_agent(query, ingest_if_empty=True):
+```
+
+There is **no `store_location` parameter**. The test would fail immediately with:
+
+```
+TypeError: run_agent() got an unexpected keyword argument 'store_location'
+```
+
+Even ignoring the TypeError, the persistence paths are hard-coded module-level constants (`CHROMA_DIR = "./chroma_db_child"`, `DOCSTORE_DIR = "./parent_doc_store"`), and `run_agent` calls `_build_retriever()` with **no arguments**, so `persist_child_dir` / `persist_docstore_dir` are never overridden. Therefore:
+- `store_path_1` and `store_path_2` are never created → `assertTrue(os.path.isdir(...))` fails.
+- The two runs would share one global store, so the "two independent locations" semantics of the test are entirely unfulfilled.
+- The `os.makedirs(...)` calls only exist under `__main__`, which is never executed under `unittest`.
+- Additionally, `ingest_if_empty` gating means the second run at a *fresh* location would still ingest (docstore would be empty) — but that logic is moot since locations are ignored.
+
+### 4. API verification notes
+`ParentDocumentRetriever(vectorstore, docstore, child_splitter, search_kwargs)` and the `LocalFileStore` / `create_kv_docstore` docstore pattern are legitimate LangChain APIs (matches the documented `ParentDocumentRetriever` example). The API calls themselves are fine; the failure is purely in the function signature/behavior contract required by the test.
+
+## Verdict
+
+**REJECT**
+
+Reasoning: Although the refactor modernizes imports and makes the docstore persistent (a genuine improvement over `InMemoryStore`), the fixed code breaks the required interface. `run_agent` no longer accepts the `store_location` keyword argument that the test passes, and the store paths are hard-coded and never parameterized (`_build_retriever()` is invoked with defaults). The test will raise `TypeError` on the very first call and, even if patched, would never create `./test_store_location_1` or `./test_store_location_2`, so both `assertTrue(os.path.isdir(...))` and the ≥3-files assertions cannot pass. The fix should keep `run_agent(query, store_location=...)` and use `store_location` for both the Chroma `persist_directory` and the `LocalFileStore` path.
+--------------------------------------------------------------------------------
+"""
+Persist a LangChain ParentDocumentRetriever (parent docs + child chunks) so it can be
+restored later WITHOUT re-running `add_documents`.
+
+Why the original code was wrong / output did not match expectations
+--------------------------------------------------------------------
+1. `docstore=InMemoryStore()` -> the parent documents only lived in RAM. Restarting the
+   script threw them away, so the retriever could never be restored.
+   Fix: back the docstore with `LocalFileStore` + `create_kv_docstore`, and let Chroma
+   persist the child chunks (its `persist_directory`). Both halves are now on disk.
+2. `retriever.add_documents(docs)` was always executed. When restoring you must NOT
+   re-ingest, otherwise you duplicate children/parents on every run.
+   Fix: ingest only when the persistent stores are empty (first run), otherwise just
+   rebuild the retriever objects and query them.
+3. The result was produced by `vector_db.max_marginal_relevance_search(query, k=3)`,
+   i.e. a raw similarity search over the *child chunks* collection. That is why the
+   output was small child chunks instead of the expected full/parent documents.
+   Fix: query the retriever itself (`retriever.invoke(query)`), which performs the
+   child lookup and then resolves the ids back to the *parent* documents.
+"""
+
+import os
+
+import nltk
+from dotenv import load_dotenv
+
+# embeddings (prefer the non-deprecated package, fall back to the community shim)
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:  # pragma: no cover
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+
+from langchain_text_splitters import NLTKTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.retrievers import ParentDocumentRetriever
+
+# Persistent docstore: replaces InMemoryStore
+from langchain.storage import LocalFileStore, create_kv_docstore
+
+from langchain_core.documents import Document
+
+load_dotenv()
+
+CHROMA_DIR = "./chroma_db_child"      # persists the child chunks (vectors + text)
+DOCSTORE_DIR = "./parent_doc_store"   # persists the parent documents (key/value)
+HF_CACHE = "./hf_cache"
+COLLECTION = "full_documents"
+
+
+def _build_retriever(persist_child_dir=CHROMA_DIR,
+                     persist_docstore_dir=DOCSTORE_DIR,
+                     hf_embed_path=HF_CACHE,
+                     child_chunk_size=400):
+    """Rebuild the retriever from the on-disk vector store + on-disk docstore."""
+    embedding_function = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-large-en-v1.5",
+        cache_folder=hf_embed_path,
+    )
+
+    child_splitter = NLTKTextSplitter(chunk_size=child_chunk_size)
+
+    # Child chunks live in Chroma, persisted to persist_child_dir
+    vectorstore = Chroma(
+        collection_name=COLLECTION,
+        embedding_function=embedding_function,
+        persist_directory=persist_child_dir,
+    )
+
+    # Parent documents live in a persistent key/value store instead of InMemoryStore
+    fs = LocalFileStore(persist_docstore_dir)
+    store = create_kv_docstore(fs)
+
+    retriever = ParentDocumentRetriever(
+        vectorstore=vectorstore,
+        docstore=store,
+        child_splitter=child_splitter,
+        search_kwargs={"k": 3},
+    )
+
+    return retriever, vectorstore, store
+
+
+def run_agent(query, ingest_if_empty=True):
+    # NLTK tokenizer data is required by NLTKTextSplitter
+    nltk.download("punkt", quiet=True)
+    nltk.download("punkt_tab", quiet=True)
+
+    docs = [
+        Document(page_content="Artificial Intelligence (AI) is technology that enables computers and machines to simulate human intelligence."),
+        Document(page_content="Machine learning (ML) is a type of Artificial Intelligence (AI) that teaches computers to find patterns in large datasets and make decisions or predictions without being explicitly programmed for every scenario, learning and improving from experience, much like humans do."),
+        Document(page_content="RAG most commonly refers to Retrieval-Augmented Generation, an AI technique that improves large language models (LLMs) by letting them access and use external, up-to-date information (like documents or databases) to generate more accurate, context-aware, and factual answers, preventing hallucinations and tailoring responses to specific knowledge bases without needing costly retraining."),
+    ]
+
+    retriever, vectorstore, store = _build_retriever()
+
+    # --- (Re)ingestion only when the persisted stores are empty -----------------
+    # `add_documents` writes the parent docs into the LocalFileStore-backed docstore
+    # and the child chunks into Chroma, so both survive process restarts.
+    docstore_empty = next(iter(store.yield_keys()), None) is None
+    if ingest_if_empty and docstore_empty:
+        retriever.add_documents(docs)
+
+    # Make sure everything is flushed to disk (no-op on newer Chroma versions).
+    if hasattr(vectorstore, "persist"):
+        try:
+            vectorstore.persist()
+        except Exception:
+            pass
+
+    # --- Query the retriever, not the raw vector store -------------------------
+    # This returns the PARENT documents (full text) built from the matching children,
+    # which is what a ParentDocumentRetriever is supposed to return.
+    if hasattr(retriever, "invoke"):
+        matching_doc = retriever.invoke(query)
+    else:  # older LangChain versions
+        matching_doc = retriever.get_relevant_documents(query)
+
+    return matching_doc
+
+
+if __name__ == "__main__":
+    os.makedirs(CHROMA_DIR, exist_ok=True)
+    os.makedirs(DOCSTORE_DIR, exist_ok=True)
+
+    query = "What is RAG?"
+
+    # First run: builds + persists both parent docs and child chunks.
+    result = run_agent(query)
+    print("Run 1 (ingested + retrieved parents):")
+    for i, doc in enumerate(result, start=1):
+        print(f"  [{i}] {doc.page_content[:300]}...")
+        print(f"      metadata: {doc.metadata}")
+
+    # Second run: nothing is re-added, everything is restored from disk.
+    restored = run_agent(query)
+    print("\nRun 2 (restored from disk, no add_documents):")
+    for i, doc in enumerate(restored, start=1):
+        print(f"  [{i}] {doc.page_content[:300]}...")
+
+--------------------------------------------------------------------------------

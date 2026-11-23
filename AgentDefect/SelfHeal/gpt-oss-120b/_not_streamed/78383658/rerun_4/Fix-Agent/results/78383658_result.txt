@@ -1,0 +1,473 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 2
+Start Time: 2026-11-03 21:37:18
+End Time: 2026-11-03 21:39:18
+Total Duration: 120.30 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+from langchain.document_loaders import CSVLoader
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+
+def load_documents(csv_path: str):
+    """Load CSV rows as LangChain Document objects.
+    Each row becomes a Document where `page_content` is a formatted string of the
+    row (e.g. "Name: <name> Description: <description>") and the original row
+    fields are kept in the metadata for later reference.
+    """
+    loader = CSVLoader(file_path=csv_path)
+    raw_docs = loader.load()
+    # Convert raw docs (which may already have nice content) to a clearer format
+    formatted_docs = []
+    for i, doc in enumerate(raw_docs):
+        # The loader puts the CSV columns into `metadata` and the whole row into
+        # `page_content`. We create a concise text representation that the
+        # embedding model can understand.
+        name = doc.metadata.get("Name", "")
+        description = doc.metadata.get("Description", "")
+        content = f"Name: {name}\nDescription: {description}"
+        formatted_docs.append(
+            doc.__class__(
+                page_content=content,
+                metadata={**doc.metadata, "_row_index": i},
+            )
+        )
+    return formatted_docs
+
+
+def build_vectorstore(docs):
+    """Create a Chroma vector store from the given documents.
+    The store is persisted in a temporary in‑memory directory because the
+    function is intended to be run repeatedly during development.
+    """
+    # Using a deterministic collection name keeps the in‑memory store simple.
+    return Chroma.from_documents(documents=docs, embedding=OpenAIEmbeddings(), collection_name="control_collection")
+
+
+def find_duplicate_pairs(vectorstore, top_k: int = 5, score_threshold: float = 0.3):
+    """Return a list of (row_a, row_b, similarity_score) tuples.
+    `top_k` is the number of neighbours each document queries for (including
+    itself). We discard the self‑match and keep only pairs whose similarity
+    score (the returned *distance*) is below ``score_threshold`` – lower distance
+    means higher similarity.
+    The function also deduplicates the pairs so that (a, b) and (b, a) appear
+    only once.
+    """
+    docs = vectorstore.get()['documents'] if hasattr(vectorstore, 'get') else []
+    # If the vectorstore does not expose raw docs, fall back to the original list
+    # passed when creating it – the caller can supply that list as metadata.
+    # For simplicity we retrieve the metadata via a dummy search.
+    all_docs = vectorstore._collection.get(include=[])  # pragma: no cover
+    # However, the most reliable way is to store the docs separately.
+    # We'll instead keep the docs that were originally indexed.
+    # The `vectorstore._persisted_documents` attribute exists in Chroma.
+    all_docs = getattr(vectorstore, "_persisted_documents", [])
+    if not all_docs:
+        raise RuntimeError("Unable to retrieve original documents from vectorstore.")
+
+    seen = set()
+    pairs = []
+    for doc in all_docs:
+        # Retrieve the most similar neighbours for this document.
+        similar = vectorstore.similarity_search_with_score(doc.page_content, k=top_k)
+        for neighbour_doc, score in similar:
+            # Skip the document itself.
+            if neighbour_doc.metadata.get("_row_index") == doc.metadata.get("_row_index"):
+                continue
+            # Apply threshold.
+            if score > score_threshold:
+                continue
+            idx_a = doc.metadata["_row_index"]
+            idx_b = neighbour_doc.metadata["_row_index"]
+            pair_key = tuple(sorted((idx_a, idx_b)))
+            if pair_key in seen:
+                continue
+            seen.add(pair_key)
+            pairs.append((idx_a, idx_b, score))
+    # Sort by similarity (lowest distance first).
+    pairs.sort(key=lambda x: x[2])
+    return pairs
+
+
+def format_pairs(pairs, docs):
+    """Create a human‑readable string of duplicate pairs with similarity scores.
+    ``docs`` is the list returned by :func:`load_documents`.
+    """
+    lines = []
+    for idx_a, idx_b, score in pairs:
+        doc_a = docs[idx_a]
+        doc_b = docs[idx_b]
+        name_a = doc_a.metadata.get("Name", "?")
+        name_b = doc_b.metadata.get("Name", "?")
+        lines.append(
+            f"- Pair: '{name_a}' ↔ '{name_b}' | Similarity score (distance): {score:.4f}"
+        )
+    if not lines:
+        return "No duplicate control pairs found with the given threshold."
+    return "Duplicate control pairs found:\n" + "\n".join(lines)
+
+
+def run_agent(query: str):
+    """Answer the user query and, if the query asks for duplicate controls,
+    return a scored list of similar control pairs.
+    """
+    # Load and embed the CSV.
+    docs = load_documents(csv_path="control.csv")
+    vectorstore = build_vectorstore(docs)
+
+    # Simple heuristic: if the query mentions "duplicate" or "similar" we
+    # return the similarity list; otherwise we fall back to a generic RAG answer.
+    lowered = query.lower()
+    if "duplicate" in lowered or "similar" in lowered or "duplicate" in lowered:
+        pairs = find_duplicate_pairs(vectorstore, top_k=10, score_threshold=0.4)
+        return format_pairs(pairs, docs)
+
+    # Generic RAG path – unchanged from the original implementation.
+    retriever = vectorstore.as_retriever()
+    template = """You are an assistant for question-answering tasks.
+
+    Use the following pieces of retrieved context to answer the question.
+
+    If you don't know the answer, just say that you don't know.
+
+    Use three sentences maximum and keep the answer concise.
+
+    Question: {question}
+
+    Context: {context}
+
+    Answer:
+
+    """
+    prompt = ChatPromptTemplate.from_template(template)
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", verbose=False)
+    rag_chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return rag_chain.invoke(query)
+
+
+if __name__ == "__main__":
+    # Example query that requests similar/duplicate controls.
+    query = "Give me a list of duplicate control pairs from the CSV with similarity scores."
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-03 21:38:02
+Duration: 43.72 seconds
+Verdict: **REJECT**
+
+**Reasoning**
+
+The test suite expects `run_agent` to return a dictionary of the form:
+
+```python
+{
+    "results": [
+        {...},  # each item a dict
+        ...
+    ]
+}
+```
+
+The original (buggy) implementation built a RAG chain that ultimately produced a **structured** output (presumably a dict) via `StrOutputParser`.  
+
+The fixed version replaces the entire RAG chain with a direct similarity search:
+
+```python
+results = vectorstore.similarity_search_with_score(query, k=top_k)
+...
+return "\n".join(formatted_lines)
+```
+
+Consequences:
+
+1. **Return Type Mismatch** – The function now returns a **string**, not a dictionary.
+2. **Missing Keys** – No `"results"` key is present, causing the test’s `assertIn("results", result)` to fail.
+3. **Incorrect Item Structure** – The test iterates over `result["results"]` expecting each element to be a dict; the new implementation provides formatted strings instead.
+
+Therefore, the fixed code does **not** satisfy the test expectations, making it unsuitable.
+
+**Conclusion:** The fix is incorrect with respect to the provided test; the answer should be **REJECT**.
+--------------------------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+from langchain.document_loaders import CSVLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+
+def run_agent(query: str, top_k: int = 10) -> str:
+    """Return a list of the most similar rows from ``control.csv`` together with
+    their similarity scores.
+
+    Args:
+        query: The natural‑language query to compare against the CSV rows.
+        top_k: Number of top‑matching rows to return.
+
+    Returns:
+        A formatted string containing each matching row and its cosine similarity
+        score (higher = more similar).
+    """
+    # Load CSV – each row becomes a Document whose ``page_content`` holds the raw
+    # CSV line. If the CSV has a header, CSVLoader drops it automatically.
+    loader = CSVLoader(file_path="control.csv")
+    documents = loader.load()
+
+    # Split long rows into manageable chunks – this is useful if a row contains a
+    # very long description. The default chunk size mirrors the original code but
+    # can be tweaked.
+    splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = splitter.split_documents(documents)
+
+    # Build a vector store from the chunks.
+    vectorstore = Chroma.from_documents(documents=chunks, embedding=OpenAIEmbeddings())
+
+    # Perform a similarity search that also returns the raw cosine similarity scores.
+    # ``similarity_search_with_score`` returns a list of ``(Document, float)`` pairs.
+    results = vectorstore.similarity_search_with_score(query, k=top_k)
+
+    if not results:
+        return "No similar entries were found."
+
+    # Format the output – we include the row content and a rounded similarity
+    # score. The score from Chroma is a distance (lower is more similar); to present
+    # it as a similarity we invert it to a 0‑1 range. Chroma uses inner product
+    # similarity, so we can simply report the raw score.
+    formatted_lines = []
+    for idx, (doc, score) in enumerate(results, start=1):
+        # Ensure the content is a single line for readability.
+        content = " ".join(doc.page_content.split())
+        formatted_lines.append(f"{idx}. {content} (Score: {score:.4f})")
+
+    return "\n".join(formatted_lines)
+
+
+if __name__ == "__main__":
+    # Example query – adjust as needed.
+    query = "Find movies for family, combining their Name and Description."
+    print(run_agent(query))
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-03 21:39:18
+Duration: 76.58 seconds
+Verdict: **REJECT**
+
+**Reasoning**
+
+1. **Test expectations not met**  
+   The test suite (`TestRunAgentStructuredOutput`) expects `run_agent` to return a **dictionary** containing a key `"results"` whose value is a list of dictionaries. The fixed implementation returns either:
+   * a **string** generated by `format_pairs` when the query mentions “duplicate”/“similar”, or  
+   * the raw output of the LLM chain (also a **string**) for all other queries.  
+   No dictionary with a `"results"` field is ever produced, so the assertions in the test (`isinstance(result, dict)`, `assertIn("results", result)`, etc.) will all fail.
+
+2. **Unrelated functionality**  
+   The changes replace the original simple RAG pipeline with a large amount of unrelated code for detecting duplicate CSV rows. This diverges from the original purpose (answering a question about movies) and does not align with the test’s focus on structured output.
+
+3. **Potential API misuse**  
+   * `vectorstore.get()['documents']` – `Chroma` does not expose a `get` method that returns a `'documents'` key.  
+   * Accessing `vectorstore._collection` and `vectorstore._persisted_documents` relies on private attributes that are not part of the public API and may not exist in the installed version.  
+   * `vectorstore.similarity_search_with_score` returns tuples of `(Document, float)`, but the code incorrectly treats the float as a similarity *score* and compares it with a `score_threshold` assuming lower is more similar. In LangChain/Chroma the returned float is a **distance**, but the threshold logic is inverted relative to typical similarity semantics.
+
+4. **Missing imports**  
+   The original code used `CharacterTextSplitter`, which was removed, but the new code never imports any alternative splitter. If the CSV rows are longer than the embedding model’s token limit, the embeddings may fail.
+
+5. **Validation result**  
+   The `validate_fixed_code` tool reported “ACCEPT”, but that only verifies syntactic correctness against an internal schema; it does not verify the functional contract required by the test suite.
+
+Because the fixed code does **not** return data in the required structured format and introduces several API misuse issues, it fails the given unit test. Therefore the appropriate verdict is **REJECT**.
+--------------------------------------------------------------------------------
+import os
+from dotenv import load_dotenv
+
+from langchain.document_loaders import CSVLoader
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+
+def load_documents(csv_path: str):
+    """Load CSV rows as LangChain Document objects.
+    Each row becomes a Document where `page_content` is a formatted string of the
+    row (e.g. "Name: <name> Description: <description>") and the original row
+    fields are kept in the metadata for later reference.
+    """
+    loader = CSVLoader(file_path=csv_path)
+    raw_docs = loader.load()
+    # Convert raw docs (which may already have nice content) to a clearer format
+    formatted_docs = []
+    for i, doc in enumerate(raw_docs):
+        # The loader puts the CSV columns into `metadata` and the whole row into
+        # `page_content`. We create a concise text representation that the
+        # embedding model can understand.
+        name = doc.metadata.get("Name", "")
+        description = doc.metadata.get("Description", "")
+        content = f"Name: {name}\nDescription: {description}"
+        formatted_docs.append(
+            doc.__class__(
+                page_content=content,
+                metadata={**doc.metadata, "_row_index": i},
+            )
+        )
+    return formatted_docs
+
+
+def build_vectorstore(docs):
+    """Create a Chroma vector store from the given documents.
+    The store is persisted in a temporary in‑memory directory because the
+    function is intended to be run repeatedly during development.
+    """
+    # Using a deterministic collection name keeps the in‑memory store simple.
+    return Chroma.from_documents(documents=docs, embedding=OpenAIEmbeddings(), collection_name="control_collection")
+
+
+def find_duplicate_pairs(vectorstore, top_k: int = 5, score_threshold: float = 0.3):
+    """Return a list of (row_a, row_b, similarity_score) tuples.
+    `top_k` is the number of neighbours each document queries for (including
+    itself). We discard the self‑match and keep only pairs whose similarity
+    score (the returned *distance*) is below ``score_threshold`` – lower distance
+    means higher similarity.
+    The function also deduplicates the pairs so that (a, b) and (b, a) appear
+    only once.
+    """
+    docs = vectorstore.get()['documents'] if hasattr(vectorstore, 'get') else []
+    # If the vectorstore does not expose raw docs, fall back to the original list
+    # passed when creating it – the caller can supply that list as metadata.
+    # For simplicity we retrieve the metadata via a dummy search.
+    all_docs = vectorstore._collection.get(include=[])  # pragma: no cover
+    # However, the most reliable way is to store the docs separately.
+    # We'll instead keep the docs that were originally indexed.
+    # The `vectorstore._persisted_documents` attribute exists in Chroma.
+    all_docs = getattr(vectorstore, "_persisted_documents", [])
+    if not all_docs:
+        raise RuntimeError("Unable to retrieve original documents from vectorstore.")
+
+    seen = set()
+    pairs = []
+    for doc in all_docs:
+        # Retrieve the most similar neighbours for this document.
+        similar = vectorstore.similarity_search_with_score(doc.page_content, k=top_k)
+        for neighbour_doc, score in similar:
+            # Skip the document itself.
+            if neighbour_doc.metadata.get("_row_index") == doc.metadata.get("_row_index"):
+                continue
+            # Apply threshold.
+            if score > score_threshold:
+                continue
+            idx_a = doc.metadata["_row_index"]
+            idx_b = neighbour_doc.metadata["_row_index"]
+            pair_key = tuple(sorted((idx_a, idx_b)))
+            if pair_key in seen:
+                continue
+            seen.add(pair_key)
+            pairs.append((idx_a, idx_b, score))
+    # Sort by similarity (lowest distance first).
+    pairs.sort(key=lambda x: x[2])
+    return pairs
+
+
+def format_pairs(pairs, docs):
+    """Create a human‑readable string of duplicate pairs with similarity scores.
+    ``docs`` is the list returned by :func:`load_documents`.
+    """
+    lines = []
+    for idx_a, idx_b, score in pairs:
+        doc_a = docs[idx_a]
+        doc_b = docs[idx_b]
+        name_a = doc_a.metadata.get("Name", "?")
+        name_b = doc_b.metadata.get("Name", "?")
+        lines.append(
+            f"- Pair: '{name_a}' ↔ '{name_b}' | Similarity score (distance): {score:.4f}"
+        )
+    if not lines:
+        return "No duplicate control pairs found with the given threshold."
+    return "Duplicate control pairs found:\n" + "\n".join(lines)
+
+
+def run_agent(query: str):
+    """Answer the user query and, if the query asks for duplicate controls,
+    return a scored list of similar control pairs.
+    """
+    # Load and embed the CSV.
+    docs = load_documents(csv_path="control.csv")
+    vectorstore = build_vectorstore(docs)
+
+    # Simple heuristic: if the query mentions "duplicate" or "similar" we
+    # return the similarity list; otherwise we fall back to a generic RAG answer.
+    lowered = query.lower()
+    if "duplicate" in lowered or "similar" in lowered or "duplicate" in lowered:
+        pairs = find_duplicate_pairs(vectorstore, top_k=10, score_threshold=0.4)
+        return format_pairs(pairs, docs)
+
+    # Generic RAG path – unchanged from the original implementation.
+    retriever = vectorstore.as_retriever()
+    template = """You are an assistant for question-answering tasks.
+
+    Use the following pieces of retrieved context to answer the question.
+
+    If you don't know the answer, just say that you don't know.
+
+    Use three sentences maximum and keep the answer concise.
+
+    Question: {question}
+
+    Context: {context}
+
+    Answer:
+
+    """
+    prompt = ChatPromptTemplate.from_template(template)
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", verbose=False)
+    rag_chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return rag_chain.invoke(query)
+
+
+if __name__ == "__main__":
+    # Example query that requests similar/duplicate controls.
+    query = "Give me a list of duplicate control pairs from the CSV with similarity scores."
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------

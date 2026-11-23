@@ -1,0 +1,2307 @@
+Case ID: evoninja_652
+Status: ACCEPTED
+Final Attempt: 2
+Start Time: 2026-11-13 13:55:42
+End Time: 2026-11-13 15:49:44
+Total Duration: 6842.28 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+### apps/browser/lib/hooks/useEvoService.ts
+import {
+  allowTelemetryAtom,
+  capReachedAtom,
+  evoServiceAtom,
+  localOpenAiApiKeyAtom,
+  settingsModalAtom,
+  workspaceAtom,
+  errorAtom,
+} from "@/lib/store";
+import { EvoThreadCallbacks, EvoThreadConfig } from "@/lib/services/evo/EvoThread";
+import { useAddChatLog } from "@/lib/mutations/useAddChatLog";
+import { useAddMessages } from "@/lib/mutations/useAddMessages";
+import { useAddVariable } from "@/lib/mutations/useAddVariable";
+import { useChats } from "@/lib/queries/useChats";
+import { SupabaseWorkspace } from "@/lib/supabase/SupabaseWorkspace";
+import { useSupabaseClient } from "@/lib/supabase/useSupabaseClient";
+import { useWorkspaceFilesUpdate } from "@/lib/hooks/useWorkspaceFilesUpdate";
+import { useWorkspaceUploadUpdate } from "@/lib/hooks/useWorkspaceUploadUpdate";
+import { ChatLog } from "@/components/Chat";
+import { Workspace, InMemoryWorkspace } from "@evo-ninja/agent-utils";
+import { ChatLogType, ChatMessage } from "@evo-ninja/agents";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+import { useState, useEffect, useRef } from "react";
+import { useAtom } from "jotai";
+
+export const useEvoService = (
+  chatId: string | "<anon>" | undefined,
+  isAuthenticated: boolean,
+): {
+  logs: ChatLog[];
+  isConnected: boolean;
+  isStarting: boolean;
+  isRunning: boolean;
+  status: string | undefined;
+  handleStart: (goal: string, files?: InMemoryFile[]) => Promise<void>;
+} => {
+  const supabase = useSupabaseClient();
+
+  // Globals
+  const [evoService] = useAtom(evoServiceAtom);
+  const [allowTelemetry] = useAtom(allowTelemetryAtom);
+  const [openAiApiKey] = useAtom(localOpenAiApiKeyAtom);
+  const [, setWorkspaceAtom] = useAtom(workspaceAtom);
+  const [, setCapReached] = useAtom(capReachedAtom);
+  const [, setSettingsModalOpen] = useAtom(settingsModalAtom);
+  const [, setError] = useAtom(errorAtom);
+
+  // State
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [isStarting, setIsStarting] = useState<boolean>(false);
+  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [chatLog, setChatLogState] = useState<ChatLog[]>([]);
+  const [status, setStatus] = useState<string | undefined>(undefined);
+
+  // The workspace that belongs to the currently connected thread. It is used
+  // to be sure that workspace updates (e.g. the files of an example prompt)
+  // are applied to the workspace of the *current* chat, and never to the
+  // workspace of a chat that has been viewed previously.
+  const currentWorkspaceRef = useRef<Workspace | undefined>(undefined);
+  // Connection in progress, used to avoid connecting (and loading the
+  // workspace) twice for the same chat.
+  const connectingRef = useRef<
+    { chatId: string; promise: Promise<void> } | undefined
+  >(undefined);
+
+  // Mutations
+  const { mutateAsync: addChatLog } = useAddChatLog();
+  const { mutateAsync: addMessages } = useAddMessages();
+  const { mutateAsync: addVariable } = useAddVariable();
+
+  // Queries
+  const { refetch: fetchChats } = useChats();
+
+  // Helpers
+  const workspaceFilesUpdate = useWorkspaceFilesUpdate();
+  const workspaceUploadUpdate = useWorkspaceUploadUpdate();
+
+  const setChatLog = (chatLog: ChatLog[]) => {
+    // If the most recent message is the user's goal,
+    // append an informative message from Evo
+    if (chatLog.length !== 0 && chatLog[chatLog.length - 1].user === "user") {
+      setChatLogState([
+        ...chatLog, {
+        user: "evo",
+        title: "Reviewing your prompt..."
+      }]);
+    } else {
+      setChatLogState([...chatLog]);
+    }
+  };
+
+  const disconnectEvoService = () => {
+    setIsConnected(false);
+    currentWorkspaceRef.current = undefined;
+    evoService.disconnect();
+  }
+
+  const connectEvoService = async (chatId: string): Promise<void> => {
+    const pendingConnection = connectingRef.current;
+
+    if (pendingConnection) {
+      if (pendingConnection.chatId === chatId) {
+        // A connection for this chat is already in progress (e.g. triggered by
+        // the effect reacting to the chat id). Wait for it instead of
+        // connecting and loading the workspace a second time.
+        await pendingConnection.promise;
+        return;
+      }
+
+      // Let the connection of the other chat settle first, otherwise the two
+      // connections could overwrite each other's workspace.
+      await pendingConnection.promise.catch(() => undefined);
+    }
+
+    const currentThread = evoService.current;
+
+    if (
+      currentThread &&
+      currentThread.chatId === chatId &&
+      currentWorkspaceRef.current
+    ) {
+      return;
+    }
+
+    const promise = (async () => {
+      disconnectEvoService();
+
+      const config: EvoThreadConfig = {
+        chatId,
+        loadChatLog,
+        loadWorkspace,
+        onChatLogAdded: handleChatLogAdded,
+        onMessagesAdded: handleMessagesAdded,
+        onVariableSet: handleVariableSet
+      };
+      const callbacks: EvoThreadCallbacks = {
+        setIsRunning,
+        setChatLog,
+        setWorkspace,
+        setStatus,
+        onGoalCapReached: () => {
+          setCapReached(true);
+          setSettingsModalOpen(true);
+        },
+        onError: (error: string) => {
+          console.error(error);
+          setError("Failed to start Evo.");
+        },
+      };
+      await evoService.connect(config, callbacks);
+      setIsConnected(true);
+    })();
+
+    connectingRef.current = { chatId, promise };
+
+    try {
+      await promise;
+    } finally {
+      if (connectingRef.current && connectingRef.current.promise === promise) {
+        connectingRef.current = undefined;
+      }
+    }
+  };
+
+  const loadChatLog = async (chatId: string) => {
+    if (chatId === "<anon>") {
+      return [];
+    }
+
+    const { data: chats, error } = await fetchChats();
+
+    if (error) {
+      console.error(error);
+      setError("Failed to fetch user chats.");
+      return [];
+    }
+
+    const currentChat = chats?.find(c => c.id === chatId);
+
+    if (!currentChat) {
+      return [];
+    }
+
+    return currentChat.logs;
+  };
+
+  async function loadWorkspace(chatId: string): Promise<Workspace> {
+    const workspace = isAuthenticated ?
+      new SupabaseWorkspace(chatId, supabase.storage) :
+      new InMemoryWorkspace();
+
+    // Apply the files that have been uploaded before the workspace existed
+    // (e.g. the files of an example prompt).
+    await workspaceUploadUpdate(workspace);
+
+    currentWorkspaceRef.current = workspace;
+
+    return workspace;
+  };
+
+  const setWorkspace = async (workspace: Workspace) => {
+    currentWorkspaceRef.current = workspace;
+    setWorkspaceAtom(workspace);
+    await workspaceFilesUpdate(workspace);
+  };
+
+  const applyWorkspaceUploads = async (files: InMemoryFile[]) => {
+    const workspace = currentWorkspaceRef.current;
+
+    if (!workspace) {
+      return;
+    }
+
+    await workspaceUploadUpdate(workspace, files);
+    await setWorkspace(workspace);
+  };
+
+  const handleChatLogAdded = async (log: ChatLog) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addChatLog({ chatId, log });
+  };
+
+  const handleMessagesAdded = async (type: ChatLogType, messages: ChatMessage[]) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addMessages({
+      chatId,
+      messages,
+      type
+    });
+  };
+
+  const handleVariableSet = async (key: string, value: string) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addVariable({
+      chatId,
+      key,
+      value
+    });
+  };
+
+  const handleStart = async (
+    goal: string,
+    files?: InMemoryFile[]
+  ): Promise<void> => {
+    if (isStarting) {
+      return;
+    }
+
+    if (!chatId) {
+      setError("Trying to start a goal without a chatId.");
+      return;
+    }
+
+    setIsStarting(true);
+
+    try {
+      // This either connects a new thread for the chat, or reuses the already
+      // connected one. Either way, once it resolves,
+      // `currentWorkspaceRef.current` holds the workspace of `chatId`, and not
+      // the workspace of a previously viewed chat.
+      await connectEvoService(chatId);
+
+      if (files && files.length > 0) {
+        // The files (e.g. of an example prompt) have to be applied to the
+        // workspace of the chat that is being started. Doing it here, after
+        // the chat has been connected, makes sure the files are never written
+        // to the workspace of the chat that has been viewed before.
+        await applyWorkspaceUploads(files);
+      }
+
+      setChatLog([
+        ...chatLog,
+        {
+          user: "user",
+          title: goal
+        }
+      ]);
+
+      evoService.start({
+        goal,
+        allowTelemetry,
+        openAiApiKey
+      });
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (chatId) {
+      connectEvoService(chatId);
+    } else {
+      if (evoService.current) {
+        disconnectEvoService();
+      }
+    }
+  }, [chatId]);
+
+  return {
+    logs: chatLog,
+    isConnected,
+    isStarting,
+    isRunning,
+    handleStart,
+    status
+  };
+};
+
+
+
+### apps/browser/components/Chat.tsx
+import {
+  showDisclaimerAtom,
+  errorAtom,
+  chatInfoAtom,
+  welcomeModalAtom,
+  signInModalAtom,
+  settingsModalAtom,
+} from "@/lib/store";
+import { useWorkspaceUploadDrop } from "@/lib/hooks/useWorkspaceUploadDrop";
+import { useFirstTimeUser } from "@/lib/hooks/useFirstTimeUser";
+import ExamplePrompts from "@/components/ExamplePrompts";
+import ChatLogs from "@/components/ChatLogs";
+import Disclaimer from "@/components/modals/Disclaimer";
+import Logo from "@/components/Logo";
+import Button from "@/components/Button";
+import ChatInputButton from "@/components/ChatInputButton";
+import TextField from "@/components/TextField";
+import React, { useState, ChangeEvent } from "react";
+import { UploadSimple } from "@phosphor-icons/react";
+import { useAtom } from "jotai";
+import clsx from "clsx";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+
+export interface ChatLog {
+  title: string;
+  content?: string;
+  user: string;
+  color?: string;
+  created_at?: string
+}
+
+export interface ChatProps {
+  logs: ChatLog[];
+  isStarting: boolean;
+  isRunning: boolean;
+  onGoalSubmit: (goal: string, files?: InMemoryFile[]) => Promise<void>;
+  onUpload: (upload: InMemoryFile[]) => void;
+  status: string | undefined;
+}
+
+const Chat: React.FC<ChatProps> = ({
+  logs,
+  isStarting,
+  isRunning,
+  onGoalSubmit,
+  onUpload,
+  status
+}: ChatProps) => {
+  const [{ id: chatId, name: chatName }] = useAtom(chatInfoAtom);
+  const [showDisclaimer, setShowDisclaimer] = useAtom(showDisclaimerAtom);
+  const [, setError] = useAtom(errorAtom);
+  const [welcomeModalOpen, setWelcomeModalOpen] = useAtom(welcomeModalAtom);
+  const [signInModalOpen] = useAtom(signInModalAtom);
+  const [settingsModalOpen] = useAtom(settingsModalAtom)
+
+  const [message, setMessage] = useState<string>("");
+
+  const { getInputProps, open } = useWorkspaceUploadDrop(onUpload);
+  const firstTimeUser = useFirstTimeUser();
+
+  const shouldShowExamplePrompts = !chatId || (!logs.length && !isStarting && !isRunning);
+
+  const handleGoalSubmit = async (
+    goal: string,
+    files?: InMemoryFile[]
+  ): Promise<void> => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true);
+      return;
+    }
+    if (!goal) {
+      setError("Please enter a goal.");
+      return;
+    }
+    setMessage("");
+    // The files of the example prompt are passed along with the goal, so that
+    // they get applied to the workspace of the chat that is being started
+    // (and not to the workspace of a previously viewed chat).
+    return onGoalSubmit(goal, files);
+  };
+
+  const onUploadOpen = () => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true);
+      return;
+    }
+    open();
+  }
+
+  return (
+    <main
+      className={clsx("relative flex h-full w-full flex-col", {
+        "items-center justify-center": shouldShowExamplePrompts,
+      })}
+    >
+      {shouldShowExamplePrompts ? (
+        <Logo wordmark={false} className="mb-16 w-16" />
+      ) : (
+        <ChatLogs status={status}  chatName={chatName ?? "New Session"} isRunning={isStarting || isRunning} logs={logs} />
+      )}
+
+      <div
+        className={clsx(
+          "mt-4 flex w-full space-y-4",
+          shouldShowExamplePrompts
+            ? "flex-col-reverse space-y-reverse px-4 md:px-8 lg:px-4"
+            : "mx-auto max-w-[56rem] flex-col px-4"
+        )}
+      >
+        {shouldShowExamplePrompts && (
+          <ExamplePrompts
+            onClick={handleGoalSubmit}
+          />
+        )}
+        <div
+          className={clsx(
+            "mb-4 flex w-full items-center justify-center gap-4 self-center",
+            shouldShowExamplePrompts ? "max-w-[42rem] " : "max-w-[56rem]"
+          )}
+        >
+          <TextField
+            type="text"
+            value={message}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => {
+              setMessage(event.target.value)
+            }}
+            onKeyDown={(event: React.KeyboardEvent) => {
+              if (event.key === "Enter" && !isStarting && !isRunning) {
+                return handleGoalSubmit(message);
+              }
+            }}
+            placeholder="Ask Evo anything..."
+            className="!rounded-lg !p-4 !pl-12"
+            leftAdornment={
+              <>
+                <Button variant="icon" className="!text-white" onClick={onUploadOpen}>
+                  <UploadSimple size={20} />
+                </Button>
+                <input {...getInputProps()} />
+              </>
+            }
+            rightAdornment={
+              <ChatInputButton
+                running={isRunning}
+                message={message}
+                handleSend={() => handleGoalSubmit(message)}
+              />
+            }
+            rightAdornmentClassnames="!right-3"
+            disabled={isRunning || showDisclaimer} // Disable input while sending or if disclaimer is shown
+          />
+        </div>
+      </div>
+      <Disclaimer
+        isOpen={showDisclaimer && !welcomeModalOpen && !signInModalOpen && !settingsModalOpen}
+        onClose={() => setShowDisclaimer(false)}
+      />
+    </main>
+  );
+};
+
+export default Chat;
+
+
+
+### apps/browser/components/ExamplePrompts.tsx
+import { workspaceUploadsAtom, welcomeModalAtom } from "@/lib/store";
+import { useFirstTimeUser } from "@/lib/hooks/useFirstTimeUser";
+import { examplePrompts, ExamplePrompt } from "@/lib/examplePrompts";
+import { useAtom } from "jotai";
+import clsx from "clsx";
+import useWindowSize from "@/lib/hooks/useWindowSize";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+
+export interface ExamplePromptsProps {
+  onClick: (prompt: string, files?: InMemoryFile[]) => Promise<void>;
+}
+
+export default function ExamplePrompts(props: ExamplePromptsProps) {
+  const [, setWorkspaceUploads] = useAtom(workspaceUploadsAtom);
+  const [, setWelcomeModalOpen] = useAtom(welcomeModalAtom);
+  const { isMobile } = useWindowSize();
+  const firstTimeUser = useFirstTimeUser();
+
+  const handleClick = (prompt: ExamplePrompt): Promise<void> | void => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true)
+      return
+    }
+    if (prompt.files) {
+      // Remember the files, but do *not* write them into the workspace here.
+      // The workspace that is currently in the global atom might still be the
+      // workspace of a previously viewed chat, and the chat that is about to
+      // be started loads its own workspace anyway. The files are handed over
+      // to the goal instead, so that they get applied to the workspace of the
+      // chat that is actually started.
+      setWorkspaceUploads(prompt.files);
+    }
+    return props.onClick(prompt.prompt, prompt.files);
+  };
+
+  return (
+    <div className="flex flex-col items-center space-y-3">
+      <h2 className="w-full text-center font-normal">
+        Not sure where to start?{` `}
+        {isMobile && <br />}
+        <span className="text-sm md:text-base">Try asking one of these:</span>
+      </h2>{" "}
+      {examplePrompts.map((prompt, index) => (
+        <div
+          key={index}
+          className={clsx(
+            "m-1 cursor-pointer rounded-lg  border-2 border-zinc-700 bg-zinc-900/50 p-2.5 text-xs text-zinc-400 transition-all duration-300 ease-in-out hover:bg-cyan-600 hover:text-white"
+          )}
+          onClick={() => handleClick(prompt)}
+        >
+          {prompt.prompt}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+
+### apps/browser/lib/services/evo/EvoService.ts
+import {
+  EvoThread,
+  EvoThreadStartOptions,
+  EvoThreadCallbacks,
+  EvoThreadConfig,
+} from "./EvoThread";
+
+export class EvoService {
+  private _threads: Record<string, EvoThread> = {};
+  private _current: EvoThread | undefined;
+
+  constructor(
+    public user: string
+  ) { }
+
+  get current(): EvoThread | undefined {
+    return this._current;
+  }
+
+  destroy() {
+    for (const thread of Object.values(this._threads)) {
+      thread.destroy();
+    }
+    this._threads = {};
+    this._current = undefined;
+  }
+
+  disconnect() {
+    this._current?.disconnect();
+    this._current = undefined;
+  }
+
+  async connect(config: EvoThreadConfig, callbacks: EvoThreadCallbacks): Promise<void> {
+    this._current = this.acquireThread(config);
+    await this._current.connect(callbacks);
+  }
+
+  async start(options: EvoThreadStartOptions): Promise<void> {
+    if (!this._current) {
+      throw Error("EvoService must be connected before starting a goal.");
+    }
+    return this._current.start(options);
+  }
+
+  private acquireThread(config: EvoThreadConfig): EvoThread {
+    if (!this._threads[config.chatId]) {
+      this._threads[config.chatId] = new EvoThread(config);
+    }
+    return this._threads[config.chatId];
+  }
+}
+
+
+
+### apps/browser/lib/services/evo/createEvoInstance.ts
+import { ProxyLlmApi, ProxyEmbeddingApi } from "@/lib/api";
+import { createInBrowserScripts } from "@/lib/scripts";
+import { BrowserLogger } from "@/lib/sys/logger";
+import { ChatLog } from "@/components/Chat";
+import {
+  AgentContext,
+  ConsoleLogger,
+  EmbeddingApi,
+  Env,
+  Evo,
+  LlmApi,
+  LlmModel,
+  Logger,
+  OpenAIEmbeddingAPI,
+  OpenAILlmApi,
+  Scripts,
+  Chat as EvoChat,
+  SubWorkspace,
+  AgentVariables,
+  Workspace,
+  ChatLogType,
+  ChatMessage,
+} from "@evo-ninja/agents";
+import cl100k_base from "gpt-tokenizer/esm/encoding/cl100k_base";
+
+export function createEvoInstance(
+  goalId: string,
+  workspace: Workspace,
+  openAiApiKey: string | undefined,
+  onMessagesAdded: (type: ChatLogType, messages: ChatMessage[]) => Promise<void>,
+  onVariableSet: (key: string, value: string) => Promise<void>,
+  onChatLog: (chatLog: ChatLog) => Promise<void>,
+  onStatusUpdate: (status: string) => void,
+  onGoalCapReached: () => void,
+  onError: (error: string) => void
+): Evo | undefined {
+  try {
+    const browserLogger = new BrowserLogger({
+      onLog: async (message: string) => {
+        await onChatLog({
+          user: "evo",
+          title: message,
+        });
+      },
+      onNotice: (msg: string) => {
+        onStatusUpdate(msg);
+        return Promise.resolve();
+      },
+      onSuccess: (msg: string) =>
+        onChatLog({
+          user: "evo",
+          title: msg,
+        })
+    });
+    const logger = new Logger([browserLogger, new ConsoleLogger()], {
+      promptUser: () => Promise.resolve("N/A"),
+    });
+
+    const scriptsWorkspace = createInBrowserScripts();
+    const scripts = new Scripts(scriptsWorkspace);
+
+    const env = new Env({
+      OPENAI_API_KEY: openAiApiKey || " ",
+      GPT_MODEL: "gpt-4-1106-preview",
+      CONTEXT_WINDOW_TOKENS: "128000",
+      MAX_RESPONSE_TOKENS: "4096",
+    });
+
+    let llm: LlmApi;
+    let embedding: EmbeddingApi;
+
+    if (openAiApiKey) {
+      llm = new OpenAILlmApi(
+        env.OPENAI_API_KEY,
+        env.GPT_MODEL as LlmModel,
+        env.CONTEXT_WINDOW_TOKENS,
+        env.MAX_RESPONSE_TOKENS,
+        logger,
+        env.OPENAI_API_BASE_URL,
+      );
+      embedding = new OpenAIEmbeddingAPI(
+        env.OPENAI_API_KEY,
+        logger,
+        cl100k_base,
+        env.OPENAI_API_BASE_URL,
+      );
+    } else {
+      const llmProxy = new ProxyLlmApi(
+        env.GPT_MODEL as LlmModel,
+        env.CONTEXT_WINDOW_TOKENS,
+        env.MAX_RESPONSE_TOKENS,
+        onGoalCapReached,
+      );
+      llmProxy.setGoalId(goalId);
+      llm = llmProxy;
+      const embeddingProxy = new ProxyEmbeddingApi(
+        cl100k_base,
+        onGoalCapReached
+      );
+      embeddingProxy.setGoalId(goalId);
+      embedding = embeddingProxy;
+    }
+
+    const internals = new SubWorkspace(".evo", workspace);
+
+    const chat = new EvoChat(cl100k_base, {
+      onMessagesAdded,
+    });
+    const agentVariables = new AgentVariables({
+      onVariableSet
+    });
+
+    const evo = new Evo(
+      new AgentContext(
+        llm,
+        embedding,
+        chat,
+        logger,
+        workspace,
+        internals,
+        env,
+        scripts,
+        undefined,
+        agentVariables
+      )
+    );
+    return evo;
+  } catch (e: any) {
+    onError(e.message);
+    return undefined;
+  }
+}
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-13 14:51:31
+Duration: 3349.14 seconds
+Verdict: ## Evaluation
+
+### 1. Diff analysis
+
+The fixed code makes changes to **three** files:
+
+| File | Change |
+|---|---|
+| `apps/browser/lib/hooks/useEvoService.ts` | Adds `currentWorkspaceRef` / `connectingRef`, threads `files?: InMemoryFile[]` through `handleStart`, applies uploads only after the correct chat is connected |
+| `apps/browser/components/Chat.tsx` | `onGoalSubmit(goal, files?)` passthrough |
+| `apps/browser/components/ExamplePrompts.tsx` | Stops writing `prompt.files` into the possibly stale global `workspaceAtom`; instead forwards files to `onClick` |
+
+Semantically this is a **plausible** fix for the described symptom ("Example prompts break if previously viewing an existing chat" — i.e. files were being uploaded into the workspace of the *previously viewed* chat).
+
+### 2. Test contract check — this is the decisive part
+
+The test does **not** exercise behavior; it is a strict source-level assertion:
+
+```js
+const sourceFilePath = path.join(process.cwd(), 'apps/browser/components/Workspace.tsx');
+const fixedImportLine = 'import { workspaceFilesAtom, isChatLoadingAtom, welcomeModalAtom } from "@/lib/store";';
+```
+
+For the fixed version it requires:
+
+```js
+const hasFixedImport = sourceCode.includes(fixedImportLine);  // must be true
+```
+
+Checking the fixed code against this:
+
+- **`apps/browser/components/Workspace.tsx` is not modified at all** — it does not appear anywhere in the diff (`validate_fixed_code` also only lists `useEvoService.ts`, `Chat.tsx`, `ExamplePrompts.tsx`, `EvoService.ts`, `createEvoInstance.ts`).
+- **`isChatLoadingAtom` appears nowhere** in the entire fixed code (no diff hunk, no import line).
+- Therefore `hasFixedImport === false` → the test's `else` branch prints `❌ FIX NOT VERIFIED: isChatLoadingAtom import NOT found, fix missing.` and calls `process.exit(1)`.
+
+So the test will **fail** on the provided fix, regardless of whether the refactor is functionally reasonable. The intended fix for this case was to introduce an `isChatLoadingAtom` in the store and consume it in `Workspace.tsx` (gating the workspace/example-prompt rendering on chat-loading state so stale workspace data isn't shown/applied), and that file was never touched.
+
+### 3. Additional observations on the fix itself
+
+- `verify_api_usage` on `@nerfzael/memory-fs InMemoryFile` and `jotai useAtom` returned only irrelevant search noise, so no API misuse could be confirmed there; the imports (`InMemoryFile` from `@nerfzael/memory-fs`) match the type already used in `Chat.tsx`, which is consistent.
+- The `connectingRef` de-duplication logic is sound (awaits an in-flight connection for the same chat, settles a different chat's connection first, and clears itself only if it's still the active promise).
+- Minor: `applyWorkspaceUploads` silently no-ops when `currentWorkspaceRef.current` is undefined; and `handleStart` still uses `chatLog` captured from the render closure in `setChatLog([...chatLog, ...])`, which is unchanged pre-existing behavior but now inside a `try` block that awaits — slightly more likely to be stale. Not test-relevant.
+
+### Verdict
+
+The fix bypasses the file the test targets (`Workspace.tsx`) and never introduces the required `isChatLoadingAtom` import, so the case's verification (and `buggy`-version reproduction check, since the buggy path is defined by the same file/import) is not satisfied.
+
+**REJECT** — the fixed code does not contain the mandated change in `apps/browser/components/Workspace.tsx` (missing `isChatLoadingAtom` in the `@/lib/store` import), so `validate` reports no interface to check and the provided test would exit with `FIX NOT VERIFIED`.
+--------------------------------------------------------------------------------
+### apps/browser/lib/hooks/useEvoService.ts
+import {
+  allowTelemetryAtom,
+  capReachedAtom,
+  evoServiceAtom,
+  localOpenAiApiKeyAtom,
+  settingsModalAtom,
+  workspaceAtom,
+  errorAtom,
+} from "@/lib/store";
+import { EvoThreadCallbacks, EvoThreadConfig } from "@/lib/services/evo/EvoThread";
+import { useAddChatLog } from "@/lib/mutations/useAddChatLog";
+import { useAddMessages } from "@/lib/mutations/useAddMessages";
+import { useAddVariable } from "@/lib/mutations/useAddVariable";
+import { useChats } from "@/lib/queries/useChats";
+import { SupabaseWorkspace } from "@/lib/supabase/SupabaseWorkspace";
+import { useSupabaseClient } from "@/lib/supabase/useSupabaseClient";
+import { useWorkspaceFilesUpdate } from "@/lib/hooks/useWorkspaceFilesUpdate";
+import { useWorkspaceUploadUpdate } from "@/lib/hooks/useWorkspaceUploadUpdate";
+import { ChatLog } from "@/components/Chat";
+import { Workspace, InMemoryWorkspace } from "@evo-ninja/agent-utils";
+import { ChatLogType, ChatMessage } from "@evo-ninja/agents";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+import { useState, useEffect, useRef } from "react";
+import { useAtom } from "jotai";
+
+export const useEvoService = (
+  chatId: string | "<anon>" | undefined,
+  isAuthenticated: boolean,
+): {
+  logs: ChatLog[];
+  isConnected: boolean;
+  isStarting: boolean;
+  isRunning: boolean;
+  status: string | undefined;
+  handleStart: (goal: string, files?: InMemoryFile[]) => Promise<void>;
+} => {
+  const supabase = useSupabaseClient();
+
+  // Globals
+  const [evoService] = useAtom(evoServiceAtom);
+  const [allowTelemetry] = useAtom(allowTelemetryAtom);
+  const [openAiApiKey] = useAtom(localOpenAiApiKeyAtom);
+  const [, setWorkspaceAtom] = useAtom(workspaceAtom);
+  const [, setCapReached] = useAtom(capReachedAtom);
+  const [, setSettingsModalOpen] = useAtom(settingsModalAtom);
+  const [, setError] = useAtom(errorAtom);
+
+  // State
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [isStarting, setIsStarting] = useState<boolean>(false);
+  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [chatLog, setChatLogState] = useState<ChatLog[]>([]);
+  const [status, setStatus] = useState<string | undefined>(undefined);
+
+  // The workspace that belongs to the currently connected thread. It is used
+  // to be sure that workspace updates (e.g. the files of an example prompt)
+  // are applied to the workspace of the *current* chat, and never to the
+  // workspace of a chat that has been viewed previously.
+  const currentWorkspaceRef = useRef<Workspace | undefined>(undefined);
+  // Connection in progress, used to avoid connecting (and loading the
+  // workspace) twice for the same chat.
+  const connectingRef = useRef<
+    { chatId: string; promise: Promise<void> } | undefined
+  >(undefined);
+
+  // Mutations
+  const { mutateAsync: addChatLog } = useAddChatLog();
+  const { mutateAsync: addMessages } = useAddMessages();
+  const { mutateAsync: addVariable } = useAddVariable();
+
+  // Queries
+  const { refetch: fetchChats } = useChats();
+
+  // Helpers
+  const workspaceFilesUpdate = useWorkspaceFilesUpdate();
+  const workspaceUploadUpdate = useWorkspaceUploadUpdate();
+
+  const setChatLog = (chatLog: ChatLog[]) => {
+    // If the most recent message is the user's goal,
+    // append an informative message from Evo
+    if (chatLog.length !== 0 && chatLog[chatLog.length - 1].user === "user") {
+      setChatLogState([
+        ...chatLog, {
+        user: "evo",
+        title: "Reviewing your prompt..."
+      }]);
+    } else {
+      setChatLogState([...chatLog]);
+    }
+  };
+
+  const disconnectEvoService = () => {
+    setIsConnected(false);
+    currentWorkspaceRef.current = undefined;
+    evoService.disconnect();
+  }
+
+  const connectEvoService = async (chatId: string): Promise<void> => {
+    const pendingConnection = connectingRef.current;
+
+    if (pendingConnection) {
+      if (pendingConnection.chatId === chatId) {
+        // A connection for this chat is already in progress (e.g. triggered by
+        // the effect reacting to the chat id). Wait for it instead of
+        // connecting and loading the workspace a second time.
+        await pendingConnection.promise;
+        return;
+      }
+
+      // Let the connection of the other chat settle first, otherwise the two
+      // connections could overwrite each other's workspace.
+      await pendingConnection.promise.catch(() => undefined);
+    }
+
+    const currentThread = evoService.current;
+
+    if (
+      currentThread &&
+      currentThread.chatId === chatId &&
+      currentWorkspaceRef.current
+    ) {
+      return;
+    }
+
+    const promise = (async () => {
+      disconnectEvoService();
+
+      const config: EvoThreadConfig = {
+        chatId,
+        loadChatLog,
+        loadWorkspace,
+        onChatLogAdded: handleChatLogAdded,
+        onMessagesAdded: handleMessagesAdded,
+        onVariableSet: handleVariableSet
+      };
+      const callbacks: EvoThreadCallbacks = {
+        setIsRunning,
+        setChatLog,
+        setWorkspace,
+        setStatus,
+        onGoalCapReached: () => {
+          setCapReached(true);
+          setSettingsModalOpen(true);
+        },
+        onError: (error: string) => {
+          console.error(error);
+          setError("Failed to start Evo.");
+        },
+      };
+      await evoService.connect(config, callbacks);
+      setIsConnected(true);
+    })();
+
+    connectingRef.current = { chatId, promise };
+
+    try {
+      await promise;
+    } finally {
+      if (connectingRef.current && connectingRef.current.promise === promise) {
+        connectingRef.current = undefined;
+      }
+    }
+  };
+
+  const loadChatLog = async (chatId: string) => {
+    if (chatId === "<anon>") {
+      return [];
+    }
+
+    const { data: chats, error } = await fetchChats();
+
+    if (error) {
+      console.error(error);
+      setError("Failed to fetch user chats.");
+      return [];
+    }
+
+    const currentChat = chats?.find(c => c.id === chatId);
+
+    if (!currentChat) {
+      return [];
+    }
+
+    return currentChat.logs;
+  };
+
+  async function loadWorkspace(chatId: string): Promise<Workspace> {
+    const workspace = isAuthenticated ?
+      new SupabaseWorkspace(chatId, supabase.storage) :
+      new InMemoryWorkspace();
+
+    // Apply the files that have been uploaded before the workspace existed
+    // (e.g. the files of an example prompt).
+    await workspaceUploadUpdate(workspace);
+
+    currentWorkspaceRef.current = workspace;
+
+    return workspace;
+  };
+
+  const setWorkspace = async (workspace: Workspace) => {
+    currentWorkspaceRef.current = workspace;
+    setWorkspaceAtom(workspace);
+    await workspaceFilesUpdate(workspace);
+  };
+
+  const applyWorkspaceUploads = async (files: InMemoryFile[]) => {
+    const workspace = currentWorkspaceRef.current;
+
+    if (!workspace) {
+      return;
+    }
+
+    await workspaceUploadUpdate(workspace, files);
+    await setWorkspace(workspace);
+  };
+
+  const handleChatLogAdded = async (log: ChatLog) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addChatLog({ chatId, log });
+  };
+
+  const handleMessagesAdded = async (type: ChatLogType, messages: ChatMessage[]) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addMessages({
+      chatId,
+      messages,
+      type
+    });
+  };
+
+  const handleVariableSet = async (key: string, value: string) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addVariable({
+      chatId,
+      key,
+      value
+    });
+  };
+
+  const handleStart = async (
+    goal: string,
+    files?: InMemoryFile[]
+  ): Promise<void> => {
+    if (isStarting) {
+      return;
+    }
+
+    if (!chatId) {
+      setError("Trying to start a goal without a chatId.");
+      return;
+    }
+
+    setIsStarting(true);
+
+    try {
+      // This either connects a new thread for the chat, or reuses the already
+      // connected one. Either way, once it resolves,
+      // `currentWorkspaceRef.current` holds the workspace of `chatId`, and not
+      // the workspace of a previously viewed chat.
+      await connectEvoService(chatId);
+
+      if (files && files.length > 0) {
+        // The files (e.g. of an example prompt) have to be applied to the
+        // workspace of the chat that is being started. Doing it here, after
+        // the chat has been connected, makes sure the files are never written
+        // to the workspace of the chat that has been viewed before.
+        await applyWorkspaceUploads(files);
+      }
+
+      setChatLog([
+        ...chatLog,
+        {
+          user: "user",
+          title: goal
+        }
+      ]);
+
+      evoService.start({
+        goal,
+        allowTelemetry,
+        openAiApiKey
+      });
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (chatId) {
+      connectEvoService(chatId);
+    } else {
+      if (evoService.current) {
+        disconnectEvoService();
+      }
+    }
+  }, [chatId]);
+
+  return {
+    logs: chatLog,
+    isConnected,
+    isStarting,
+    isRunning,
+    handleStart,
+    status
+  };
+};
+
+
+
+### apps/browser/components/Chat.tsx
+import {
+  showDisclaimerAtom,
+  errorAtom,
+  chatInfoAtom,
+  welcomeModalAtom,
+  signInModalAtom,
+  settingsModalAtom,
+} from "@/lib/store";
+import { useWorkspaceUploadDrop } from "@/lib/hooks/useWorkspaceUploadDrop";
+import { useFirstTimeUser } from "@/lib/hooks/useFirstTimeUser";
+import ExamplePrompts from "@/components/ExamplePrompts";
+import ChatLogs from "@/components/ChatLogs";
+import Disclaimer from "@/components/modals/Disclaimer";
+import Logo from "@/components/Logo";
+import Button from "@/components/Button";
+import ChatInputButton from "@/components/ChatInputButton";
+import TextField from "@/components/TextField";
+import React, { useState, ChangeEvent } from "react";
+import { UploadSimple } from "@phosphor-icons/react";
+import { useAtom } from "jotai";
+import clsx from "clsx";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+
+export interface ChatLog {
+  title: string;
+  content?: string;
+  user: string;
+  color?: string;
+  created_at?: string
+}
+
+export interface ChatProps {
+  logs: ChatLog[];
+  isStarting: boolean;
+  isRunning: boolean;
+  onGoalSubmit: (goal: string, files?: InMemoryFile[]) => Promise<void>;
+  onUpload: (upload: InMemoryFile[]) => void;
+  status: string | undefined;
+}
+
+const Chat: React.FC<ChatProps> = ({
+  logs,
+  isStarting,
+  isRunning,
+  onGoalSubmit,
+  onUpload,
+  status
+}: ChatProps) => {
+  const [{ id: chatId, name: chatName }] = useAtom(chatInfoAtom);
+  const [showDisclaimer, setShowDisclaimer] = useAtom(showDisclaimerAtom);
+  const [, setError] = useAtom(errorAtom);
+  const [welcomeModalOpen, setWelcomeModalOpen] = useAtom(welcomeModalAtom);
+  const [signInModalOpen] = useAtom(signInModalAtom);
+  const [settingsModalOpen] = useAtom(settingsModalAtom)
+
+  const [message, setMessage] = useState<string>("");
+
+  const { getInputProps, open } = useWorkspaceUploadDrop(onUpload);
+  const firstTimeUser = useFirstTimeUser();
+
+  const shouldShowExamplePrompts = !chatId || (!logs.length && !isStarting && !isRunning);
+
+  const handleGoalSubmit = async (
+    goal: string,
+    files?: InMemoryFile[]
+  ): Promise<void> => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true);
+      return;
+    }
+    if (!goal) {
+      setError("Please enter a goal.");
+      return;
+    }
+    setMessage("");
+    // The files of the example prompt are passed along with the goal, so that
+    // they get applied to the workspace of the chat that is being started
+    // (and not to the workspace of a previously viewed chat).
+    return onGoalSubmit(goal, files);
+  };
+
+  const onUploadOpen = () => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true);
+      return;
+    }
+    open();
+  }
+
+  return (
+    <main
+      className={clsx("relative flex h-full w-full flex-col", {
+        "items-center justify-center": shouldShowExamplePrompts,
+      })}
+    >
+      {shouldShowExamplePrompts ? (
+        <Logo wordmark={false} className="mb-16 w-16" />
+      ) : (
+        <ChatLogs status={status}  chatName={chatName ?? "New Session"} isRunning={isStarting || isRunning} logs={logs} />
+      )}
+
+      <div
+        className={clsx(
+          "mt-4 flex w-full space-y-4",
+          shouldShowExamplePrompts
+            ? "flex-col-reverse space-y-reverse px-4 md:px-8 lg:px-4"
+            : "mx-auto max-w-[56rem] flex-col px-4"
+        )}
+      >
+        {shouldShowExamplePrompts && (
+          <ExamplePrompts
+            onClick={handleGoalSubmit}
+          />
+        )}
+        <div
+          className={clsx(
+            "mb-4 flex w-full items-center justify-center gap-4 self-center",
+            shouldShowExamplePrompts ? "max-w-[42rem] " : "max-w-[56rem]"
+          )}
+        >
+          <TextField
+            type="text"
+            value={message}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => {
+              setMessage(event.target.value)
+            }}
+            onKeyDown={(event: React.KeyboardEvent) => {
+              if (event.key === "Enter" && !isStarting && !isRunning) {
+                return handleGoalSubmit(message);
+              }
+            }}
+            placeholder="Ask Evo anything..."
+            className="!rounded-lg !p-4 !pl-12"
+            leftAdornment={
+              <>
+                <Button variant="icon" className="!text-white" onClick={onUploadOpen}>
+                  <UploadSimple size={20} />
+                </Button>
+                <input {...getInputProps()} />
+              </>
+            }
+            rightAdornment={
+              <ChatInputButton
+                running={isRunning}
+                message={message}
+                handleSend={() => handleGoalSubmit(message)}
+              />
+            }
+            rightAdornmentClassnames="!right-3"
+            disabled={isRunning || showDisclaimer} // Disable input while sending or if disclaimer is shown
+          />
+        </div>
+      </div>
+      <Disclaimer
+        isOpen={showDisclaimer && !welcomeModalOpen && !signInModalOpen && !settingsModalOpen}
+        onClose={() => setShowDisclaimer(false)}
+      />
+    </main>
+  );
+};
+
+export default Chat;
+
+
+
+### apps/browser/components/ExamplePrompts.tsx
+import { workspaceUploadsAtom, welcomeModalAtom } from "@/lib/store";
+import { useFirstTimeUser } from "@/lib/hooks/useFirstTimeUser";
+import { examplePrompts, ExamplePrompt } from "@/lib/examplePrompts";
+import { useAtom } from "jotai";
+import clsx from "clsx";
+import useWindowSize from "@/lib/hooks/useWindowSize";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+
+export interface ExamplePromptsProps {
+  onClick: (prompt: string, files?: InMemoryFile[]) => Promise<void>;
+}
+
+export default function ExamplePrompts(props: ExamplePromptsProps) {
+  const [, setWorkspaceUploads] = useAtom(workspaceUploadsAtom);
+  const [, setWelcomeModalOpen] = useAtom(welcomeModalAtom);
+  const { isMobile } = useWindowSize();
+  const firstTimeUser = useFirstTimeUser();
+
+  const handleClick = (prompt: ExamplePrompt): Promise<void> | void => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true)
+      return
+    }
+    if (prompt.files) {
+      // Remember the files, but do *not* write them into the workspace here.
+      // The workspace that is currently in the global atom might still be the
+      // workspace of a previously viewed chat, and the chat that is about to
+      // be started loads its own workspace anyway. The files are handed over
+      // to the goal instead, so that they get applied to the workspace of the
+      // chat that is actually started.
+      setWorkspaceUploads(prompt.files);
+    }
+    return props.onClick(prompt.prompt, prompt.files);
+  };
+
+  return (
+    <div className="flex flex-col items-center space-y-3">
+      <h2 className="w-full text-center font-normal">
+        Not sure where to start?{` `}
+        {isMobile && <br />}
+        <span className="text-sm md:text-base">Try asking one of these:</span>
+      </h2>{" "}
+      {examplePrompts.map((prompt, index) => (
+        <div
+          key={index}
+          className={clsx(
+            "m-1 cursor-pointer rounded-lg  border-2 border-zinc-700 bg-zinc-900/50 p-2.5 text-xs text-zinc-400 transition-all duration-300 ease-in-out hover:bg-cyan-600 hover:text-white"
+          )}
+          onClick={() => handleClick(prompt)}
+        >
+          {prompt.prompt}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+
+### apps/browser/lib/services/evo/EvoService.ts
+import {
+  EvoThread,
+  EvoThreadStartOptions,
+  EvoThreadCallbacks,
+  EvoThreadConfig,
+} from "./EvoThread";
+
+export class EvoService {
+  private _threads: Record<string, EvoThread> = {};
+  private _current: EvoThread | undefined;
+
+  constructor(
+    public user: string
+  ) { }
+
+  get current(): EvoThread | undefined {
+    return this._current;
+  }
+
+  destroy() {
+    for (const thread of Object.values(this._threads)) {
+      thread.destroy();
+    }
+    this._threads = {};
+    this._current = undefined;
+  }
+
+  disconnect() {
+    this._current?.disconnect();
+    this._current = undefined;
+  }
+
+  async connect(config: EvoThreadConfig, callbacks: EvoThreadCallbacks): Promise<void> {
+    this._current = this.acquireThread(config);
+    await this._current.connect(callbacks);
+  }
+
+  async start(options: EvoThreadStartOptions): Promise<void> {
+    if (!this._current) {
+      throw Error("EvoService must be connected before starting a goal.");
+    }
+    return this._current.start(options);
+  }
+
+  private acquireThread(config: EvoThreadConfig): EvoThread {
+    if (!this._threads[config.chatId]) {
+      this._threads[config.chatId] = new EvoThread(config);
+    }
+    return this._threads[config.chatId];
+  }
+}
+
+
+
+### apps/browser/lib/services/evo/createEvoInstance.ts
+import { ProxyLlmApi, ProxyEmbeddingApi } from "@/lib/api";
+import { createInBrowserScripts } from "@/lib/scripts";
+import { BrowserLogger } from "@/lib/sys/logger";
+import { ChatLog } from "@/components/Chat";
+import {
+  AgentContext,
+  ConsoleLogger,
+  EmbeddingApi,
+  Env,
+  Evo,
+  LlmApi,
+  LlmModel,
+  Logger,
+  OpenAIEmbeddingAPI,
+  OpenAILlmApi,
+  Scripts,
+  Chat as EvoChat,
+  SubWorkspace,
+  AgentVariables,
+  Workspace,
+  ChatLogType,
+  ChatMessage,
+} from "@evo-ninja/agents";
+import cl100k_base from "gpt-tokenizer/esm/encoding/cl100k_base";
+
+export function createEvoInstance(
+  goalId: string,
+  workspace: Workspace,
+  openAiApiKey: string | undefined,
+  onMessagesAdded: (type: ChatLogType, messages: ChatMessage[]) => Promise<void>,
+  onVariableSet: (key: string, value: string) => Promise<void>,
+  onChatLog: (chatLog: ChatLog) => Promise<void>,
+  onStatusUpdate: (status: string) => void,
+  onGoalCapReached: () => void,
+  onError: (error: string) => void
+): Evo | undefined {
+  try {
+    const browserLogger = new BrowserLogger({
+      onLog: async (message: string) => {
+        await onChatLog({
+          user: "evo",
+          title: message,
+        });
+      },
+      onNotice: (msg: string) => {
+        onStatusUpdate(msg);
+        return Promise.resolve();
+      },
+      onSuccess: (msg: string) =>
+        onChatLog({
+          user: "evo",
+          title: msg,
+        })
+    });
+    const logger = new Logger([browserLogger, new ConsoleLogger()], {
+      promptUser: () => Promise.resolve("N/A"),
+    });
+
+    const scriptsWorkspace = createInBrowserScripts();
+    const scripts = new Scripts(scriptsWorkspace);
+
+    const env = new Env({
+      OPENAI_API_KEY: openAiApiKey || " ",
+      GPT_MODEL: "gpt-4-1106-preview",
+      CONTEXT_WINDOW_TOKENS: "128000",
+      MAX_RESPONSE_TOKENS: "4096",
+    });
+
+    let llm: LlmApi;
+    let embedding: EmbeddingApi;
+
+    if (openAiApiKey) {
+      llm = new OpenAILlmApi(
+        env.OPENAI_API_KEY,
+        env.GPT_MODEL as LlmModel,
+        env.CONTEXT_WINDOW_TOKENS,
+        env.MAX_RESPONSE_TOKENS,
+        logger,
+        env.OPENAI_API_BASE_URL,
+      );
+      embedding = new OpenAIEmbeddingAPI(
+        env.OPENAI_API_KEY,
+        logger,
+        cl100k_base,
+        env.OPENAI_API_BASE_URL,
+      );
+    } else {
+      const llmProxy = new ProxyLlmApi(
+        env.GPT_MODEL as LlmModel,
+        env.CONTEXT_WINDOW_TOKENS,
+        env.MAX_RESPONSE_TOKENS,
+        onGoalCapReached,
+      );
+      llmProxy.setGoalId(goalId);
+      llm = llmProxy;
+      const embeddingProxy = new ProxyEmbeddingApi(
+        cl100k_base,
+        onGoalCapReached
+      );
+      embeddingProxy.setGoalId(goalId);
+      embedding = embeddingProxy;
+    }
+
+    const internals = new SubWorkspace(".evo", workspace);
+
+    const chat = new EvoChat(cl100k_base, {
+      onMessagesAdded,
+    });
+    const agentVariables = new AgentVariables({
+      onVariableSet
+    });
+
+    const evo = new Evo(
+      new AgentContext(
+        llm,
+        embedding,
+        chat,
+        logger,
+        workspace,
+        internals,
+        env,
+        scripts,
+        undefined,
+        agentVariables
+      )
+    );
+    return evo;
+  } catch (e: any) {
+    onError(e.message);
+    return undefined;
+  }
+}
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-13 15:49:44
+Duration: 3493.13 seconds
+Verdict: ## Evaluation: REJECT
+
+### 1. Test expectation vs. what the fix actually does
+
+The test for this case is a **source-assertion test on a specific file**:
+
+```js
+const sourceFilePath = path.join(process.cwd(), 'apps/browser/components/Workspace.tsx');
+const fixedImportLine = 'import { workspaceFilesAtom, isChatLoadingAtom, welcomeModalAtom } from "@/lib/store";';
+```
+
+For `VERSION=buggy` it expects that line to be **absent**; for the fixed version it expects that line to be **present**. That file must therefore exist in the fixed output and must contain `isChatLoadingAtom` in its `@/lib/store` import.
+
+The generated diff shows changes to only:
+- `apps/browser/lib/hooks/useEvoService.ts`
+- `apps/browser/components/Chat.tsx`
+- `apps/browser/components/ExamplePrompts.tsx`
+- (trailing-whitespace hunk in `lib/services/evo/createEvoInstance.ts`)
+
+**`apps/browser/components/Workspace.tsx` is never touched.** The `isChatLoadingAtom` import is absent, so the "fixed" run would still print `❌ FIX NOT VERIFIED` and exit 1. This alone is disqualifying.
+
+`validate_fixed_code` only returned a file-presence/format check ("no parser available here for TypeScript", "no required interface checked"), so its ACCEPT is not evidence that the behavioral contract of the test is met.
+
+### 2. The change also doesn't fix the described bug at its root
+
+The reported bug is that example prompts break when a chat was previously viewed — i.e. the `Workspace` component subscribes to workspace files / atoms that belong to the previously viewed chat and there is no `isChatLoading` gate, so a freshly started "anon" session silently inherits stale chat state. The `isChatLoadingAtom` import is exactly the mechanism that guards this. The candidate fix instead moves example-prompt file uploads into `handleStart`, which is a **different symptom** treatment:
+
+- `ExamplePrompts` no longer applies files directly (reasonable), but it still calls `setWorkspaceUploads(prompt.files)`.
+- `loadWorkspace` still calls `await workspaceUploadUpdate(workspace)` **without** an explicit `files` argument, meaning it still applies whatever is in the global `workspaceUploadsAtom` — including a stale example prompt's files from a previous interaction. So the cross-chat file leak the bug describes is **not** eliminated; it's merely applied in a second place.
+- `applyWorkspaceUploads` then applies the same files **again** on top of `loadWorkspace`, so files are written twice on the normal path.
+
+### 3. Secondary concerns
+
+- `applyWorkspaceUploads` silently no-ops when `currentWorkspaceRef.current` is undefined, so a user clicking an example prompt with files whose connection failed loses the files with no error surfaced.
+- The `connectingRef` de-duplication and `currentWorkspaceRef` reuse logic is non-trivial concurrency code added to the hook, but it isn't what the test (or the issue) targets — it increases surface area without addressing the loading-state gate.
+- `verify_api_usage` for `@nerfzael/memory-fs InMemoryFile` returned irrelevant results; the `InMemoryFile` type import itself matches existing usage in `Chat.tsx`, so types are fine — but that doesn't rescue the case.
+
+### Conclusion
+
+The fix targets a different layer than the one the test and issue point at, and leaves the `isChatLoadingAtom` guard in `apps/browser/components/Workspace.tsx` entirely absent. The test would fail on the fixed version. **REJECT.**
+--------------------------------------------------------------------------------
+### apps/browser/lib/hooks/useEvoService.ts
+import {
+  allowTelemetryAtom,
+  capReachedAtom,
+  evoServiceAtom,
+  localOpenAiApiKeyAtom,
+  settingsModalAtom,
+  workspaceAtom,
+  errorAtom,
+} from "@/lib/store";
+import { EvoThreadCallbacks, EvoThreadConfig } from "@/lib/services/evo/EvoThread";
+import { useAddChatLog } from "@/lib/mutations/useAddChatLog";
+import { useAddMessages } from "@/lib/mutations/useAddMessages";
+import { useAddVariable } from "@/lib/mutations/useAddVariable";
+import { useChats } from "@/lib/queries/useChats";
+import { SupabaseWorkspace } from "@/lib/supabase/SupabaseWorkspace";
+import { useSupabaseClient } from "@/lib/supabase/useSupabaseClient";
+import { useWorkspaceFilesUpdate } from "@/lib/hooks/useWorkspaceFilesUpdate";
+import { useWorkspaceUploadUpdate } from "@/lib/hooks/useWorkspaceUploadUpdate";
+import { ChatLog } from "@/components/Chat";
+import { Workspace, InMemoryWorkspace } from "@evo-ninja/agent-utils";
+import { ChatLogType, ChatMessage } from "@evo-ninja/agents";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+import { useState, useEffect, useRef } from "react";
+import { useAtom } from "jotai";
+
+export const useEvoService = (
+  chatId: string | "<anon>" | undefined,
+  isAuthenticated: boolean,
+): {
+  logs: ChatLog[];
+  isConnected: boolean;
+  isStarting: boolean;
+  isRunning: boolean;
+  status: string | undefined;
+  handleStart: (goal: string, files?: InMemoryFile[]) => Promise<void>;
+} => {
+  const supabase = useSupabaseClient();
+
+  // Globals
+  const [evoService] = useAtom(evoServiceAtom);
+  const [allowTelemetry] = useAtom(allowTelemetryAtom);
+  const [openAiApiKey] = useAtom(localOpenAiApiKeyAtom);
+  const [, setWorkspaceAtom] = useAtom(workspaceAtom);
+  const [, setCapReached] = useAtom(capReachedAtom);
+  const [, setSettingsModalOpen] = useAtom(settingsModalAtom);
+  const [, setError] = useAtom(errorAtom);
+
+  // State
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [isStarting, setIsStarting] = useState<boolean>(false);
+  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [chatLog, setChatLogState] = useState<ChatLog[]>([]);
+  const [status, setStatus] = useState<string | undefined>(undefined);
+
+  // The workspace that belongs to the currently connected thread. It is used
+  // to be sure that workspace updates (e.g. the files of an example prompt)
+  // are applied to the workspace of the *current* chat, and never to the
+  // workspace of a chat that has been viewed previously.
+  const currentWorkspaceRef = useRef<Workspace | undefined>(undefined);
+  // Connection in progress, used to avoid connecting (and loading the
+  // workspace) twice for the same chat.
+  const connectingRef = useRef<
+    { chatId: string; promise: Promise<void> } | undefined
+  >(undefined);
+
+  // Mutations
+  const { mutateAsync: addChatLog } = useAddChatLog();
+  const { mutateAsync: addMessages } = useAddMessages();
+  const { mutateAsync: addVariable } = useAddVariable();
+
+  // Queries
+  const { refetch: fetchChats } = useChats();
+
+  // Helpers
+  const workspaceFilesUpdate = useWorkspaceFilesUpdate();
+  const workspaceUploadUpdate = useWorkspaceUploadUpdate();
+
+  const setChatLog = (chatLog: ChatLog[]) => {
+    // If the most recent message is the user's goal,
+    // append an informative message from Evo
+    if (chatLog.length !== 0 && chatLog[chatLog.length - 1].user === "user") {
+      setChatLogState([
+        ...chatLog, {
+        user: "evo",
+        title: "Reviewing your prompt..."
+      }]);
+    } else {
+      setChatLogState([...chatLog]);
+    }
+  };
+
+  const disconnectEvoService = () => {
+    setIsConnected(false);
+    currentWorkspaceRef.current = undefined;
+    evoService.disconnect();
+  }
+
+  const connectEvoService = async (chatId: string): Promise<void> => {
+    const pendingConnection = connectingRef.current;
+
+    if (pendingConnection) {
+      if (pendingConnection.chatId === chatId) {
+        // A connection for this chat is already in progress (e.g. triggered by
+        // the effect reacting to the chat id). Wait for it instead of
+        // connecting and loading the workspace a second time.
+        await pendingConnection.promise;
+        return;
+      }
+
+      // Let the connection of the other chat settle first, otherwise the two
+      // connections could overwrite each other's workspace.
+      await pendingConnection.promise.catch(() => undefined);
+    }
+
+    const currentThread = evoService.current;
+
+    if (
+      currentThread &&
+      currentThread.chatId === chatId &&
+      currentWorkspaceRef.current
+    ) {
+      return;
+    }
+
+    const promise = (async () => {
+      disconnectEvoService();
+
+      const config: EvoThreadConfig = {
+        chatId,
+        loadChatLog,
+        loadWorkspace,
+        onChatLogAdded: handleChatLogAdded,
+        onMessagesAdded: handleMessagesAdded,
+        onVariableSet: handleVariableSet
+      };
+      const callbacks: EvoThreadCallbacks = {
+        setIsRunning,
+        setChatLog,
+        setWorkspace,
+        setStatus,
+        onGoalCapReached: () => {
+          setCapReached(true);
+          setSettingsModalOpen(true);
+        },
+        onError: (error: string) => {
+          console.error(error);
+          setError("Failed to start Evo.");
+        },
+      };
+      await evoService.connect(config, callbacks);
+      setIsConnected(true);
+    })();
+
+    connectingRef.current = { chatId, promise };
+
+    try {
+      await promise;
+    } finally {
+      if (connectingRef.current && connectingRef.current.promise === promise) {
+        connectingRef.current = undefined;
+      }
+    }
+  };
+
+  const loadChatLog = async (chatId: string) => {
+    if (chatId === "<anon>") {
+      return [];
+    }
+
+    const { data: chats, error } = await fetchChats();
+
+    if (error) {
+      console.error(error);
+      setError("Failed to fetch user chats.");
+      return [];
+    }
+
+    const currentChat = chats?.find(c => c.id === chatId);
+
+    if (!currentChat) {
+      return [];
+    }
+
+    return currentChat.logs;
+  };
+
+  async function loadWorkspace(chatId: string): Promise<Workspace> {
+    const workspace = isAuthenticated ?
+      new SupabaseWorkspace(chatId, supabase.storage) :
+      new InMemoryWorkspace();
+
+    // Apply the files that have been uploaded before the workspace existed
+    // (e.g. the files of an example prompt).
+    await workspaceUploadUpdate(workspace);
+
+    currentWorkspaceRef.current = workspace;
+
+    return workspace;
+  };
+
+  const setWorkspace = async (workspace: Workspace) => {
+    currentWorkspaceRef.current = workspace;
+    setWorkspaceAtom(workspace);
+    await workspaceFilesUpdate(workspace);
+  };
+
+  const applyWorkspaceUploads = async (files: InMemoryFile[]) => {
+    const workspace = currentWorkspaceRef.current;
+
+    if (!workspace) {
+      return;
+    }
+
+    await workspaceUploadUpdate(workspace, files);
+    await setWorkspace(workspace);
+  };
+
+  const handleChatLogAdded = async (log: ChatLog) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addChatLog({ chatId, log });
+  };
+
+  const handleMessagesAdded = async (type: ChatLogType, messages: ChatMessage[]) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addMessages({
+      chatId,
+      messages,
+      type
+    });
+  };
+
+  const handleVariableSet = async (key: string, value: string) => {
+    if (!isAuthenticated || !chatId) {
+      return;
+    }
+    await addVariable({
+      chatId,
+      key,
+      value
+    });
+  };
+
+  const handleStart = async (
+    goal: string,
+    files?: InMemoryFile[]
+  ): Promise<void> => {
+    if (isStarting) {
+      return;
+    }
+
+    if (!chatId) {
+      setError("Trying to start a goal without a chatId.");
+      return;
+    }
+
+    setIsStarting(true);
+
+    try {
+      // This either connects a new thread for the chat, or reuses the already
+      // connected one. Either way, once it resolves,
+      // `currentWorkspaceRef.current` holds the workspace of `chatId`, and not
+      // the workspace of a previously viewed chat.
+      await connectEvoService(chatId);
+
+      if (files && files.length > 0) {
+        // The files (e.g. of an example prompt) have to be applied to the
+        // workspace of the chat that is being started. Doing it here, after
+        // the chat has been connected, makes sure the files are never written
+        // to the workspace of the chat that has been viewed before.
+        await applyWorkspaceUploads(files);
+      }
+
+      setChatLog([
+        ...chatLog,
+        {
+          user: "user",
+          title: goal
+        }
+      ]);
+
+      evoService.start({
+        goal,
+        allowTelemetry,
+        openAiApiKey
+      });
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (chatId) {
+      connectEvoService(chatId);
+    } else {
+      if (evoService.current) {
+        disconnectEvoService();
+      }
+    }
+  }, [chatId]);
+
+  return {
+    logs: chatLog,
+    isConnected,
+    isStarting,
+    isRunning,
+    handleStart,
+    status
+  };
+};
+
+
+
+### apps/browser/components/Chat.tsx
+import {
+  showDisclaimerAtom,
+  errorAtom,
+  chatInfoAtom,
+  welcomeModalAtom,
+  signInModalAtom,
+  settingsModalAtom,
+} from "@/lib/store";
+import { useWorkspaceUploadDrop } from "@/lib/hooks/useWorkspaceUploadDrop";
+import { useFirstTimeUser } from "@/lib/hooks/useFirstTimeUser";
+import ExamplePrompts from "@/components/ExamplePrompts";
+import ChatLogs from "@/components/ChatLogs";
+import Disclaimer from "@/components/modals/Disclaimer";
+import Logo from "@/components/Logo";
+import Button from "@/components/Button";
+import ChatInputButton from "@/components/ChatInputButton";
+import TextField from "@/components/TextField";
+import React, { useState, ChangeEvent } from "react";
+import { UploadSimple } from "@phosphor-icons/react";
+import { useAtom } from "jotai";
+import clsx from "clsx";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+
+export interface ChatLog {
+  title: string;
+  content?: string;
+  user: string;
+  color?: string;
+  created_at?: string
+}
+
+export interface ChatProps {
+  logs: ChatLog[];
+  isStarting: boolean;
+  isRunning: boolean;
+  onGoalSubmit: (goal: string, files?: InMemoryFile[]) => Promise<void>;
+  onUpload: (upload: InMemoryFile[]) => void;
+  status: string | undefined;
+}
+
+const Chat: React.FC<ChatProps> = ({
+  logs,
+  isStarting,
+  isRunning,
+  onGoalSubmit,
+  onUpload,
+  status
+}: ChatProps) => {
+  const [{ id: chatId, name: chatName }] = useAtom(chatInfoAtom);
+  const [showDisclaimer, setShowDisclaimer] = useAtom(showDisclaimerAtom);
+  const [, setError] = useAtom(errorAtom);
+  const [welcomeModalOpen, setWelcomeModalOpen] = useAtom(welcomeModalAtom);
+  const [signInModalOpen] = useAtom(signInModalAtom);
+  const [settingsModalOpen] = useAtom(settingsModalAtom)
+
+  const [message, setMessage] = useState<string>("");
+
+  const { getInputProps, open } = useWorkspaceUploadDrop(onUpload);
+  const firstTimeUser = useFirstTimeUser();
+
+  const shouldShowExamplePrompts = !chatId || (!logs.length && !isStarting && !isRunning);
+
+  const handleGoalSubmit = async (
+    goal: string,
+    files?: InMemoryFile[]
+  ): Promise<void> => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true);
+      return;
+    }
+    if (!goal) {
+      setError("Please enter a goal.");
+      return;
+    }
+    setMessage("");
+    // The files of the example prompt are passed along with the goal, so that
+    // they get applied to the workspace of the chat that is being started
+    // (and not to the workspace of a previously viewed chat).
+    return onGoalSubmit(goal, files);
+  };
+
+  const onUploadOpen = () => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true);
+      return;
+    }
+    open();
+  }
+
+  return (
+    <main
+      className={clsx("relative flex h-full w-full flex-col", {
+        "items-center justify-center": shouldShowExamplePrompts,
+      })}
+    >
+      {shouldShowExamplePrompts ? (
+        <Logo wordmark={false} className="mb-16 w-16" />
+      ) : (
+        <ChatLogs status={status}  chatName={chatName ?? "New Session"} isRunning={isStarting || isRunning} logs={logs} />
+      )}
+
+      <div
+        className={clsx(
+          "mt-4 flex w-full space-y-4",
+          shouldShowExamplePrompts
+            ? "flex-col-reverse space-y-reverse px-4 md:px-8 lg:px-4"
+            : "mx-auto max-w-[56rem] flex-col px-4"
+        )}
+      >
+        {shouldShowExamplePrompts && (
+          <ExamplePrompts
+            onClick={handleGoalSubmit}
+          />
+        )}
+        <div
+          className={clsx(
+            "mb-4 flex w-full items-center justify-center gap-4 self-center",
+            shouldShowExamplePrompts ? "max-w-[42rem] " : "max-w-[56rem]"
+          )}
+        >
+          <TextField
+            type="text"
+            value={message}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => {
+              setMessage(event.target.value)
+            }}
+            onKeyDown={(event: React.KeyboardEvent) => {
+              if (event.key === "Enter" && !isStarting && !isRunning) {
+                return handleGoalSubmit(message);
+              }
+            }}
+            placeholder="Ask Evo anything..."
+            className="!rounded-lg !p-4 !pl-12"
+            leftAdornment={
+              <>
+                <Button variant="icon" className="!text-white" onClick={onUploadOpen}>
+                  <UploadSimple size={20} />
+                </Button>
+                <input {...getInputProps()} />
+              </>
+            }
+            rightAdornment={
+              <ChatInputButton
+                running={isRunning}
+                message={message}
+                handleSend={() => handleGoalSubmit(message)}
+              />
+            }
+            rightAdornmentClassnames="!right-3"
+            disabled={isRunning || showDisclaimer} // Disable input while sending or if disclaimer is shown
+          />
+        </div>
+      </div>
+      <Disclaimer
+        isOpen={showDisclaimer && !welcomeModalOpen && !signInModalOpen && !settingsModalOpen}
+        onClose={() => setShowDisclaimer(false)}
+      />
+    </main>
+  );
+};
+
+export default Chat;
+
+
+
+### apps/browser/components/ExamplePrompts.tsx
+import { workspaceUploadsAtom, welcomeModalAtom } from "@/lib/store";
+import { useFirstTimeUser } from "@/lib/hooks/useFirstTimeUser";
+import { examplePrompts, ExamplePrompt } from "@/lib/examplePrompts";
+import { useAtom } from "jotai";
+import clsx from "clsx";
+import useWindowSize from "@/lib/hooks/useWindowSize";
+import { InMemoryFile } from "@nerfzael/memory-fs";
+
+export interface ExamplePromptsProps {
+  onClick: (prompt: string, files?: InMemoryFile[]) => Promise<void>;
+}
+
+export default function ExamplePrompts(props: ExamplePromptsProps) {
+  const [, setWorkspaceUploads] = useAtom(workspaceUploadsAtom);
+  const [, setWelcomeModalOpen] = useAtom(welcomeModalAtom);
+  const { isMobile } = useWindowSize();
+  const firstTimeUser = useFirstTimeUser();
+
+  const handleClick = (prompt: ExamplePrompt): Promise<void> | void => {
+    if (firstTimeUser) {
+      setWelcomeModalOpen(true)
+      return
+    }
+    if (prompt.files) {
+      // Remember the files, but do *not* write them into the workspace here.
+      // The workspace that is currently in the global atom might still be the
+      // workspace of a previously viewed chat, and the chat that is about to
+      // be started loads its own workspace anyway. The files are handed over
+      // to the goal instead, so that they get applied to the workspace of the
+      // chat that is actually started.
+      setWorkspaceUploads(prompt.files);
+    }
+    return props.onClick(prompt.prompt, prompt.files);
+  };
+
+  return (
+    <div className="flex flex-col items-center space-y-3">
+      <h2 className="w-full text-center font-normal">
+        Not sure where to start?{` `}
+        {isMobile && <br />}
+        <span className="text-sm md:text-base">Try asking one of these:</span>
+      </h2>{" "}
+      {examplePrompts.map((prompt, index) => (
+        <div
+          key={index}
+          className={clsx(
+            "m-1 cursor-pointer rounded-lg  border-2 border-zinc-700 bg-zinc-900/50 p-2.5 text-xs text-zinc-400 transition-all duration-300 ease-in-out hover:bg-cyan-600 hover:text-white"
+          )}
+          onClick={() => handleClick(prompt)}
+        >
+          {prompt.prompt}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+
+### apps/browser/lib/services/evo/EvoService.ts
+import {
+  EvoThread,
+  EvoThreadStartOptions,
+  EvoThreadCallbacks,
+  EvoThreadConfig,
+} from "./EvoThread";
+
+export class EvoService {
+  private _threads: Record<string, EvoThread> = {};
+  private _current: EvoThread | undefined;
+
+  constructor(
+    public user: string
+  ) { }
+
+  get current(): EvoThread | undefined {
+    return this._current;
+  }
+
+  destroy() {
+    for (const thread of Object.values(this._threads)) {
+      thread.destroy();
+    }
+    this._threads = {};
+    this._current = undefined;
+  }
+
+  disconnect() {
+    this._current?.disconnect();
+    this._current = undefined;
+  }
+
+  async connect(config: EvoThreadConfig, callbacks: EvoThreadCallbacks): Promise<void> {
+    this._current = this.acquireThread(config);
+    await this._current.connect(callbacks);
+  }
+
+  async start(options: EvoThreadStartOptions): Promise<void> {
+    if (!this._current) {
+      throw Error("EvoService must be connected before starting a goal.");
+    }
+    return this._current.start(options);
+  }
+
+  private acquireThread(config: EvoThreadConfig): EvoThread {
+    if (!this._threads[config.chatId]) {
+      this._threads[config.chatId] = new EvoThread(config);
+    }
+    return this._threads[config.chatId];
+  }
+}
+
+
+
+### apps/browser/lib/services/evo/createEvoInstance.ts
+import { ProxyLlmApi, ProxyEmbeddingApi } from "@/lib/api";
+import { createInBrowserScripts } from "@/lib/scripts";
+import { BrowserLogger } from "@/lib/sys/logger";
+import { ChatLog } from "@/components/Chat";
+import {
+  AgentContext,
+  ConsoleLogger,
+  EmbeddingApi,
+  Env,
+  Evo,
+  LlmApi,
+  LlmModel,
+  Logger,
+  OpenAIEmbeddingAPI,
+  OpenAILlmApi,
+  Scripts,
+  Chat as EvoChat,
+  SubWorkspace,
+  AgentVariables,
+  Workspace,
+  ChatLogType,
+  ChatMessage,
+} from "@evo-ninja/agents";
+import cl100k_base from "gpt-tokenizer/esm/encoding/cl100k_base";
+
+export function createEvoInstance(
+  goalId: string,
+  workspace: Workspace,
+  openAiApiKey: string | undefined,
+  onMessagesAdded: (type: ChatLogType, messages: ChatMessage[]) => Promise<void>,
+  onVariableSet: (key: string, value: string) => Promise<void>,
+  onChatLog: (chatLog: ChatLog) => Promise<void>,
+  onStatusUpdate: (status: string) => void,
+  onGoalCapReached: () => void,
+  onError: (error: string) => void
+): Evo | undefined {
+  try {
+    const browserLogger = new BrowserLogger({
+      onLog: async (message: string) => {
+        await onChatLog({
+          user: "evo",
+          title: message,
+        });
+      },
+      onNotice: (msg: string) => {
+        onStatusUpdate(msg);
+        return Promise.resolve();
+      },
+      onSuccess: (msg: string) =>
+        onChatLog({
+          user: "evo",
+          title: msg,
+        })
+    });
+    const logger = new Logger([browserLogger, new ConsoleLogger()], {
+      promptUser: () => Promise.resolve("N/A"),
+    });
+
+    const scriptsWorkspace = createInBrowserScripts();
+    const scripts = new Scripts(scriptsWorkspace);
+
+    const env = new Env({
+      OPENAI_API_KEY: openAiApiKey || " ",
+      GPT_MODEL: "gpt-4-1106-preview",
+      CONTEXT_WINDOW_TOKENS: "128000",
+      MAX_RESPONSE_TOKENS: "4096",
+    });
+
+    let llm: LlmApi;
+    let embedding: EmbeddingApi;
+
+    if (openAiApiKey) {
+      llm = new OpenAILlmApi(
+        env.OPENAI_API_KEY,
+        env.GPT_MODEL as LlmModel,
+        env.CONTEXT_WINDOW_TOKENS,
+        env.MAX_RESPONSE_TOKENS,
+        logger,
+        env.OPENAI_API_BASE_URL,
+      );
+      embedding = new OpenAIEmbeddingAPI(
+        env.OPENAI_API_KEY,
+        logger,
+        cl100k_base,
+        env.OPENAI_API_BASE_URL,
+      );
+    } else {
+      const llmProxy = new ProxyLlmApi(
+        env.GPT_MODEL as LlmModel,
+        env.CONTEXT_WINDOW_TOKENS,
+        env.MAX_RESPONSE_TOKENS,
+        onGoalCapReached,
+      );
+      llmProxy.setGoalId(goalId);
+      llm = llmProxy;
+      const embeddingProxy = new ProxyEmbeddingApi(
+        cl100k_base,
+        onGoalCapReached
+      );
+      embeddingProxy.setGoalId(goalId);
+      embedding = embeddingProxy;
+    }
+
+    const internals = new SubWorkspace(".evo", workspace);
+
+    const chat = new EvoChat(cl100k_base, {
+      onMessagesAdded,
+    });
+    const agentVariables = new AgentVariables({
+      onVariableSet
+    });
+
+    const evo = new Evo(
+      new AgentContext(
+        llm,
+        embedding,
+        chat,
+        logger,
+        workspace,
+        internals,
+        env,
+        scripts,
+        undefined,
+        agentVariables
+      )
+    );
+    return evo;
+  } catch (e: any) {
+    onError(e.message);
+    return undefined;
+  }
+}
+--------------------------------------------------------------------------------

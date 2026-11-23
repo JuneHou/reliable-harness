@@ -1,0 +1,512 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 01:51:53
+End Time: 2026-11-09 02:00:06
+Total Duration: 493.49 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+
+# Import with fallbacks so the code works on both current and older LangChain versions
+try:
+    from langchain_community.document_loaders import CSVLoader
+    from langchain_community.embeddings import OpenAIEmbeddings
+except ImportError:  # pragma: no cover - older langchain packages
+    from langchain.document_loaders import CSVLoader
+    from langchain.embeddings import OpenAIEmbeddings
+
+try:
+    from langchain_openai import ChatOpenAI
+except ImportError:  # pragma: no cover - older langchain packages
+    from langchain.chat_models import ChatOpenAI
+
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration - the "specified thresholds" for similar / duplicate controls
+# ---------------------------------------------------------------------------
+CSV_FILE = "control.csv"
+
+DUPLICATE_THRESHOLD = 0.95   # cosine similarity >= this  -> duplicate control pair
+SIMILAR_THRESHOLD = 0.85     # cosine similarity >= this  -> similar control pair
+TOP_K = 10                   # how many neighbours to inspect per control
+MAX_PAIRS_REPORTED = 50      # cap on pairs printed per category
+USE_LLM_REVIEW = True        # optional LLM verification of the detected pairs
+
+
+def load_controls(file_path):
+    """
+    Load the control dataset.
+
+    FIX: each CSV row is already one complete control, so rows are loaded as
+    whole documents.  The buggy version additionally ran
+    CharacterTextSplitter(chunk_size=500, chunk_overlap=50), which chopped
+    individual controls into overlapping fragments and destroyed the
+    "1 document == 1 control" mapping that pairwise duplicate/similarity
+    detection requires.
+    """
+    loader = CSVLoader(file_path=file_path)
+    controls = loader.load()
+    if not controls:
+        raise ValueError(f"No controls were loaded from '{file_path}'.")
+    return controls
+
+
+def control_text(control):
+    """Flatten a control document into a single comparable string."""
+    text = (control.page_content or "").strip()
+    if not text:
+        # Precondition guard: fall back to metadata if the content is empty
+        text = " | ".join(f"{k}: {v}" for k, v in control.metadata.items())
+    return text
+
+
+def control_id(control, index):
+    """Best-effort identifier for a control (CSV row number or list index)."""
+    return control.metadata.get("row", index + 1)
+
+
+def build_similarity_matrix(texts, embeddings):
+    """
+    Compute the full cosine-similarity matrix across all controls.
+
+    FIX: similarity scores are computed deterministically in code (not
+    guessed by the LLM), so every reported score is reproducible and can be
+    compared against the configured thresholds.
+    """
+    vectors = np.array(embeddings.embed_documents(texts), dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    unit_vectors = vectors / np.clip(norms, 1e-10, None)
+    sim = unit_vectors @ unit_vectors.T
+    # A control is never similar to itself
+    np.fill_diagonal(sim, -1.0)
+    return sim
+
+
+def find_pairs(controls, sim, duplicate_threshold, similar_threshold, top_k):
+    """
+    Enumerate unordered control pairs whose cosine similarity exceeds the
+    configured thresholds, separated into 'duplicate' and 'similar' buckets.
+
+    FIX: this pairwise comparison step did not exist in the buggy code, which
+    only retrieved k=4 documents to answer a single question.
+    """
+    n = len(controls)
+    seen = set()
+    duplicates, similar = [], []
+
+    for i in range(n):
+        # Inspect only the top_k most similar neighbours to stay tractable
+        candidates = np.argsort(-sim[i])[:top_k]
+        for j in candidates:
+            score = float(sim[i][j])
+            if score < similar_threshold:
+                continue
+
+            a, b = (i, j) if i < j else (j, i)   # canonical unordered pair
+            if (a, b) in seen:
+                continue
+            seen.add((a, b))
+
+            pair = {
+                "id_a": control_id(controls[a], a),
+                "id_b": control_id(controls[b], b),
+                "text_a": control_text(controls[a]),
+                "text_b": control_text(controls[b]),
+                "score": round(score, 4),
+            }
+            if score >= duplicate_threshold:
+                duplicates.append(pair)
+            else:
+                similar.append(pair)
+
+    duplicates.sort(key=lambda p: p["score"], reverse=True)
+    similar.sort(key=lambda p: p["score"], reverse=True)
+    return duplicates, similar
+
+
+def format_pairs(pairs, title, max_pairs):
+    """Render a category of pairs as an explicit, readable list."""
+    lines = [f"\n=== {title} ({len(pairs)} pairs) ==="]
+    if not pairs:
+        lines.append("  None found for the configured threshold.")
+    for rank, p in enumerate(pairs[:max_pairs], start=1):
+        lines.append(
+            f"\n{rank}. Control #{p['id_a']}  <->  Control #{p['id_b']}"
+            f"  | similarity = {p['score']:.4f}"
+        )
+        lines.append(f"   A: {p['text_a'][:200]}")
+        lines.append(f"   B: {p['text_b'][:200]}")
+    if len(pairs) > max_pairs:
+        lines.append(f"\n... and {len(pairs) - max_pairs} more pairs (not shown).")
+    return "\n".join(lines)
+
+
+def llm_review(duplicates, similar, llm):
+    """
+    Optional verification step.
+
+    FIX: the LLM is no longer asked to discover the pairs (which it cannot do
+    reliably for 3500+ controls).  It only receives pairs that were already
+    found and scored deterministically, and is explicitly instructed to
+    re-list them without inventing new pairs or changing the scores.
+    """
+    pair_lines = []
+    for p in duplicates:
+        pair_lines.append(
+            f"[DUPLICATE] #{p['id_a']} <-> #{p['id_b']} score={p['score']}\n"
+            f"  A: {p['text_a'][:300]}\n  B: {p['text_b'][:300]}"
+        )
+    for p in similar:
+        pair_lines.append(
+            f"[SIMILAR] #{p['id_a']} <-> #{p['id_b']} score={p['score']}\n"
+            f"  A: {p['text_a'][:300]}\n  B: {p['text_b'][:300]}"
+        )
+
+    template = """You are an auditor reviewing controls for duplicates.
+
+Below is a candidate list of control pairs that were detected and scored with
+cosine similarity.  Review each pair and re-list only the pairs you agree
+should be reported.  For every pair you keep, output exactly one line:
+
+  <CATEGORY> | <control A id> | <control B id> | <similarity score> | <one-line reason>
+
+Do NOT invent pairs that are not in the list. Do NOT change the scores.
+
+Candidate pairs:
+{pairs}
+
+Answer:
+"""
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"pairs": "\n\n".join(pair_lines) if pair_lines else "None"})
+
+
+def run_agent(
+    csv_file=CSV_FILE,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+    similar_threshold=SIMILAR_THRESHOLD,
+    top_k=TOP_K,
+    use_llm_review=USE_LLM_REVIEW,
+):
+    """Detect and list similar/duplicate control pairs above the thresholds."""
+    # 1. Load controls: 1 CSV row = 1 intact control document (no chunk splitting)
+    controls = load_controls(csv_file)
+    texts = [control_text(c) for c in controls]
+
+    # 2. Embed every control
+    embeddings = OpenAIEmbeddings()
+
+    # 3. Deterministic cosine-similarity scoring across all controls
+    sim = build_similarity_matrix(texts, embeddings)
+
+    # 4. Extract deduplicated pairs whose scores exceed the thresholds
+    duplicates, similar = find_pairs(
+        controls, sim, duplicate_threshold, similar_threshold, top_k
+    )
+
+    # 5. Report the results as an explicit list of pairs with scores
+    report = [
+        f"Analysed {len(controls)} controls from '{csv_file}'.",
+        f"Duplicate threshold: similarity >= {duplicate_threshold}",
+        f"Similar threshold:   similarity >= {similar_threshold}",
+        format_pairs(duplicates, "DUPLICATE CONTROL PAIRS", MAX_PAIRS_REPORTED),
+        format_pairs(similar, "SIMILAR CONTROL PAIRS", MAX_PAIRS_REPORTED),
+    ]
+
+    # 6. Optional LLM verification of the detected pairs
+    if use_llm_review and (duplicates or similar):
+        llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+        report.append("\n=== LLM VERIFICATION ===")
+        report.append(llm_review(duplicates, similar, llm))
+
+    return "\n".join(report)
+
+
+if __name__ == "__main__":
+    print(run_agent())
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 02:00:06
+Duration: 493.49 seconds
+Verdict: I've completed my evaluation. Let me analyze all the evidence:
+
+## Analysis
+
+**1. Diff Review:**
+The fixed code completely rewrote the agent into a "control duplicate/similarity detection" system. Key changes:
+- Removed the `query`-based RAG chain entirely
+- `run_agent` signature changed to `run_agent(csv_file=CSV_FILE, duplicate_threshold=..., similar_threshold=..., top_k=..., use_llm_review=...)`
+- Returns `"\n".join(report)` — a **string**, not a dict
+- No structured output with a `"results"` key
+
+**2. Test Expectations (the ground truth):**
+The test requires:
+```python
+result = run_agent(query)          # called with a positional query string
+assertIsInstance(result, dict)     # must return a dict
+assertIn("results", result)        # dict must contain "results" key
+assertIsInstance(result["results"], list)  # must be a list
+```
+
+**3. Critical Mismatches in the Fixed Code:**
+
+- **Signature mismatch:** `run_agent("Find movies for family...")` will bind the query string to the `csv_file` parameter. The code will then attempt `CSVLoader(file_path="Find movies for family. Return only the title, genre and budget.")` and fail with a `FileNotFoundError` when loading. The test errors out before any assertion even runs.
+- **Return type mismatch:** Even if execution somehow succeeded, `run_agent` returns `"\n".join(report)` (a string), so `assertIsInstance(result, dict)` fails immediately.
+- **Missing structure:** There is no `"results"` key or list-of-dicts structure anywhere in the output. The report is free-form text lines about duplicate control pairs.
+- **Task mismatch:** The test expects an agent that answers movie queries ("title, genre and budget") with structured results, but the fixed code pivoted entirely to an audit-style control deduplication report — a completely different task.
+
+**4. Validation tool discrepancy:** `validate_fixed_code` returned "ACCEPT fixed code matches expected structure and output format," but this contradicts the explicit test code, which is the authoritative specification. The automated check appears to have validated only syntactic/structural soundness (valid Python, consistent imports), not semantic conformance to the test.
+
+**5. API usage:** The `verify_api_usage` tool returned only generic search noise with no relevant documentation. From my own knowledge, the APIs used (`CSVLoader`, `OpenAIEmbeddings.embed_documents`, `ChatOpenAI`, `ChatPromptTemplate.from_template`, LCEL `chain.invoke`) are themselves validly used — but valid API usage doesn't matter when the function's contract with the test is broken.
+
+## Verdict
+
+**REJECT**
+
+The fixed code fails the test on three independent grounds: (1) calling `run_agent(query)` misbinds the query string to the `csv_file` parameter, causing a `FileNotFoundError` before the function can even return; (2) the function returns a plain string rather than the required `dict`; and (3) the output contains no `"results"` key with a list of dicts as the test demands. The rewrite also abandoned the agent's original query-answering purpose (answering questions about movies from the CSV) in favor of an unrelated pairwise-similarity audit task, which no test assertion supports. To pass, the fix should have preserved `run_agent(query)` semantics and made the chain return structured output (e.g., via an appropriate output parser or structured-output schema producing `{"results": [ {...}, ... ]}`).
+--------------------------------------------------------------------------------
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+
+# Import with fallbacks so the code works on both current and older LangChain versions
+try:
+    from langchain_community.document_loaders import CSVLoader
+    from langchain_community.embeddings import OpenAIEmbeddings
+except ImportError:  # pragma: no cover - older langchain packages
+    from langchain.document_loaders import CSVLoader
+    from langchain.embeddings import OpenAIEmbeddings
+
+try:
+    from langchain_openai import ChatOpenAI
+except ImportError:  # pragma: no cover - older langchain packages
+    from langchain.chat_models import ChatOpenAI
+
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration - the "specified thresholds" for similar / duplicate controls
+# ---------------------------------------------------------------------------
+CSV_FILE = "control.csv"
+
+DUPLICATE_THRESHOLD = 0.95   # cosine similarity >= this  -> duplicate control pair
+SIMILAR_THRESHOLD = 0.85     # cosine similarity >= this  -> similar control pair
+TOP_K = 10                   # how many neighbours to inspect per control
+MAX_PAIRS_REPORTED = 50      # cap on pairs printed per category
+USE_LLM_REVIEW = True        # optional LLM verification of the detected pairs
+
+
+def load_controls(file_path):
+    """
+    Load the control dataset.
+
+    FIX: each CSV row is already one complete control, so rows are loaded as
+    whole documents.  The buggy version additionally ran
+    CharacterTextSplitter(chunk_size=500, chunk_overlap=50), which chopped
+    individual controls into overlapping fragments and destroyed the
+    "1 document == 1 control" mapping that pairwise duplicate/similarity
+    detection requires.
+    """
+    loader = CSVLoader(file_path=file_path)
+    controls = loader.load()
+    if not controls:
+        raise ValueError(f"No controls were loaded from '{file_path}'.")
+    return controls
+
+
+def control_text(control):
+    """Flatten a control document into a single comparable string."""
+    text = (control.page_content or "").strip()
+    if not text:
+        # Precondition guard: fall back to metadata if the content is empty
+        text = " | ".join(f"{k}: {v}" for k, v in control.metadata.items())
+    return text
+
+
+def control_id(control, index):
+    """Best-effort identifier for a control (CSV row number or list index)."""
+    return control.metadata.get("row", index + 1)
+
+
+def build_similarity_matrix(texts, embeddings):
+    """
+    Compute the full cosine-similarity matrix across all controls.
+
+    FIX: similarity scores are computed deterministically in code (not
+    guessed by the LLM), so every reported score is reproducible and can be
+    compared against the configured thresholds.
+    """
+    vectors = np.array(embeddings.embed_documents(texts), dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    unit_vectors = vectors / np.clip(norms, 1e-10, None)
+    sim = unit_vectors @ unit_vectors.T
+    # A control is never similar to itself
+    np.fill_diagonal(sim, -1.0)
+    return sim
+
+
+def find_pairs(controls, sim, duplicate_threshold, similar_threshold, top_k):
+    """
+    Enumerate unordered control pairs whose cosine similarity exceeds the
+    configured thresholds, separated into 'duplicate' and 'similar' buckets.
+
+    FIX: this pairwise comparison step did not exist in the buggy code, which
+    only retrieved k=4 documents to answer a single question.
+    """
+    n = len(controls)
+    seen = set()
+    duplicates, similar = [], []
+
+    for i in range(n):
+        # Inspect only the top_k most similar neighbours to stay tractable
+        candidates = np.argsort(-sim[i])[:top_k]
+        for j in candidates:
+            score = float(sim[i][j])
+            if score < similar_threshold:
+                continue
+
+            a, b = (i, j) if i < j else (j, i)   # canonical unordered pair
+            if (a, b) in seen:
+                continue
+            seen.add((a, b))
+
+            pair = {
+                "id_a": control_id(controls[a], a),
+                "id_b": control_id(controls[b], b),
+                "text_a": control_text(controls[a]),
+                "text_b": control_text(controls[b]),
+                "score": round(score, 4),
+            }
+            if score >= duplicate_threshold:
+                duplicates.append(pair)
+            else:
+                similar.append(pair)
+
+    duplicates.sort(key=lambda p: p["score"], reverse=True)
+    similar.sort(key=lambda p: p["score"], reverse=True)
+    return duplicates, similar
+
+
+def format_pairs(pairs, title, max_pairs):
+    """Render a category of pairs as an explicit, readable list."""
+    lines = [f"\n=== {title} ({len(pairs)} pairs) ==="]
+    if not pairs:
+        lines.append("  None found for the configured threshold.")
+    for rank, p in enumerate(pairs[:max_pairs], start=1):
+        lines.append(
+            f"\n{rank}. Control #{p['id_a']}  <->  Control #{p['id_b']}"
+            f"  | similarity = {p['score']:.4f}"
+        )
+        lines.append(f"   A: {p['text_a'][:200]}")
+        lines.append(f"   B: {p['text_b'][:200]}")
+    if len(pairs) > max_pairs:
+        lines.append(f"\n... and {len(pairs) - max_pairs} more pairs (not shown).")
+    return "\n".join(lines)
+
+
+def llm_review(duplicates, similar, llm):
+    """
+    Optional verification step.
+
+    FIX: the LLM is no longer asked to discover the pairs (which it cannot do
+    reliably for 3500+ controls).  It only receives pairs that were already
+    found and scored deterministically, and is explicitly instructed to
+    re-list them without inventing new pairs or changing the scores.
+    """
+    pair_lines = []
+    for p in duplicates:
+        pair_lines.append(
+            f"[DUPLICATE] #{p['id_a']} <-> #{p['id_b']} score={p['score']}\n"
+            f"  A: {p['text_a'][:300]}\n  B: {p['text_b'][:300]}"
+        )
+    for p in similar:
+        pair_lines.append(
+            f"[SIMILAR] #{p['id_a']} <-> #{p['id_b']} score={p['score']}\n"
+            f"  A: {p['text_a'][:300]}\n  B: {p['text_b'][:300]}"
+        )
+
+    template = """You are an auditor reviewing controls for duplicates.
+
+Below is a candidate list of control pairs that were detected and scored with
+cosine similarity.  Review each pair and re-list only the pairs you agree
+should be reported.  For every pair you keep, output exactly one line:
+
+  <CATEGORY> | <control A id> | <control B id> | <similarity score> | <one-line reason>
+
+Do NOT invent pairs that are not in the list. Do NOT change the scores.
+
+Candidate pairs:
+{pairs}
+
+Answer:
+"""
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"pairs": "\n\n".join(pair_lines) if pair_lines else "None"})
+
+
+def run_agent(
+    csv_file=CSV_FILE,
+    duplicate_threshold=DUPLICATE_THRESHOLD,
+    similar_threshold=SIMILAR_THRESHOLD,
+    top_k=TOP_K,
+    use_llm_review=USE_LLM_REVIEW,
+):
+    """Detect and list similar/duplicate control pairs above the thresholds."""
+    # 1. Load controls: 1 CSV row = 1 intact control document (no chunk splitting)
+    controls = load_controls(csv_file)
+    texts = [control_text(c) for c in controls]
+
+    # 2. Embed every control
+    embeddings = OpenAIEmbeddings()
+
+    # 3. Deterministic cosine-similarity scoring across all controls
+    sim = build_similarity_matrix(texts, embeddings)
+
+    # 4. Extract deduplicated pairs whose scores exceed the thresholds
+    duplicates, similar = find_pairs(
+        controls, sim, duplicate_threshold, similar_threshold, top_k
+    )
+
+    # 5. Report the results as an explicit list of pairs with scores
+    report = [
+        f"Analysed {len(controls)} controls from '{csv_file}'.",
+        f"Duplicate threshold: similarity >= {duplicate_threshold}",
+        f"Similar threshold:   similarity >= {similar_threshold}",
+        format_pairs(duplicates, "DUPLICATE CONTROL PAIRS", MAX_PAIRS_REPORTED),
+        format_pairs(similar, "SIMILAR CONTROL PAIRS", MAX_PAIRS_REPORTED),
+    ]
+
+    # 6. Optional LLM verification of the detected pairs
+    if use_llm_review and (duplicates or similar):
+        llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+        report.append("\n=== LLM VERIFICATION ===")
+        report.append(llm_review(duplicates, similar, llm))
+
+    return "\n".join(report)
+
+
+if __name__ == "__main__":
+    print(run_agent())
+
+--------------------------------------------------------------------------------

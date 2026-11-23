@@ -1,0 +1,317 @@
+Case ID: 78020395
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-04 20:57:36
+End Time: 2026-11-04 20:59:33
+Total Duration: 116.97 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import json
+from typing import List, Dict, Any
+
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+# NOTE: langchain.output_parsers.StructuredOutputParser only knows how to describe
+# a *flat* object (one key/value pair per ResponseSchema). To get nested JSON
+# (a list of dictionaries) you have to describe the shape with a nested model and
+# use a JSON/Pydantic parser instead.
+from langchain_core.output_parsers import JsonOutputParser
+
+load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# 1. Describe the nested schema with Pydantic models
+# ---------------------------------------------------------------------------
+class MissingItem(BaseModel):
+    """A single identifier/text pair found in the error message."""
+
+    identifier: str = Field(description="This is missing identifier.")
+    text: str = Field(description="This is missing text.")
+
+
+class MissingItems(BaseModel):
+    """Container whose single field is a LIST of nested objects."""
+
+    missing_items: List[MissingItem] = Field(
+        description=(
+            "A JSON array with one entry per identifier/text pair mentioned in "
+            "the error message. Never collapse the pairs into a single object."
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Build a parser that emits/accepts nested JSON
+# ---------------------------------------------------------------------------
+def get_output_parser() -> JsonOutputParser:
+    # JsonOutputParser(pydantic_object=...) turns the nested model into format
+    # instructions like:
+    #   {"missing_items": [{"identifier": "...", "text": "..."}, ...]}
+    # and parses exactly that shape back into Python data.
+    return JsonOutputParser(pydantic_object=MissingItems)
+
+
+def _to_list_of_dicts(parsed: Any) -> List[Dict[str, Any]]:
+    """Normalise whatever the parser returns into a plain list of dicts."""
+    if isinstance(parsed, BaseModel):
+        parsed = parsed.model_dump()
+
+    # The parser normally returns {"missing_items": [...]}; be forgiving about
+    # other key names / bare lists the model may produce.
+    if isinstance(parsed, dict):
+        for key in ("missing_items", "items", "results", "data", "output"):
+            if isinstance(parsed.get(key), list):
+                parsed = parsed[key]
+                break
+        else:
+            if all(isinstance(v, dict) for v in parsed.values()) and parsed:
+                parsed = list(parsed.values())
+            else:
+                parsed = [parsed]
+
+    if not isinstance(parsed, list):
+        parsed = [parsed]
+
+    result: List[Dict[str, Any]] = []
+    for item in parsed:
+        if isinstance(item, BaseModel):
+            result.append(item.model_dump())
+        elif isinstance(item, dict):
+            result.append(item)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 3. Predict
+# ---------------------------------------------------------------------------
+def predict_result(msg: str, PROMPT_TEMPLATE: str) -> List[Dict[str, Any]]:
+    model = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        max_tokens=2000,
+    )
+
+    output_parser = get_output_parser()
+    format_instructions = output_parser.get_format_instructions()
+
+    prompt = ChatPromptTemplate.from_template(template=PROMPT_TEMPLATE)
+    message = prompt.format_messages(msg=msg, format_instructions=format_instructions)
+    response = model.invoke(message)
+
+    content = response.content
+
+    # Parse the nested JSON; fall back to raw json.loads if the parser is picky.
+    try:
+        parsed = output_parser.parse(content)
+    except Exception:
+        start, end = content.find("{"), content.rfind("}")
+        if start == -1 or end == -1:
+            raise
+        parsed = json.loads(content[start : end + 1])
+
+    # -> list[dict], e.g.
+    # [{"identifier": "identifier1", "text": "text1"},
+    #  {"identifier": "identifier2", "text": "text1"},
+    #  {"identifier": "identifier3", "text": "text1"}]
+    return _to_list_of_dicts(parsed)
+
+
+if __name__ == "__main__":
+    test_msg = (
+        "ObjectNotFoundException AnyOf(AllOf(withId:identifier1, withText:text1),"
+        "AllOf(withId:identifier2, withText:text1),"
+        "AllOf(withId:identifier3, withText:text1))"
+    )
+
+    PROMPT_TEMPLATE = """
+    You are an android developer.
+    Parse this error message and provide me identifiers & texts mentioned in error message.
+    Return them as a JSON array of objects, one object per identifier/text pair.
+    --------
+    Error message is {msg}
+    --------
+    {format_instructions}
+    """
+
+    result = predict_result(test_msg, PROMPT_TEMPLATE)
+    print(result)
+    for item in result:
+        print(item["identifier"], "->", item["text"])
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-04 20:59:33
+Duration: 116.97 seconds
+Verdict: ## Evaluation
+
+**Bug context:** The original code used `StructuredOutputParser` with two *flat* `ResponseSchema`s (`identifier`, `text`). That schema can only ever describe a single flat object, so an error message like the sample one containing **three** `AllOf(withId:…, withText:…)` pairs gets collapsed into one pair — information is lost, and the schema can't instruct the model to emit multiple items. There's also a versioning smell: `langchain.output_parsers.StructuredOutputParser` has been moved to the `langchain-classic` package (per the docs verification), so that import is fragile/deprecated.
+
+**What the fix does:**
+1. Replaces the flat schema with nested Pydantic models — `MissingItem` (`identifier`, `text`) and `MissingItems` (`missing_items: List[MissingItem]`). This is exactly the shape the task requires (N pairs, not 1).
+2. Switches to `JsonOutputParser(pydantic_object=MissingItems)` — verified: `JsonOutputParser` accepts a `pydantic_object` used to generate format instructions, and `get_format_instructions()` exists on it. Note the parser returns a plain `dict` (not the Pydantic model), which the fix correctly anticipates.
+3. Adds `_to_list_of_dicts()` to normalize tolerant shapes (`{"missing_items": [...]}`, bare list, alternate keys, or a single flat dict) into a stable `list[dict]` — sensible defensive design given LLM output variance.
+4. Keeps `ChatPromptTemplate.from_template(...).format_messages(msg=..., format_instructions=...)` — verified correct; braces inside the *value* of `format_instructions` are safe since it's substituted as a variable, not as template text.
+5. Adds a `json.loads` fallback on parse failure and updates the prompt to explicitly request "a JSON array of objects, one object per identifier/text pair" — consistent with the new schema.
+
+**API checks:** `langchain_core.output_parsers.JsonOutputParser` (with `pydantic_object` + `get_format_instructions`), `langchain_core.prompts.ChatPromptTemplate`, and `pydantic.BaseModel/Field` usage are all valid. The deprecated `StructuredOutputParser` import is removed, which is a plus.
+
+**Caveats (not fatal):**
+- `validate_fixed_code` returned "REJECT — test code unavailable", so the exact expected output contract can't be confirmed.
+- The return type changes from `dict` to `list[dict]`. This is the *right* semantic fix for a multi-pair error message, but any external consumer/test expecting the old single-dict shape would need updating.
+- `JsonOutputParser` doesn't actually validate against `MissingItems` (only `PydanticOutputParser` does), so the model is effectively just a format-instruction generator — acceptable, since normalization handles it.
+
+**Verdict:** The change directly addresses the root cause (flat schema → nested list schema), uses the APIs correctly, and adds reasonable robustness without breaking the invocation path.
+
+**ACCEPT** — with the note that the return-shape change to `list[dict]` should be treated as the intended new contract.
+--------------------------------------------------------------------------------
+import os
+import json
+from typing import List, Dict, Any
+
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+# NOTE: langchain.output_parsers.StructuredOutputParser only knows how to describe
+# a *flat* object (one key/value pair per ResponseSchema). To get nested JSON
+# (a list of dictionaries) you have to describe the shape with a nested model and
+# use a JSON/Pydantic parser instead.
+from langchain_core.output_parsers import JsonOutputParser
+
+load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# 1. Describe the nested schema with Pydantic models
+# ---------------------------------------------------------------------------
+class MissingItem(BaseModel):
+    """A single identifier/text pair found in the error message."""
+
+    identifier: str = Field(description="This is missing identifier.")
+    text: str = Field(description="This is missing text.")
+
+
+class MissingItems(BaseModel):
+    """Container whose single field is a LIST of nested objects."""
+
+    missing_items: List[MissingItem] = Field(
+        description=(
+            "A JSON array with one entry per identifier/text pair mentioned in "
+            "the error message. Never collapse the pairs into a single object."
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Build a parser that emits/accepts nested JSON
+# ---------------------------------------------------------------------------
+def get_output_parser() -> JsonOutputParser:
+    # JsonOutputParser(pydantic_object=...) turns the nested model into format
+    # instructions like:
+    #   {"missing_items": [{"identifier": "...", "text": "..."}, ...]}
+    # and parses exactly that shape back into Python data.
+    return JsonOutputParser(pydantic_object=MissingItems)
+
+
+def _to_list_of_dicts(parsed: Any) -> List[Dict[str, Any]]:
+    """Normalise whatever the parser returns into a plain list of dicts."""
+    if isinstance(parsed, BaseModel):
+        parsed = parsed.model_dump()
+
+    # The parser normally returns {"missing_items": [...]}; be forgiving about
+    # other key names / bare lists the model may produce.
+    if isinstance(parsed, dict):
+        for key in ("missing_items", "items", "results", "data", "output"):
+            if isinstance(parsed.get(key), list):
+                parsed = parsed[key]
+                break
+        else:
+            if all(isinstance(v, dict) for v in parsed.values()) and parsed:
+                parsed = list(parsed.values())
+            else:
+                parsed = [parsed]
+
+    if not isinstance(parsed, list):
+        parsed = [parsed]
+
+    result: List[Dict[str, Any]] = []
+    for item in parsed:
+        if isinstance(item, BaseModel):
+            result.append(item.model_dump())
+        elif isinstance(item, dict):
+            result.append(item)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 3. Predict
+# ---------------------------------------------------------------------------
+def predict_result(msg: str, PROMPT_TEMPLATE: str) -> List[Dict[str, Any]]:
+    model = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        max_tokens=2000,
+    )
+
+    output_parser = get_output_parser()
+    format_instructions = output_parser.get_format_instructions()
+
+    prompt = ChatPromptTemplate.from_template(template=PROMPT_TEMPLATE)
+    message = prompt.format_messages(msg=msg, format_instructions=format_instructions)
+    response = model.invoke(message)
+
+    content = response.content
+
+    # Parse the nested JSON; fall back to raw json.loads if the parser is picky.
+    try:
+        parsed = output_parser.parse(content)
+    except Exception:
+        start, end = content.find("{"), content.rfind("}")
+        if start == -1 or end == -1:
+            raise
+        parsed = json.loads(content[start : end + 1])
+
+    # -> list[dict], e.g.
+    # [{"identifier": "identifier1", "text": "text1"},
+    #  {"identifier": "identifier2", "text": "text1"},
+    #  {"identifier": "identifier3", "text": "text1"}]
+    return _to_list_of_dicts(parsed)
+
+
+if __name__ == "__main__":
+    test_msg = (
+        "ObjectNotFoundException AnyOf(AllOf(withId:identifier1, withText:text1),"
+        "AllOf(withId:identifier2, withText:text1),"
+        "AllOf(withId:identifier3, withText:text1))"
+    )
+
+    PROMPT_TEMPLATE = """
+    You are an android developer.
+    Parse this error message and provide me identifiers & texts mentioned in error message.
+    Return them as a JSON array of objects, one object per identifier/text pair.
+    --------
+    Error message is {msg}
+    --------
+    {format_instructions}
+    """
+
+    result = predict_result(test_msg, PROMPT_TEMPLATE)
+    print(result)
+    for item in result:
+        print(item["identifier"], "->", item["text"])
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,349 @@
+Case ID: 77555312
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 19:23:31
+End Time: 2026-11-05 19:25:58
+Total Duration: 147.30 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+
+import dotenv
+from langchain.document_loaders import UnstructuredFileLoader
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Building the vector store is expensive AND, when it is rebuilt on every
+# call (or pointed at the same persistence directory), the very same chunks
+# get inserted again and again.  That is one of the reasons a retriever can
+# hand back the exact same document several times.  Build it once per
+# process and reuse it.
+# ---------------------------------------------------------------------------
+_VECTORSTORE = None
+
+
+def _unique_splits(splits):
+    """Drop duplicated / empty chunks that the loader or splitter produced."""
+    seen = set()
+    unique = []
+    for split in splits:
+        content = (split.page_content or "").strip()
+        if not content:
+            continue
+        key = (
+            split.metadata.get("source"),
+            split.metadata.get("start_index"),
+            content,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(split)
+    return unique
+
+
+def get_vectorstore():
+    global _VECTORSTORE
+    if _VECTORSTORE is not None:
+        return _VECTORSTORE
+
+    loader = UnstructuredFileLoader("paper2.pdf")
+    docs = loader.load()
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        add_start_index=True,
+        # separators that prefer real semantic boundaries, so neighbouring
+        # chunks are not almost identical copies of each other
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    all_splits = _unique_splits(text_splitter.split_documents(docs))
+
+    _VECTORSTORE = Chroma.from_documents(
+        documents=all_splits,
+        embedding=OpenAIEmbeddings(),
+    )
+    return _VECTORSTORE
+
+
+def _dedupe(docs, k):
+    """Keep at most one document per distinct piece of text."""
+    unique = []
+    seen = set()
+    for doc in docs:
+        key = " ".join((doc.page_content or "").split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(doc)
+        if len(unique) == k:
+            break
+    return unique
+
+
+def get_unique_documents(query, k=6):
+    """Return up to ``k`` *distinct* documents for ``query``."""
+    vectorstore = get_vectorstore()
+
+    # 1) MMR (Maximal Marginal Relevance): re-ranks a larger candidate pool
+    #    (fetch_k) and deliberately penalises results that are too similar to
+    #    the ones already selected, so you get diversity instead of the same
+    #    passage six times.
+    fetch_k = max(20, k * 10)
+    docs = vectorstore.max_marginal_relevance_search(
+        query,
+        k=k * 2,          # over-fetch a bit, duplicates are removed below
+        fetch_k=fetch_k,
+        lambda_mult=0.5,  # 0 = max diversity, 1 = pure similarity
+    )
+    unique_docs = _dedupe(docs, k)
+
+    # 2) Fallback / top-up: if still short of k unique chunks (short paper,
+    #    very repetitive text), widen the plain similarity search and keep
+    #    adding not-yet-seen documents.
+    if len(unique_docs) < k:
+        seen = {" ".join((d.page_content or "").split()) for d in unique_docs}
+        for doc in vectorstore.similarity_search(query, k=max(fetch_k, k * 10)):
+            key = " ".join((doc.page_content or "").split())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique_docs.append(doc)
+            if len(unique_docs) == k:
+                break
+
+    return unique_docs[:k]
+
+
+def run_agent(query):
+    # Use the MMR-based retriever so that ``k`` means "k *different* chunks".
+    retriever = get_vectorstore().as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": 6,
+            "fetch_k": 60,
+            "lambda_mult": 0.5,
+        },
+    )
+
+    try:
+        retrieved_docs = retriever.invoke(query)
+    except AttributeError:  # older langchain versions
+        retrieved_docs = retriever.get_relevant_documents(query)
+
+    # Guarantee distinct contents even if the backend returned duplicates.
+    retrieved_docs = _dedupe(retrieved_docs, 6)
+    if len(retrieved_docs) < 6:
+        retrieved_docs = get_unique_documents(query, k=6)
+
+    return retrieved_docs
+
+
+if __name__ == "__main__":
+    query = "What is Toggle?"
+    result = run_agent(query)
+    for i, doc in enumerate(result, start=1):
+        print(f"--- doc {i} (source={doc.metadata.get('source')}, "
+              f"start_index={doc.metadata.get('start_index')}) ---")
+        print(doc.page_content[:300])
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 19:25:58
+Duration: 147.30 seconds
+Verdict: ## Evaluation Report — Case 77555312
+
+### 1. Diff review
+The fix is a substantial rewrite of the retrieval pipeline:
+
+- **Cleanup**: dropped unused/incorrect imports (`langchain.llms.OpenAI`, `bs4`, `langchain`, `hub`) → no import-time failures from unrelated modules.
+- **Vector store built once** via a module-level `_VECTORSTORE` cache (`get_vectorstore()`), which both avoids re-embedding the PDF on every call and removes the duplicate-insertion problem when a persistence dir is reused.
+- **Chunk dedup** (`_unique_splits`) drops empty/near-identical chunks before embedding.
+- **Splitter config**: keeps `chunk_size=1000, chunk_overlap=200, add_start_index=True` and adds explicit `separators` (valid `RecursiveCharacterTextSplitter` argument; default is `["\n\n","\n"," ",""]`, so adding `". "` is a legal refinement).
+- **Retrieval upgrade**: `as_retriever(search_type="mmr", search_kwargs={"k":6,"fetch_k":60,"lambda_mult":0.5})` — this is exactly the documented MMR retriever wiring (`fetch_k`, `lambda_mult` are legitimate `search_kwargs` for `search_type="mmr"`).
+- **API compatibility guard**: `retriever.invoke(query)` with `except AttributeError → get_relevant_documents(query)`, correct for both modern (≥0.1) and legacy LangChain.
+- **Post-dedup** (`_dedupe`) plus a widening fallback (`get_unique_documents` using `max_marginal_relevance_search(query, k, fetch_k, lambda_mult)` and `similarity_search`), whose signatures match `VectorStore.max_marginal_relevance_search(query, k=4, fetch_k=20, lambda_mult=0.5, ...)` and `similarity_search(query, k=4)`.
+
+### 2. Validation
+`validate_fixed_code` → **ACCEPT**: structure and output format match expectations.
+
+### 3. API verification
+The documentation lookups returned only generic LangChain overviews (no signature detail), so I checked the calls against the known `VectorStore`/`Chroma` and `VectorStoreRetriever` contracts: `max_marginal_relevance_search`, `similarity_search`, `as_retriever(search_type="mmr", search_kwargs=...)`, and `invoke` are all used with valid parameter names/semantics. No invalid or hallucinated API is used.
+
+### 4. Contract with the test
+`run_agent(query)` still returns a **list of `Document` objects** (each with `page_content`), length in `[0, 6]`, satisfying:
+
+```python
+assertIsInstance(result, list); assertGreaterEqual(len(result), 0)
+for doc in result: assertTrue(hasattr(doc, "page_content"))
+```
+
+`_dedupe` returns real `Document`s, so `page_content`/`metadata` access in the `__main__` block is safe (metadata is a dict, `.get` is fine).
+
+### Minor observations (non-blocking)
+- `get_unique_documents` partially duplicates the retriever path — redundant, and the fallback can trigger an extra search round (slight latency), but it doesn't affect correctness.
+- The `except AttributeError` around `invoke` would also swallow an unrelated `AttributeError` raised deeper inside Chroma, causing one extra query instead of failing. Harmless here.
+- The pre-existing external dependency on `paper2.pdf` and `OPENAI_API_KEY` (`dotenv` loaded) is unchanged from the buggy version.
+
+## Verdict: **ACCEPT**
+
+The fix preserves the required return type/format, uses only valid LangChain APIs (MMR retriever/search with correct kwargs, `similarity_search`, `invoke` with a legacy fallback), and genuinely addresses the underlying bug (duplicate retrieved documents) via single-build vector store, chunk dedup, MMR diversification, and result dedup — with no regressions against the supplied test.
+--------------------------------------------------------------------------------
+import os
+
+import dotenv
+from langchain.document_loaders import UnstructuredFileLoader
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+
+dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Building the vector store is expensive AND, when it is rebuilt on every
+# call (or pointed at the same persistence directory), the very same chunks
+# get inserted again and again.  That is one of the reasons a retriever can
+# hand back the exact same document several times.  Build it once per
+# process and reuse it.
+# ---------------------------------------------------------------------------
+_VECTORSTORE = None
+
+
+def _unique_splits(splits):
+    """Drop duplicated / empty chunks that the loader or splitter produced."""
+    seen = set()
+    unique = []
+    for split in splits:
+        content = (split.page_content or "").strip()
+        if not content:
+            continue
+        key = (
+            split.metadata.get("source"),
+            split.metadata.get("start_index"),
+            content,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(split)
+    return unique
+
+
+def get_vectorstore():
+    global _VECTORSTORE
+    if _VECTORSTORE is not None:
+        return _VECTORSTORE
+
+    loader = UnstructuredFileLoader("paper2.pdf")
+    docs = loader.load()
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        add_start_index=True,
+        # separators that prefer real semantic boundaries, so neighbouring
+        # chunks are not almost identical copies of each other
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    all_splits = _unique_splits(text_splitter.split_documents(docs))
+
+    _VECTORSTORE = Chroma.from_documents(
+        documents=all_splits,
+        embedding=OpenAIEmbeddings(),
+    )
+    return _VECTORSTORE
+
+
+def _dedupe(docs, k):
+    """Keep at most one document per distinct piece of text."""
+    unique = []
+    seen = set()
+    for doc in docs:
+        key = " ".join((doc.page_content or "").split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(doc)
+        if len(unique) == k:
+            break
+    return unique
+
+
+def get_unique_documents(query, k=6):
+    """Return up to ``k`` *distinct* documents for ``query``."""
+    vectorstore = get_vectorstore()
+
+    # 1) MMR (Maximal Marginal Relevance): re-ranks a larger candidate pool
+    #    (fetch_k) and deliberately penalises results that are too similar to
+    #    the ones already selected, so you get diversity instead of the same
+    #    passage six times.
+    fetch_k = max(20, k * 10)
+    docs = vectorstore.max_marginal_relevance_search(
+        query,
+        k=k * 2,          # over-fetch a bit, duplicates are removed below
+        fetch_k=fetch_k,
+        lambda_mult=0.5,  # 0 = max diversity, 1 = pure similarity
+    )
+    unique_docs = _dedupe(docs, k)
+
+    # 2) Fallback / top-up: if still short of k unique chunks (short paper,
+    #    very repetitive text), widen the plain similarity search and keep
+    #    adding not-yet-seen documents.
+    if len(unique_docs) < k:
+        seen = {" ".join((d.page_content or "").split()) for d in unique_docs}
+        for doc in vectorstore.similarity_search(query, k=max(fetch_k, k * 10)):
+            key = " ".join((doc.page_content or "").split())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique_docs.append(doc)
+            if len(unique_docs) == k:
+                break
+
+    return unique_docs[:k]
+
+
+def run_agent(query):
+    # Use the MMR-based retriever so that ``k`` means "k *different* chunks".
+    retriever = get_vectorstore().as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": 6,
+            "fetch_k": 60,
+            "lambda_mult": 0.5,
+        },
+    )
+
+    try:
+        retrieved_docs = retriever.invoke(query)
+    except AttributeError:  # older langchain versions
+        retrieved_docs = retriever.get_relevant_documents(query)
+
+    # Guarantee distinct contents even if the backend returned duplicates.
+    retrieved_docs = _dedupe(retrieved_docs, 6)
+    if len(retrieved_docs) < 6:
+        retrieved_docs = get_unique_documents(query, k=6)
+
+    return retrieved_docs
+
+
+if __name__ == "__main__":
+    query = "What is Toggle?"
+    result = run_agent(query)
+    for i, doc in enumerate(result, start=1):
+        print(f"--- doc {i} (source={doc.metadata.get('source')}, "
+              f"start_index={doc.metadata.get('start_index')}) ---")
+        print(doc.page_content[:300])
+
+--------------------------------------------------------------------------------

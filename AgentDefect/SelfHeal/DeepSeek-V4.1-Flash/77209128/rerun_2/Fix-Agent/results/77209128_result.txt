@@ -1,0 +1,344 @@
+Case ID: 77209128
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 17:50:42
+End Time: 2026-11-05 17:54:32
+Total Duration: 229.66 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import json
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, MetaData, Table, Column, JSON, Integer
+from llama_index.core import SQLDatabase, VectorStoreIndex, Settings
+from llama_index.core.objects import SQLTableNodeMapping, SQLTableSchema, ObjectIndex
+from llama_index.core.query_engine import SQLTableRetrieverQueryEngine
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+
+load_dotenv()
+
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in .env file")
+
+pg_uri = os.environ.get('DATABASE_URL', 'sqlite:///test.db')
+
+TABLE_NAME = "snapshots"
+
+# JSON metadata: field name -> human readable description of the field that
+# lives inside the `data` JSON column of the snapshots table.
+metadata_dict = {
+    "page_call_phone_clicks_logged_in_unique": "Number of people who logged into Facebook and clicked the Call Now button. Ex: 2"
+}
+
+
+def build_table_context(table_name: str, field_descriptions: dict) -> str:
+    """Build a human readable description of the table + its JSON fields.
+
+    This string is what gets attached to the SQLTableSchema (``context_str``)
+    and therefore what the retriever and the SQL generation prompt actually see.
+    """
+    sample_field = next(iter(field_descriptions))
+    lines = [
+        f'Table "{table_name}" stores snapshot records.',
+        'Column "id" is the primary key.',
+        'Column "data" holds a JSON object whose keys are metric field names.',
+        "Field descriptions inside the \"data\" JSON column:",
+    ]
+    for field_name, description in field_descriptions.items():
+        lines.append(f'- "{field_name}": {description}')
+    lines.append(
+        f'To read such a field use a JSON accessor, e.g. '
+        f"data->>'{sample_field}' (SQLite/Postgres)."
+    )
+    return "\n".join(lines)
+
+
+class SqlQueryEngine:
+
+    def __init__(self):
+        self.schema = []
+
+    def query_engine(self):
+        engine = create_engine(pg_uri)
+        metadata_obj = MetaData()
+        # Convert the metadata dictionary to a JSON string. This is kept as a
+        # column comment (works on DBs that support comments, e.g. Postgres --
+        # SQLite simply ignores it), but it is *not* what feeds the LLM.
+        metadata_json = json.dumps(metadata_dict)
+        # create snapshot SQL table
+        snapshots_table = Table(
+            TABLE_NAME,
+            metadata_obj,
+            Column("id", Integer, primary_key=True),
+            Column("data", JSON, comment=metadata_json),
+        )
+
+        metadata_obj.create_all(engine)
+
+        # Restrict the SQL database to the table we care about so the retrieved
+        # schema is deterministic.
+        sql_database = SQLDatabase(engine, include_tables=[TABLE_NAME])
+        nodes = SQLTableNodeMapping(sql_database)
+
+        llm = OpenAI(temperature=0.0, model="gpt-3.5-turbo")
+        Settings.llm = llm
+        # The ObjectIndex needs an embedding model as well.
+        Settings.embed_model = OpenAIEmbedding()
+
+        # KEY FIX: the JSON field descriptions must be attached to the
+        # SQLTableSchema through `context_str`. Previously the schema was built
+        # with only `table_name`, so `context_str` stayed None: the vector index
+        # (built from `str(SQLTableSchema)` == "<table>: <context_str>") and the
+        # SQL prompt (which appends `context_str` to the table info) never saw
+        # the metadata. A column comment alone is not enough -- and SQLite does
+        # not persist column comments at all.
+        table_context = build_table_context(TABLE_NAME, metadata_dict)
+
+        self.schema = [
+            SQLTableSchema(table_name=TABLE_NAME, context_str=table_context)
+            for table_name in metadata_obj.tables.keys()
+        ]
+
+        # Dump the table schema information into a vector index so the right
+        # table (and its context) is retrieved at query time.
+        index = ObjectIndex.from_objects(self.schema, nodes, VectorStoreIndex)
+
+        query_engine = SQLTableRetrieverQueryEngine(
+            sql_database,
+            index.as_retriever(similarity_top_k=1),
+        )
+
+        return query_engine
+
+
+def run_agent(query: str):
+    print("Initializing SQL Query Engine...")
+    sql_engine = SqlQueryEngine()
+    query_engine = sql_engine.query_engine()
+    print("Query engine created successfully!")
+
+    print(f"\nExecuting query: {query}")
+    response = query_engine.query(query)
+    print(f"Response: {response}")
+
+    return sql_engine, response
+
+
+if __name__ == "__main__":
+
+    query = "What does the page_call_phone_clicks_logged_in_unique field mean in the data column?"
+    sql_engine, response = run_agent(query)
+
+    for schema_item in sql_engine.schema:
+        print(f"\nTable: {schema_item.table_name}")
+        if getattr(schema_item, 'context_str', None):
+            print(f"  context_str: {schema_item.context_str}")
+            print("  Status: Metadata context is SET")
+            # Also verify the text that is embedded for retrieval actually
+            # contains the metadata.
+            print(f"  Retrieval node text: {str(schema_item)[:200]}...")
+        else:
+            print("  context_str: None")
+            print("  Status: Metadata context is NOT SET")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 17:54:32
+Duration: 229.66 seconds
+Verdict: ## Review Summary
+
+### 1. Diff analysis
+The fix addresses the actual root cause of the bug: the metadata descriptions never reached the LLM.
+
+**Original bug chain:**
+- `metadata_dict` was only injected as `comment=metadata_json` on the `data` column.
+- `SQLTableSchema(table_name=table_name)` was created **without** `context_str`, so `context_str` stayed `None`.
+- `str(SQLTableSchema)` (the text that gets embedded into the `ObjectIndex`) and the SQL-generation prompt both append `context_str`, so the field descriptions were invisible to retrieval and to SQL generation.
+- Bonus issue: SQLite silently drops column comments, so even the comment route is a dead end for the default `sqlite:///test.db`.
+
+**What the fix does:**
+- Adds `build_table_context()` which renders the table/JSON-field descriptions into a human-readable string.
+- Passes that string via `SQLTableSchema(table_name=TABLE_NAME, context_str=table_context)` — directly satisfying the test's core assertion (`context_str` present, non-None, non-empty).
+- `self.schema` is now populated from `metadata_obj.tables.keys()` with `context_str` set, and `len(self.schema) > 0` holds (one table: `snapshots`).
+- Sets `Settings.embed_model = OpenAIEmbedding()` (with the matching import) — required because `ObjectIndex.from_objects(..., VectorStoreIndex)` embeds the schema strings; without an embedding model this path errors out. This is a genuine, necessary addition.
+- `SQLDatabase(engine, include_tables=[TABLE_NAME])` makes retrieval deterministic and avoids picking up unrelated tables (relevant because `similarity_top_k=1`).
+- Introduces `TABLE_NAME` constant, keeps `context_str` semantics coherent with `str(schema_item)` (verified in the `__main__` diagnostics block).
+- Lowered `temperature` 0.9 → 0.0, which is appropriate for SQL generation.
+- Cosmetic cleanups (whitespace, `getattr(schema_item, 'context_str', None)`), no behavioral regressions.
+
+### 2. Structural validation
+`validate_fixed_code` returned **ACCEPT** — the fixed code matches the expected structure/output format, and the schema construction satisfies every assertion in the test:
+- `sql_engine` not None ✔
+- `hasattr(sql_engine, "schema")` ✔
+- `len(schema) > 0` ✔
+- every item has non-empty `context_str` ✔
+
+### 3. API verification
+I attempted to verify `SQLTableSchema`, `SQLDatabase`, `ObjectIndex.from_objects`, and `SQLTableRetrieverQueryEngine`. Note: the documentation lookup returned **irrelevant results** (generic "Llama the animal" / "Subway sandwich" articles — the search backend did not resolve the `llama_index` package). The verification outputs therefore carry **no signal** and were not used to accept or reject the code.
+
+I evaluated these APIs against known `llama_index` semantics instead:
+- `SQLTableSchema(table_name: str, context_str: Optional[str] = None, table_schema: Optional[str] = None)` — `context_str` is a valid keyword field. ✔
+- `SQLDatabase(engine, schema=None, metadata=None, include_tables=None, ...)` — `include_tables` is a valid parameter taking a list of table names. ✔
+- `ObjectIndex.from_objects(objs, table_node_mapping, vector_store_index_cls, ...)` — matches the positional `(self.schema, nodes, VectorStoreIndex)` call. ✔
+- `SQLTableRetrieverQueryEngine(sql_database, table_retriever)` — matches; `as_retriever(similarity_top_k=...)` is a valid `ObjectIndex` call. ✔
+- `OpenAIEmbedding()` exists at `llama_index.embeddings.openai` and is assignable to `Settings.embed_model`. ✔
+
+No deprecated APIs introduced (the removed `LLMPredictor`/`ServiceContext` comments were already the correct call; `Settings.llm` is the modern path).
+
+### 4. Minor, non-blocking observations
+- The `context_str` mentions `data->>'field'`; this is valid SQLite ≥3.38 and Postgres, and is illustrative only — the SQL generator adapts. Not a correctness risk.
+- `run_agent` still performs a live LLM query, so the test depends on a valid `OPENAI_API_KEY` — that's an environment prerequisite already enforced in the original file, not a defect introduced by the fix.
+- `next(iter(field_descriptions))` would raise on an empty dict, but `metadata_dict` is a non-empty module constant, so this is safe here.
+
+## Verdict
+
+**ACCEPT**
+
+The fix correctly targets the root cause (`context_str` was never populated, so the JSON metadata never reached the vector index or the SQL prompt), the structural validation passes, and all API usages are consistent with `llama_index` semantics. The added `Settings.embed_model` was a necessary correction rather than incidental scope creep.
+--------------------------------------------------------------------------------
+import os
+import json
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, MetaData, Table, Column, JSON, Integer
+from llama_index.core import SQLDatabase, VectorStoreIndex, Settings
+from llama_index.core.objects import SQLTableNodeMapping, SQLTableSchema, ObjectIndex
+from llama_index.core.query_engine import SQLTableRetrieverQueryEngine
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+
+load_dotenv()
+
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in .env file")
+
+pg_uri = os.environ.get('DATABASE_URL', 'sqlite:///test.db')
+
+TABLE_NAME = "snapshots"
+
+# JSON metadata: field name -> human readable description of the field that
+# lives inside the `data` JSON column of the snapshots table.
+metadata_dict = {
+    "page_call_phone_clicks_logged_in_unique": "Number of people who logged into Facebook and clicked the Call Now button. Ex: 2"
+}
+
+
+def build_table_context(table_name: str, field_descriptions: dict) -> str:
+    """Build a human readable description of the table + its JSON fields.
+
+    This string is what gets attached to the SQLTableSchema (``context_str``)
+    and therefore what the retriever and the SQL generation prompt actually see.
+    """
+    sample_field = next(iter(field_descriptions))
+    lines = [
+        f'Table "{table_name}" stores snapshot records.',
+        'Column "id" is the primary key.',
+        'Column "data" holds a JSON object whose keys are metric field names.',
+        "Field descriptions inside the \"data\" JSON column:",
+    ]
+    for field_name, description in field_descriptions.items():
+        lines.append(f'- "{field_name}": {description}')
+    lines.append(
+        f'To read such a field use a JSON accessor, e.g. '
+        f"data->>'{sample_field}' (SQLite/Postgres)."
+    )
+    return "\n".join(lines)
+
+
+class SqlQueryEngine:
+
+    def __init__(self):
+        self.schema = []
+
+    def query_engine(self):
+        engine = create_engine(pg_uri)
+        metadata_obj = MetaData()
+        # Convert the metadata dictionary to a JSON string. This is kept as a
+        # column comment (works on DBs that support comments, e.g. Postgres --
+        # SQLite simply ignores it), but it is *not* what feeds the LLM.
+        metadata_json = json.dumps(metadata_dict)
+        # create snapshot SQL table
+        snapshots_table = Table(
+            TABLE_NAME,
+            metadata_obj,
+            Column("id", Integer, primary_key=True),
+            Column("data", JSON, comment=metadata_json),
+        )
+
+        metadata_obj.create_all(engine)
+
+        # Restrict the SQL database to the table we care about so the retrieved
+        # schema is deterministic.
+        sql_database = SQLDatabase(engine, include_tables=[TABLE_NAME])
+        nodes = SQLTableNodeMapping(sql_database)
+
+        llm = OpenAI(temperature=0.0, model="gpt-3.5-turbo")
+        Settings.llm = llm
+        # The ObjectIndex needs an embedding model as well.
+        Settings.embed_model = OpenAIEmbedding()
+
+        # KEY FIX: the JSON field descriptions must be attached to the
+        # SQLTableSchema through `context_str`. Previously the schema was built
+        # with only `table_name`, so `context_str` stayed None: the vector index
+        # (built from `str(SQLTableSchema)` == "<table>: <context_str>") and the
+        # SQL prompt (which appends `context_str` to the table info) never saw
+        # the metadata. A column comment alone is not enough -- and SQLite does
+        # not persist column comments at all.
+        table_context = build_table_context(TABLE_NAME, metadata_dict)
+
+        self.schema = [
+            SQLTableSchema(table_name=TABLE_NAME, context_str=table_context)
+            for table_name in metadata_obj.tables.keys()
+        ]
+
+        # Dump the table schema information into a vector index so the right
+        # table (and its context) is retrieved at query time.
+        index = ObjectIndex.from_objects(self.schema, nodes, VectorStoreIndex)
+
+        query_engine = SQLTableRetrieverQueryEngine(
+            sql_database,
+            index.as_retriever(similarity_top_k=1),
+        )
+
+        return query_engine
+
+
+def run_agent(query: str):
+    print("Initializing SQL Query Engine...")
+    sql_engine = SqlQueryEngine()
+    query_engine = sql_engine.query_engine()
+    print("Query engine created successfully!")
+
+    print(f"\nExecuting query: {query}")
+    response = query_engine.query(query)
+    print(f"Response: {response}")
+
+    return sql_engine, response
+
+
+if __name__ == "__main__":
+
+    query = "What does the page_call_phone_clicks_logged_in_unique field mean in the data column?"
+    sql_engine, response = run_agent(query)
+
+    for schema_item in sql_engine.schema:
+        print(f"\nTable: {schema_item.table_name}")
+        if getattr(schema_item, 'context_str', None):
+            print(f"  context_str: {schema_item.context_str}")
+            print("  Status: Metadata context is SET")
+            # Also verify the text that is embedded for retrieval actually
+            # contains the metadata.
+            print(f"  Retrieval node text: {str(schema_item)[:200]}...")
+        else:
+            print("  context_str: None")
+            print("  Status: Metadata context is NOT SET")
+
+--------------------------------------------------------------------------------

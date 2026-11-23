@@ -8,7 +8,7 @@ Every number in this report is read from the experiment records listed in sectio
 
 The 20 harness repair papers of the literature review (`docs/Agent_Error_Mitigation_Review (1).html`) change a persistent system, its code, prompt assembly, tool adapters, memory policy and control rules. They accept a patch when the patched harness passes its test. The review leaves three questions open. Whether an intervention was enacted at all, as distinct from being wrong (DoVer, row 15). Whether a component's effect can be separated from stochastic recovery, with intervals (Causal Agent Replay, row 6). Whether alternative and jointly sufficient repair sets can be recovered under validity constraints (MRFR and GCJR, row 22).
 
-Two motivation experiments show that the acceptance test leaves all three open. A verdict such as "this change is required" or "this change is removable" is a thresholded contrast of two pass counts, three runs a side. The runs may never have executed the change.
+The motivation experiments show that the acceptance test leaves all three open. A verdict such as "this change is required" or "this change is removable" is a thresholded contrast of two pass counts, three runs a side. The runs may never have executed the change.
 
 **Proposal.** Define the verdict on a harness change as a causal estimand and estimate it. The estimand is the effect of the change on the pass probability, among the runs that enact it, in its repair context. Its uncertainty is valid at whatever repetition count the loop stops. Three claims follow.
 
@@ -24,9 +24,7 @@ A fourth observation, that a pass can come through a path the repair never touch
 
 **AgentDefect** holds 37 case folders of small LangChain programs with a reported defect, 36 with a buggy and a fixed program, and a median substantive diff of 8.5 lines. Six programs ran. Each complete repair was decomposed into declared changes by statement level AST comparison. Every coherent subset was built as a configuration. Each pair of configurations that differs by one change was run three times per frozen input on gpt-6-luna, with probes at the module boundaries. The main experiment holds 174 runs and 32 comparisons, the retrieval intervention 36 runs and four comparisons, and the environment experiment 192 runs and 52 comparisons. All 402 runs carry boundary states and a trace.
 
-**AgentIssue-Bench** is a cohort of 50 reproduced issues in real agent repositories with Docker images and developer fixes. Qualification produced 36 records, 30 of which reproduced the failure, and five cases qualified for the removal study with their controls held. Each developer fix was split into changes and every removal was run three times per check. The record states per run whether the implicated code was reached and the loaded implementation was verified. The removal study holds 42 comparisons and its corrected follow-up 19.
-
-**Reanalysis.** Every recorded comparison of both datasets, 88 and 61 rows, was re-read without a model call. Each side's passes over its runs give a Jeffreys Beta posterior of the pass probability. The effect is the posterior of the difference between the with side and the without side, and each with side run is marked enacted or not. A required verdict survives when the posterior probability of a positive difference is at least 0.95. A removable verdict survives when the probability that the two rates lie within 0.2 is at least 0.95. Fisher's exact two sided test is reported beside the posterior.
+**Reanalysis.** Every recorded comparison, 88 rows, was re-read without a model call. Each side's passes over its runs give a Jeffreys Beta posterior of the pass probability. The effect is the posterior of the difference between the with side and the without side, and each with side run is marked enacted or not. A required verdict survives when the posterior probability of a positive difference is at least 0.95. A removable verdict survives when the probability that the two rates lie within 0.2 is at least 0.95. Fisher's exact two sided test is reported beside the posterior.
 
 ## 3. Evidence for each claim
 
@@ -35,7 +33,6 @@ A fourth observation, that a pass can come through a path the repair never touch
 | dataset | evidence |
 |---|---|
 | AgentDefect | The 77178370 published repair adds a retrieval tool. Across its nine with side runs it passed six, and two executed the tool, so four passes came from runs that never took the repair's path. The 76906469 change B alone stops at the memory interface before any request in all four of its rows and enacted nothing. Of 88 rows, 73 have an observed enactment rate, four never enacted, and 11 touch document splitting, the model client or data loading, modules without a probe, so their rate is undefined. |
-| AgentIssue-Bench | All 552 with side runs enacted their change, because qualification required the fixed files to load and the implicated code to be reached. Where receipt is enforced the dilution disappears. The two datasets differ in exactly the quantity the claim names. |
 
 **Why the 77178370 passes mislead.** The archived acceptance test asks what buildings are made of and accepts any answer that contains the word brick. The program is built to answer from seven retrieved notes through a document search tool, and one note states that buildings are made of brick. A model answers this question from its own knowledge, so the test passes whether or not the tool ran. Six of the nine with side runs passed and two executed the tool. The test cannot separate a pass through the repair from a pass without it. The remedy is a stronger check that swaps in notes without the answer, so that only the retrieval path can pass. A pass without the tool shows the test is too weak. It does not show that no repair was needed.
 
@@ -45,27 +42,24 @@ A verdict needs the enactment rate beside it. A repair loop needs probes at the 
 
 | dataset | evidence |
 |---|---|
-| AgentDefect | The configuration published+R passed the adventure input two of three times in one fresh batch and three of three in the next, and its verdict moved from not assessed to removable. None of the eight removable verdicts survives at the margin 0.2. Three passes against three leave a probability of 0.72 that the two rates lie within 0.2, and nine against nine leave 0.95. Of 22 required verdicts 17 rest on three runs a side, where Fisher's exact test gives p = 0.10 and the posterior gives 0.996. Only the five 78383658 rows with nine runs a side are significant under both. |
-| AgentIssue-Bench | Of 13 removable verdicts 11 survive at 0.2, all with 12 runs a side over four required checks, and the two with nine runs a side fail. At the margin 0.1 none survives in either dataset, since 12 against 12 gives 0.86. All 25 required verdicts rest on three target runs on the without side, with Fisher p = 0.10 and posterior 0.996. |
+| AgentDefect | The configuration published+R passed the adventure input two of three times in one fresh batch and three of three in the next, and its verdict moved from not assessed to removable. None of the eight removable verdicts survives at the margin 0.2. Three passes against three leave a probability of 0.72 that the two rates lie within 0.2. Of 22 required verdicts 17 rest on three runs a side, where Fisher's exact test gives p = 0.10 and the posterior gives 0.996. Only the five 78383658 rows with nine runs a side are significant under both. |
 
-Three repetitions cannot establish that a change is removable, and establish that it is required only under a prior dependent rule. The repetitions a verdict needs are a quantity to compute per comparison. When both sides pass every run, removability at the margin 0.2 needs about 12 runs a side and at 0.1 about 24. The loop should stop when the posterior clears its level.
+Three repetitions cannot establish that a change is removable, and establish that it is required only under a prior dependent rule. The repetitions a verdict needs are a quantity to compute per comparison. The loop should stop when the posterior clears its level.
 
 ### Claim 3, sufficient sets
 
 | dataset | evidence |
 |---|---|
 | AgentDefect | In 79343179 the three loader changes L1, L2 and L3 are each required given the other two, and all six proper subsets are inadequate, so L1L2L3 is inclusion minimal. The developer's four change baseline contains the removable docstring change DV. In 78366661 two routes are adequate, the one change baseline and the published N+P1 with three modules and two changes, and the scope rule keeps the smaller. In 76906469 B alone breaks at the memory interface, so the set {B} is a positivity violation and only {A, B} can be assessed. The measured verdicts changed the retained repair in four of six cases. |
-| AgentIssue-Bench | In evoninja_515 the routing change is removable and the smaller repair is kept. In evoninja_525 the two type changes are removable on the runtime checks and required for the package type check, so the sufficient set depends on the declared requirement. In evoninja_504 and evoninja_594 every proposed reduction is a malformed fragment or leaves names undefined, so no alternative set is admissible. After the corrections one of five cases keeps a smaller repair. |
 
 The decision object is a set. Minimality, alternative routes and inadmissible combinations all appear in the records, and the repair loop needs a rule that ranks admissible sufficient sets by declared scope.
 
 ### Evidence in the published artifacts
 
-Each claim has at least one instance that needs no run of ours. The instances below sit in the archives, images and result sheets the dataset authors published.
+Each claim has at least one instance that needs no run of ours. The instances below sit in the archives and result sheets the dataset authors published.
 
 | observation | where it sits | model involved | claim |
 |---|---|---|---|
-| Every AgentIssue-Bench verdict, the removable routing change in evoninja_515, the removable type changes in evoninja_525, the malformed fragments in evoninja_504 and evoninja_594, and enactment enforced on every run | the authors' Docker images, developer fixes and checks. All 315 scored runs made zero model calls | none | 3, and 1 |
 | L1L2L3 inclusion minimal, DV removable, the developer baseline not minimal (79343179) | the archived loader code under pandas, loader scope only | none | 3 |
 | B alone inadmissible (76906469) | the archived program raises the LangChain memory error before any request | none | 1 and 3 |
 | The acceptance test is blind to enactment (77178370) | the archived test.py asserts only that the word brick appears in the answer | none | 1 |
@@ -183,9 +177,7 @@ The first question is the primary one: does the boundary method estimate arm pas
 
 An environment experiment changed one input per case, the chat model, the pandas version, the embedding model and the catalog size, and reran the matched comparisons under both conditions. In the 22 comparisons that could be observed no verdict flipped. The gpt-4 condition was unresolved because the endpoint rejected every request. The three observed inputs reached no verdict's mechanism, so the environment claim stays untested. Its record is section 8 of the AgentDefect report.
 
-The AgentIssue-Bench label harmful_edit_table means that the with side is inadequate, so it carries no survival label. The AgentIssue-Bench contrast pools the required checks of each row, the checks its verdict was computed on.
-
-The study covers six and five cases. Each case has frozen checks, AgentDefect has no preservation check, and AgentIssue-Bench ran no repository test suite. 79343179 ran in loader scope only. The Jeffreys posterior accepts three against zero at 0.996 where Fisher gives 0.10, and both are reported.
+The study covers six cases. Each case has frozen checks, and AgentDefect has no preservation check. 79343179 ran in loader scope only. The Jeffreys posterior accepts three against zero at 0.996 where Fisher gives 0.10, and both are reported.
 
 ## 6. Files and registries
 
@@ -196,8 +188,6 @@ The study covers six and five cases. Each case has frozen checks, AgentDefect ha
 | AgentDefect experiments, sections 1 to 9, and limitations | `motivation_pilot/artifacts/agentdefect_extension/exp-2026-10-22/report.md`, `limitations.md` |
 | AgentDefect records | `motivation_pilot/artifacts/agentdefect_extension/exp-2026-10-22/`, `exp-2026-10-22-r/`, `exp-2026-10-23-e/`, and the reanalysis `exp-2026-10-23-v/` |
 | AgentDefect number registry | `motivation_pilot/NUMBERS.md` |
-| AgentIssue-Bench experiments | `/data/wang/junh/githubs/AgentIssue-Bench/motivation_experiment/exp-2026-10-21/report.md`, `exp-2026-10-22/report.md`, and the reanalysis `exp-2026-10-23-v/report.md` |
-| AgentIssue-Bench number registry | `/data/wang/junh/githubs/AgentIssue-Bench/motivation_experiment/NUMBERS.md` |
 | the dataset authors' result sheets | `/data/wang/junh/githubs/SelfHeal/Detailed Result.xlsx` |
 | estimator | `motivation_pilot/src/motivation_pilot/verdict_stats.py` |
 | numbers of this report that appear in no other registry | `docs/NUMBERS.md` |

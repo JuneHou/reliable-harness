@@ -1,0 +1,672 @@
+Case ID: 76670856
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 19:50:31
+End Time: 2026-11-05 19:56:20
+Total Duration: 349.14 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+"""Conversational retrieval over hotel reviews stored in JSON.
+
+Why the original script gave "incorrect" answers:
+
+1. Loader / jq_schema shape
+   ``JSONLoader("data/review.json", jq_schema=".reviews[]", content_key="text")``
+   only produces usable ``page_content`` when the jq result is a list/stream of
+   *dicts* and the installed LangChain version really honours ``content_key``.
+   On several 0.0.2xx builds the key is ignored (or the record comes back as a
+   raw string), so every Document ends up with the *whole* JSON blob or an empty
+   ``page_content``.  The retriever then embeds garbage, similarity search
+   returns irrelevant chunks and the chain happily answers from thin air.
+   => build the documents explicitly and *verify* that each one contains the
+      review text (with a pure-python fallback so the content can never be lost).
+
+2. Retrieval depth
+   ``index.vectorstore.as_retriever()`` defaults to ``k=4``.  With only ten very
+   short reviews, questions such as "how many negative reviews are there?" or
+   "summarize the feedback" can never be answered correctly because six reviews
+   never reach the LLM.
+   => retrieve all documents of this small corpus (``search_kwargs={"k": n}``).
+
+3. Prompt / temperature
+   The default "stuff" prompt of ConversationalRetrievalChain is extremely
+   permissive, and ``ChatOpenAI`` uses ``temperature=0.7``, so the model
+   paraphrases, invents reviews and mixes up the chat history.
+   => custom grounding prompt + ``temperature=0`` + an explicit follow-up
+      (condense) prompt.
+
+4. Input handling
+   ``for query in queries`` iterates *characters* when a single string is
+   passed, which silently produced meaningless answers as well.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Iterable, List, Sequence
+
+from dotenv import load_dotenv
+
+from langchain.chains import ConversationalRetrievalChain
+from langchain.document_loaders import JSONLoader
+from langchain.prompts import PromptTemplate
+from langchain.schema import Document
+from langchain.vectorstores import Chroma
+
+# `langchain.chat_models` / `langchain.embeddings` were moved to
+# `langchain_openai`; import from wherever the package actually lives.
+try:  # newer LangChain
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+except ImportError:  # older LangChain
+    from langchain.chat_models import ChatOpenAI
+    from langchain.embeddings import OpenAIEmbeddings
+
+
+load_dotenv()
+
+PERSIST = False
+PERSIST_DIR = "persist"
+
+# --------------------------------------------------------------------------- #
+# Prompts
+# --------------------------------------------------------------------------- #
+
+CONDENSE_QUESTION_PROMPT = PromptTemplate(
+    input_variables=["chat_history", "question"],
+    template=(
+        "Given the following conversation and a follow up question, rephrase the "
+        "follow up question to be a standalone question that can be used to search "
+        "a collection of hotel reviews. Keep the original language.\n\n"
+        "Chat History:\n{chat_history}\n\n"
+        "Follow Up Input: {question}\n"
+        "Standalone question:"
+    ),
+)
+
+QA_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are analysing a fixed set of hotel reviews.\n"
+        "Answer the question using ONLY the review texts in the context below.\n\n"
+        "Context (each line is one separate review):\n{context}\n\n"
+        "Question: {question}\n\n"
+        "Rules:\n"
+        "- Every statement must be supported by the reviews above; never invent a "
+        "review, a rating, a price or a detail that is not written there.\n"
+        "- If the question asks for a count, a list or 'how many', go through each "
+        "review in the context one by one, count explicitly and state the number.\n"
+        "- Quote short review snippets when it helps justify the answer.\n"
+        "- If the context does not contain the answer, reply exactly: "
+        '"The provided reviews do not contain that information."\n\n'
+        "Answer:"
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# Data
+# --------------------------------------------------------------------------- #
+
+SAMPLE_REVIEWS = [
+    "Great hotel, excellent service and comfortable rooms.",
+    "I had a terrible experience at this hotel. The room was dirty and the staff was rude.",
+    "Highly recommended! The hotel has a beautiful view and the staff is friendly.",
+    "Average hotel. The room was okay, but nothing special.",
+    "I absolutely loved my stay at this hotel. The amenities were top notch.",
+    "Disappointing experience. The hotel was overpriced for the quality provided.",
+    "The hotel exceeded my expectations. The room was spacious and clean.",
+    "Avoid this hotel at all costs! The customer service was horrendous.",
+    "Fantastic hotel with a great location. I would definitely stay here again.",
+    "Not a bad hotel, but there are better options available in the area.",
+]
+
+
+def ensure_review_file(data_dir: Path = Path("data")) -> Path:
+    """Create data/review.json from the sample reviews if it does not exist."""
+    data_dir.mkdir(exist_ok=True)
+    review_file = data_dir / "review.json"
+    if not review_file.exists():
+        payload = {"reviews": [{"text": text} for text in SAMPLE_REVIEWS]}
+        review_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return review_file
+
+
+def _documents_from_json(review_file: Path) -> List[Document]:
+    """Pure-python fallback: one Document per review, guaranteed text content."""
+    raw = json.loads(review_file.read_text(encoding="utf-8"))
+    reviews = raw.get("reviews", []) if isinstance(raw, dict) else raw
+    documents: List[Document] = []
+    for index, record in enumerate(reviews):
+        if isinstance(record, dict):
+            text = record.get("text") or record.get("content") or ""
+        else:
+            text = str(record)
+        text = (text or "").strip()
+        if text:
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={"source": str(review_file), "review_index": index},
+                )
+            )
+    return documents
+
+
+def load_review_documents(review_file: Path) -> List[Document]:
+    """Load reviews with JSONLoader/jq_schema, validating the extracted text.
+
+    The canonical setup for the payload ``{"reviews": [{"text": ...}, ...]}`` is
+    ``jq_schema=".reviews[]"`` (one object per Document) plus
+    ``content_key="text"`` (which field becomes ``page_content``).  Because that
+    combination is ignored/empty on some LangChain versions, two safe variants
+    are tried and a plain-python parse is used as the last resort.
+    """
+    candidates = [
+        # (jq_schema, content_key) pairs, most idiomatic first
+        (".reviews[]", "text"),      # select each object, pick its "text" field
+        (".reviews[].text", None),   # select the strings directly, no content_key
+    ]
+
+    for jq_schema, content_key in candidates:
+        kwargs = {"jq_schema": jq_schema}
+        if content_key is not None:
+            kwargs["content_key"] = content_key
+        try:
+            loader = JSONLoader(str(review_file), **kwargs)
+        except TypeError:
+            # very old signature: JSONLoader(file_path, jq_schema=..., content_key=...)
+            try:
+                loader = JSONLoader(
+                    file_path=str(review_file), jq_schema=jq_schema,
+                    content_key=content_key,
+                )
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        try:
+            documents = loader.load()
+        except Exception:
+            continue
+
+        documents = [doc for doc in documents if (doc.page_content or "").strip()]
+        # Reject the "whole record dumped as text" case as well.
+        documents = [
+            doc for doc in documents
+            if not doc.page_content.strip().startswith("{")
+        ]
+        if documents:
+            return documents
+
+    return _documents_from_json(review_file)
+
+
+# --------------------------------------------------------------------------- #
+# Vector store
+# --------------------------------------------------------------------------- #
+
+def build_or_reuse_vectorstore(embedding_function):
+    """Return (vectorstore, number_of_indexed_documents)."""
+    if PERSIST and os.path.exists(PERSIST_DIR):
+        print("Reusing index...\n")
+        vectorstore = Chroma(
+            persist_directory=PERSIST_DIR, embedding_function=embedding_function
+        )
+        try:
+            total = vectorstore._collection.count()
+        except Exception:
+            total = 10
+        return vectorstore, total
+
+    review_file = ensure_review_file()
+    documents = load_review_documents(review_file)
+    if not documents:
+        raise RuntimeError(
+            f"No review text could be extracted from {review_file}. "
+            "Check the JSON structure and the jq_schema."
+        )
+
+    print(
+        f"Indexed {len(documents)} reviews, e.g. page_content="
+        f"{documents[0].page_content[:80]!r}",
+        file=sys.stderr,
+    )
+
+    persist_dir = PERSIST_DIR if PERSIST else None
+    vectorstore = Chroma.from_documents(
+        documents=documents,
+        embedding=embedding_function,
+        persist_directory=persist_dir,
+    )
+    if PERSIST:
+        try:
+            vectorstore.persist()
+        except Exception:
+            pass
+    return vectorstore, len(documents)
+
+
+# --------------------------------------------------------------------------- #
+# Agent
+# --------------------------------------------------------------------------- #
+
+def _as_query_list(queries: Iterable[str] | str) -> Sequence[str]:
+    if isinstance(queries, str):
+        return [queries]
+    return list(queries)
+
+
+def run_agent(queries):
+    queries = _as_query_list(queries)
+
+    embedding_function = OpenAIEmbeddings()
+    vectorstore, indexed_docs = build_or_reuse_vectorstore(embedding_function)
+
+    # Retrieve *every* review of this small corpus so counting/summarising
+    # questions are answered from the full data instead of 4 random chunks.
+    retriever_k = max(1, min(indexed_docs, 50))
+    retriever = vectorstore.as_retriever(search_kwargs={"k": retriever_k})
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
+        retriever=retriever,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+        condense_question_prompt=CONDENSE_QUESTION_PROMPT,
+        return_source_documents=True,
+        verbose=False,
+    )
+
+    chat_history: List[tuple] = []
+    results: List[str] = []
+
+    for query in queries:
+        if not query or not query.strip():
+            continue
+        if query.strip().lower() in {"quit", "q", "exit"}:
+            break
+
+        payload = {"question": query, "chat_history": chat_history}
+        try:  # LangChain >= 0.1
+            result = chain.invoke(payload)
+        except AttributeError:  # older LangChain
+            result = chain(payload)
+
+        answer = result["answer"]
+        print(answer)
+        results.append(answer)
+
+        if os.getenv("DEBUG"):
+            print("--- retrieved ---", file=sys.stderr)
+            for doc in result.get("source_documents", []):
+                print(f"  * {doc.page_content[:120]}", file=sys.stderr)
+
+        # keep the (question, answer) pair so follow-up questions stay grounded
+        chat_history.append((query, answer))
+
+    return results
+
+
+if __name__ == "__main__":
+    cli_queries = sys.argv[1:]
+    if not cli_queries:
+        cli_queries = ["How many reviews are negative, and why?"]
+    run_agent(cli_queries)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 19:56:20
+Duration: 349.13 seconds
+Verdict: ## Analysis
+
+### Diff summary
+The fix rewrites the script from a script-style module into a structured one:
+
+- **Loader robustness**: `load_review_documents()` tries two `JSONLoader` variants (`.reviews[]` + `content_key="text"`, then `.reviews[].text`), filters out empty/`"{...}"`-dumped documents, and falls back to a pure-Python `json` parse (`_documents_from_json`) if `jq`/`content_key` misbehaves. This directly addresses the root cause in the buggy code where documents could end up with whole-JSON or empty `page_content`.
+- **Retrieval depth**: `as_retriever(search_kwargs={"k": retriever_k})` with `k = min(indexed_docs, 50)` instead of the default `k=4`, so counting/summarising questions see all 10 reviews.
+- **Grounding**: custom `QA_PROMPT` (`context`, `question`) via `combine_docs_chain_kwargs={"prompt": ...}`, a `CONDENSE_QUESTION_PROMPT` (`chat_history`, `question`), and `temperature=0`.
+- **Input handling**: `_as_query_list()` prevents iterating over characters when a bare string is passed.
+- **Vector store built directly** with `Chroma.from_documents(documents=..., embedding=...)` instead of `VectorstoreIndexCreator` (default `text_splitter` was unnecessary for short one-line reviews).
+
+### API correctness checks
+- `ConversationalRetrievalChain.from_llm(llm, retriever, combine_docs_chain_kwargs={"prompt": QA_PROMPT}, condense_question_prompt=..., return_source_documents=True)` — `combine_docs_chain_kwargs.prompt` must expose exactly `context`/`question`; `QA_PROMPT.input_variables` matches, and `CONDENSE_QUESTION_PROMPT` matches the chain's `chat_history`/`question` contract. ✅
+- `Chroma.from_documents(documents, embedding, persist_directory)` and `Chroma(persist_directory, embedding_function)` — correct keyword names (`embedding=` for classmethod, `embedding_function=` for constructor). ✅
+- `chain.invoke(payload)` wrapped in `except AttributeError` with legacy `chain(payload)` fallback; result accessed as `result["answer"]`, consistent with `return_source_documents=True`. ✅
+- Imports: `langchain_openai` with fallback to `langchain.chat_models`/`langchain.embeddings`; `langchain.schema.Document`, `langchain.prompts.PromptTemplate`, `langchain.document_loaders.JSONLoader` all exist in the 0.0.2xx → 0.1+ range the original targeted. ✅
+- Test contract: `run_agent(queries)` returns `List[str]`, non-empty for two valid queries, prints each answer, retains grounded `chat_history`. ✅
+
+### Minor nits (non-blocking)
+- `vectorstore._collection.count()` uses a private attribute (guarded by `try/except` with a hardcoded `10` fallback) — only on the dead `PERSIST=False` path.
+- `PERSIST = False` is now module-level, so the persistence branch never executes in the default configuration (same as the original).
+- A debug `print(..., file=sys.stderr)` about indexed docs leaks a small diagnostic to stderr on every run; it cannot affect the returned list.
+- Always retrieving all 10 documents lowers semantic selectivity, but is intentional and correct for a 10-item corpus.
+- `langchain.prompts`/`langchain.schema` are deprecated shims in very recent versions, but remain importable and were already the style of the original code.
+
+None of these change the returned value, its type, or the answer quality for the tested queries, and the loader fallback chain removes the original silent-corruption failure mode.
+
+## Verdict
+
+**ACCEPT**
+
+The fixed code preserves the `run_agent(queries) -> List[str]` contract required by the test, removes the fragile `VectorstoreIndexCreator`/`content_key` dependency with a validated loader plus pure-Python fallback, adds grounding prompts with deterministic sampling, and correctly wires the `ConversationalRetrievalChain`, `Chroma`, and retriever APIs. Structural validation also reports ACCEPT.
+--------------------------------------------------------------------------------
+"""Conversational retrieval over hotel reviews stored in JSON.
+
+Why the original script gave "incorrect" answers:
+
+1. Loader / jq_schema shape
+   ``JSONLoader("data/review.json", jq_schema=".reviews[]", content_key="text")``
+   only produces usable ``page_content`` when the jq result is a list/stream of
+   *dicts* and the installed LangChain version really honours ``content_key``.
+   On several 0.0.2xx builds the key is ignored (or the record comes back as a
+   raw string), so every Document ends up with the *whole* JSON blob or an empty
+   ``page_content``.  The retriever then embeds garbage, similarity search
+   returns irrelevant chunks and the chain happily answers from thin air.
+   => build the documents explicitly and *verify* that each one contains the
+      review text (with a pure-python fallback so the content can never be lost).
+
+2. Retrieval depth
+   ``index.vectorstore.as_retriever()`` defaults to ``k=4``.  With only ten very
+   short reviews, questions such as "how many negative reviews are there?" or
+   "summarize the feedback" can never be answered correctly because six reviews
+   never reach the LLM.
+   => retrieve all documents of this small corpus (``search_kwargs={"k": n}``).
+
+3. Prompt / temperature
+   The default "stuff" prompt of ConversationalRetrievalChain is extremely
+   permissive, and ``ChatOpenAI`` uses ``temperature=0.7``, so the model
+   paraphrases, invents reviews and mixes up the chat history.
+   => custom grounding prompt + ``temperature=0`` + an explicit follow-up
+      (condense) prompt.
+
+4. Input handling
+   ``for query in queries`` iterates *characters* when a single string is
+   passed, which silently produced meaningless answers as well.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Iterable, List, Sequence
+
+from dotenv import load_dotenv
+
+from langchain.chains import ConversationalRetrievalChain
+from langchain.document_loaders import JSONLoader
+from langchain.prompts import PromptTemplate
+from langchain.schema import Document
+from langchain.vectorstores import Chroma
+
+# `langchain.chat_models` / `langchain.embeddings` were moved to
+# `langchain_openai`; import from wherever the package actually lives.
+try:  # newer LangChain
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+except ImportError:  # older LangChain
+    from langchain.chat_models import ChatOpenAI
+    from langchain.embeddings import OpenAIEmbeddings
+
+
+load_dotenv()
+
+PERSIST = False
+PERSIST_DIR = "persist"
+
+# --------------------------------------------------------------------------- #
+# Prompts
+# --------------------------------------------------------------------------- #
+
+CONDENSE_QUESTION_PROMPT = PromptTemplate(
+    input_variables=["chat_history", "question"],
+    template=(
+        "Given the following conversation and a follow up question, rephrase the "
+        "follow up question to be a standalone question that can be used to search "
+        "a collection of hotel reviews. Keep the original language.\n\n"
+        "Chat History:\n{chat_history}\n\n"
+        "Follow Up Input: {question}\n"
+        "Standalone question:"
+    ),
+)
+
+QA_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are analysing a fixed set of hotel reviews.\n"
+        "Answer the question using ONLY the review texts in the context below.\n\n"
+        "Context (each line is one separate review):\n{context}\n\n"
+        "Question: {question}\n\n"
+        "Rules:\n"
+        "- Every statement must be supported by the reviews above; never invent a "
+        "review, a rating, a price or a detail that is not written there.\n"
+        "- If the question asks for a count, a list or 'how many', go through each "
+        "review in the context one by one, count explicitly and state the number.\n"
+        "- Quote short review snippets when it helps justify the answer.\n"
+        "- If the context does not contain the answer, reply exactly: "
+        '"The provided reviews do not contain that information."\n\n'
+        "Answer:"
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# Data
+# --------------------------------------------------------------------------- #
+
+SAMPLE_REVIEWS = [
+    "Great hotel, excellent service and comfortable rooms.",
+    "I had a terrible experience at this hotel. The room was dirty and the staff was rude.",
+    "Highly recommended! The hotel has a beautiful view and the staff is friendly.",
+    "Average hotel. The room was okay, but nothing special.",
+    "I absolutely loved my stay at this hotel. The amenities were top notch.",
+    "Disappointing experience. The hotel was overpriced for the quality provided.",
+    "The hotel exceeded my expectations. The room was spacious and clean.",
+    "Avoid this hotel at all costs! The customer service was horrendous.",
+    "Fantastic hotel with a great location. I would definitely stay here again.",
+    "Not a bad hotel, but there are better options available in the area.",
+]
+
+
+def ensure_review_file(data_dir: Path = Path("data")) -> Path:
+    """Create data/review.json from the sample reviews if it does not exist."""
+    data_dir.mkdir(exist_ok=True)
+    review_file = data_dir / "review.json"
+    if not review_file.exists():
+        payload = {"reviews": [{"text": text} for text in SAMPLE_REVIEWS]}
+        review_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return review_file
+
+
+def _documents_from_json(review_file: Path) -> List[Document]:
+    """Pure-python fallback: one Document per review, guaranteed text content."""
+    raw = json.loads(review_file.read_text(encoding="utf-8"))
+    reviews = raw.get("reviews", []) if isinstance(raw, dict) else raw
+    documents: List[Document] = []
+    for index, record in enumerate(reviews):
+        if isinstance(record, dict):
+            text = record.get("text") or record.get("content") or ""
+        else:
+            text = str(record)
+        text = (text or "").strip()
+        if text:
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={"source": str(review_file), "review_index": index},
+                )
+            )
+    return documents
+
+
+def load_review_documents(review_file: Path) -> List[Document]:
+    """Load reviews with JSONLoader/jq_schema, validating the extracted text.
+
+    The canonical setup for the payload ``{"reviews": [{"text": ...}, ...]}`` is
+    ``jq_schema=".reviews[]"`` (one object per Document) plus
+    ``content_key="text"`` (which field becomes ``page_content``).  Because that
+    combination is ignored/empty on some LangChain versions, two safe variants
+    are tried and a plain-python parse is used as the last resort.
+    """
+    candidates = [
+        # (jq_schema, content_key) pairs, most idiomatic first
+        (".reviews[]", "text"),      # select each object, pick its "text" field
+        (".reviews[].text", None),   # select the strings directly, no content_key
+    ]
+
+    for jq_schema, content_key in candidates:
+        kwargs = {"jq_schema": jq_schema}
+        if content_key is not None:
+            kwargs["content_key"] = content_key
+        try:
+            loader = JSONLoader(str(review_file), **kwargs)
+        except TypeError:
+            # very old signature: JSONLoader(file_path, jq_schema=..., content_key=...)
+            try:
+                loader = JSONLoader(
+                    file_path=str(review_file), jq_schema=jq_schema,
+                    content_key=content_key,
+                )
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        try:
+            documents = loader.load()
+        except Exception:
+            continue
+
+        documents = [doc for doc in documents if (doc.page_content or "").strip()]
+        # Reject the "whole record dumped as text" case as well.
+        documents = [
+            doc for doc in documents
+            if not doc.page_content.strip().startswith("{")
+        ]
+        if documents:
+            return documents
+
+    return _documents_from_json(review_file)
+
+
+# --------------------------------------------------------------------------- #
+# Vector store
+# --------------------------------------------------------------------------- #
+
+def build_or_reuse_vectorstore(embedding_function):
+    """Return (vectorstore, number_of_indexed_documents)."""
+    if PERSIST and os.path.exists(PERSIST_DIR):
+        print("Reusing index...\n")
+        vectorstore = Chroma(
+            persist_directory=PERSIST_DIR, embedding_function=embedding_function
+        )
+        try:
+            total = vectorstore._collection.count()
+        except Exception:
+            total = 10
+        return vectorstore, total
+
+    review_file = ensure_review_file()
+    documents = load_review_documents(review_file)
+    if not documents:
+        raise RuntimeError(
+            f"No review text could be extracted from {review_file}. "
+            "Check the JSON structure and the jq_schema."
+        )
+
+    print(
+        f"Indexed {len(documents)} reviews, e.g. page_content="
+        f"{documents[0].page_content[:80]!r}",
+        file=sys.stderr,
+    )
+
+    persist_dir = PERSIST_DIR if PERSIST else None
+    vectorstore = Chroma.from_documents(
+        documents=documents,
+        embedding=embedding_function,
+        persist_directory=persist_dir,
+    )
+    if PERSIST:
+        try:
+            vectorstore.persist()
+        except Exception:
+            pass
+    return vectorstore, len(documents)
+
+
+# --------------------------------------------------------------------------- #
+# Agent
+# --------------------------------------------------------------------------- #
+
+def _as_query_list(queries: Iterable[str] | str) -> Sequence[str]:
+    if isinstance(queries, str):
+        return [queries]
+    return list(queries)
+
+
+def run_agent(queries):
+    queries = _as_query_list(queries)
+
+    embedding_function = OpenAIEmbeddings()
+    vectorstore, indexed_docs = build_or_reuse_vectorstore(embedding_function)
+
+    # Retrieve *every* review of this small corpus so counting/summarising
+    # questions are answered from the full data instead of 4 random chunks.
+    retriever_k = max(1, min(indexed_docs, 50))
+    retriever = vectorstore.as_retriever(search_kwargs={"k": retriever_k})
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=ChatOpenAI(model="gpt-3.5-turbo", temperature=0),
+        retriever=retriever,
+        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+        condense_question_prompt=CONDENSE_QUESTION_PROMPT,
+        return_source_documents=True,
+        verbose=False,
+    )
+
+    chat_history: List[tuple] = []
+    results: List[str] = []
+
+    for query in queries:
+        if not query or not query.strip():
+            continue
+        if query.strip().lower() in {"quit", "q", "exit"}:
+            break
+
+        payload = {"question": query, "chat_history": chat_history}
+        try:  # LangChain >= 0.1
+            result = chain.invoke(payload)
+        except AttributeError:  # older LangChain
+            result = chain(payload)
+
+        answer = result["answer"]
+        print(answer)
+        results.append(answer)
+
+        if os.getenv("DEBUG"):
+            print("--- retrieved ---", file=sys.stderr)
+            for doc in result.get("source_documents", []):
+                print(f"  * {doc.page_content[:120]}", file=sys.stderr)
+
+        # keep the (question, answer) pair so follow-up questions stay grounded
+        chat_history.append((query, answer))
+
+    return results
+
+
+if __name__ == "__main__":
+    cli_queries = sys.argv[1:]
+    if not cli_queries:
+        cli_queries = ["How many reviews are negative, and why?"]
+    run_agent(cli_queries)
+
+--------------------------------------------------------------------------------

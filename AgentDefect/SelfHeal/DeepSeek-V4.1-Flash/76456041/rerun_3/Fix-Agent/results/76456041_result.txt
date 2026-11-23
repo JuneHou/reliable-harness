@@ -1,0 +1,677 @@
+Case ID: 76456041
+Status: ACCEPTED
+Final Attempt: 2
+Start Time: 2026-11-05 18:16:12
+End Time: 2026-11-05 18:39:27
+Total Duration: 1395.00 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.chat_models import ChatOpenAI
+from langchain.document_loaders import CSVLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.prompts import PromptTemplate
+from langchain.schema import Document
+from langchain.vectorstores import Chroma
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# ---------------------------------------------------------------------------
+# Why the original code produced the "wrong" answer AND a huge bill
+# ---------------------------------------------------------------------------
+# 1) `chain_type="map_reduce"` does NOT reuse the `stuff` prompt. The default
+#    LangChain prompts are built for *summarising long prose*, not for
+#    enumerating rows of a table:
+#       question_prompt : "... see if any of the text is relevant to answer the
+#                          question. Return any relevant text verbatim."
+#       combine_prompt  : "Given the following extracted parts ... create a final
+#                          answer with references ('SOURCES') ... ALWAYS return a
+#                          'SOURCES' part ..."
+#       collapse_prompt : "distill it into a final, consolidated summary"
+#    So each retrieved row is mapped to snippet/"None", the partial answers are
+#    repeatedly *collapsed* into "final answers with SOURCES", and names get
+#    silently dropped between collapse rounds.  That is why the answer for a
+#    query such as "Tell me the name of every driver who is German" is
+#    incomplete (and littered with a SOURCES section) with map_reduce while the
+#    same query is fine with `stuff`, where every row is in a single prompt.
+# 2) `search_kwargs={"k": 1000}` => the map step performs ONE LLM call per
+#    retrieved row (plus the collapse/combine calls), i.e. ~1000+ requests and
+#    ~1000x the token spend of `stuff` for the very same corpus.  The legacy
+#    `OpenAI()` default model also truncates answers at max_tokens=256.
+#
+# Fix: use explicit, task-specific prompts (list *every* matching driver, merge
+# without dropping anything, no SOURCES), keep the whole table when it fits the
+# context (stuff = 1 call), and only fall back to map_reduce over *bundled rows*
+# with a cheaper long-context chat model when the table is really too large.
+# ---------------------------------------------------------------------------
+
+MODEL_NAME = "gpt-3.5-turbo-16k"     # much cheaper than text-davinci-003, 16k context
+MODEL_CONTEXT_TOKENS = 16000
+RESERVED_OUTPUT_TOKENS = 1500
+ROWS_PER_MAP_CHUNK = 20              # rows sent in a single map-step LLM call
+
+# Used when the whole CSV fits into one prompt (same behaviour that made
+# `stuff` work in the first place, but exhaustive and without truncation).
+STUFF_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are a data analyst answering questions about a drivers dataset.\n"
+        "Answer ONLY from the CSV rows below. Be exhaustive: if the question asks "
+        "for 'every' item, list EVERY matching row, one per line, using the exact "
+        "values found in the rows. Never invent a row. Do not output a SOURCES "
+        "section.\n\n"
+        "Rows:\n{context}\n\n"
+        "Question: {question}\n"
+        "Complete answer:"
+    ),
+)
+
+# Map step: applied to one bundle of rows. It must return names, not
+# "relevant text", and it must answer NONE instead of an empty string.
+MAP_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are given a batch of rows from a drivers dataset.\n"
+        "Return the full name of EVERY driver in these rows that matches the "
+        "question, one name per line, copied exactly as written in the row.\n"
+        "Rules: do not summarise, do not explain, do not add names that are not "
+        "in the rows, do not output SOURCES. If no row matches, output only: NONE\n\n"
+        "Rows:\n{context}\n\n"
+        "Question: {question}\n"
+        "Matching driver names:"
+    ),
+)
+
+# Combine/reduce step: replaces the default "distill into a consolidated
+# summary" prompt that used to drop names.
+COMBINE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "Below are partial answers extracted from different batches of a drivers "
+        "dataset.\n"
+        "Merge them into ONE final answer to the question.\n"
+        "Rules:\n"
+        "- Keep EVERY driver name that appears in ANY partial answer.\n"
+        "- Remove duplicates and remove the placeholder NONE.\n"
+        "- Never summarise, never truncate, never drop a name.\n"
+        "- Answer with a plain comma separated list of the names, no preamble, "
+        "no SOURCES section.\n"
+        "- If nothing matched at all, answer: I don't know.\n\n"
+        "Partial answers:\n{summaries}\n\n"
+        "Question: {question}\n"
+        "Final answer (complete list of names):"
+    ),
+)
+
+
+def _rough_tokens(text):
+    """Cheap token estimate (~4 chars per token)."""
+    return len(text) // 4 + 1
+
+
+def bundle_rows(docs, rows_per_chunk=ROWS_PER_MAP_CHUNK):
+    """Group CSV rows so that the map step costs 1 LLM call per bundle
+    instead of 1 LLM call per row (the main driver of the API bill)."""
+    bundles = []
+    for start in range(0, len(docs), rows_per_chunk):
+        group = docs[start:start + rows_per_chunk]
+        bundles.append(
+            Document(
+                page_content="\n".join(d.page_content for d in group),
+                metadata={"source": group[0].metadata.get("source", ""),
+                          "rows": "{}..{}".format(
+                              group[0].metadata.get("row", start),
+                              group[-1].metadata.get("row", start + len(group) - 1))},
+            )
+        )
+    return bundles
+
+
+def _build_qa_chain(docs, llm):
+    """Index the rows and return a RetrievalQA chain that actually answers
+    the user's questions. `k` is sized to the corpus (these questions need a
+    full table scan), not blindly set to 1000."""
+    corpus_tokens = sum(_rough_tokens(d.page_content) for d in docs)
+
+    if corpus_tokens + RESERVED_OUTPUT_TOKENS < MODEL_CONTEXT_TOKENS:
+        index_docs = docs
+        chain_type = "stuff"
+        chain_type_kwargs = {"prompt": STUFF_PROMPT}
+        print("[index] {} rows (~{} tokens) fit in one prompt -> chain_type='stuff' "
+              "(1 LLM call per query)".format(len(docs), corpus_tokens))
+    else:
+        index_docs = bundle_rows(docs)
+        chain_type = "map_reduce"
+        chain_type_kwargs = {"question_prompt": MAP_PROMPT,
+                             "combine_prompt": COMBINE_PROMPT}
+        print("[index] {} rows (~{} tokens) are too large for one prompt -> "
+              "chain_type='map_reduce' over {} row bundles of {} rows "
+              "({} LLM calls per query instead of {})".format(
+                  len(docs), corpus_tokens, len(index_docs), ROWS_PER_MAP_CHUNK,
+                  len(index_docs) + 1, len(docs) + 1))
+
+    db = Chroma.from_documents(index_docs, OpenAIEmbeddings())
+    retriever = db.as_retriever(search_type="similarity",
+                                search_kwargs={"k": len(index_docs)})
+
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type=chain_type,
+        retriever=retriever,
+        chain_type_kwargs=chain_type_kwargs,
+        return_source_documents=False,
+        verbose=True,
+    )
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    # Long-context chat model: ~10x cheaper per token than text-davinci-003 and
+    # no max_tokens=256 truncation of the list of names.
+    llm = ChatOpenAI(model_name=MODEL_NAME, temperature=0, max_tokens=None)
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as file_cb:
+
+            loader = CSVLoader(file_path=file, encoding='utf-8')
+            docs = loader.load()
+
+            # Build the index / chain once per file, not once per query.
+            qa_chain = _build_qa_chain(docs, llm)
+
+            for query in queries:
+                with get_openai_callback() as cb:
+                    result = qa_chain.run(query)
+                results.append(result)
+
+                print(query)
+                print(result)
+                print("cost of this query: ${:.4f} ({} tokens, {} LLM calls)".format(
+                    cb.total_cost, cb.total_tokens, cb.successful_requests))
+
+            print(file_cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 18:24:36
+Duration: 503.84 seconds
+Verdict: ## Evaluation
+
+### What the fix does
+It's a near-total rewrite of `run_agent` (~120 added lines) built around two claimed bugs:
+
+1. **"Wrong/incomplete answers"** → because `map_reduce` uses *summarisation* prompts, the reduce step never sees the user question. Fix supplies custom `question_prompt` + `combine_prompt` via `chain_type_kwargs`.
+2. **"Unexpectedly high API cost"** → because `search_kwargs={"k": 1000}` feeds the entire index into `map_reduce` (one LLM call per doc). Fix caps `k` at `RETRIEVER_K = 8`, builds the chain once per file instead of per query, and forces `model_name="gpt-3.5-turbo-instruct"`.
+
+### Tool results
+- `generate_diff`: confirms the large behavioral rewrite above.
+- `validate_fixed_code`: **REJECT** ("test code unavailable") — no structural/test evidence the fix is correct.
+- `verify_api_usage` for `RetrievalQA.from_chain_type`, `COMBINE_PROMPT`, `OpenAI(model_name=…)`, `Chroma.as_retriever(search_kwargs=…)`: no authoritative docs returned, so nothing corroborates the new usage.
+
+### Problems
+
+1. **The two "fixes" are mutually contradictory for the stated query.** The query is *"Tell me the name of **every** driver who is German"*, and the reason the original code used `map_reduce` + `k=1000` is precisely to sweep the *whole* CSV so no matching row is missed. Capping `k = min(8, len(docs))` means only 8 similarity-ranked rows reach the LLM — the answer will almost certainly omit most German drivers. Improved prompts cannot compensate for documents that were never retrieved. So Fix 2 *reintroduces* the "incomplete answer" symptom that Fix 1 claims to solve. A correct cost fix would keep full coverage (`k = len(docs)`) and reduce cost via the cheaper model / batching / a filter-then-verify pass — not by silently narrowing retrieval scope.
+
+2. **Fragile, guessed-at prompt plumbing.** `_summaries_input_name()` infers the reduce-step document variable by importing `langchain.chains.question_answering.COMBINE_PROMPT` and picking "the first input variable that isn't `question`/`context`". This is version-dependent introspection: if the import path/attribute differs (it is not a stable public export in several LangChain versions), the code silently falls back to `"summaries"`, which may not match whatever `document_variable_name` `MapReduceDocumentsChain` actually uses → the same `COMBINE_TEMPLATE` value that blindly `.replace("{summaries}", …)` was applied to may then be wrong, producing a prompt-input mismatch at runtime. The `except Exception: pass` hides the failure instead of surfacing it.
+
+3. **Unrequested, unverified model change.** Hard-coding `gpt-3.5-turbo-instruct` (with `max_tokens=512`) changes behavior well outside the reported bug and *requires* a newer `openai`/`langchain` combination; on the version this notebook pins (`langchain.document_loaders`, `langchain.llms.OpenAI`, legacy `text-davinci-003` default) it can raise an invalid-model error and turn a wrong-answer bug into a hard crash.
+
+4. **Out-of-scope restructuring raises regression risk with zero test evidence.** Moving `Chroma.from_documents` / `OpenAIEmbeddings()` outside `get_openai_callback()`, building the chain once per file, adding `return_source_documents=False`, and adding env-var knobs (`RETRIEVER_K`, `LLM_MODEL`) all change the audited-cost accounting and output shape. Notably, embedding calls are now excluded from the `cb` report, so the very "cost" metric the fix claims to improve is no longer comparable to before.
+
+5. **No validation signal at all.** `validate_fixed_code` returned REJECT and `verify_api_usage` could not corroborate any of the new API usage. A 120-line speculative rewrite of a `map_reduce` pipeline, with no passing tests and no documentation backing, is not a defendable fix.
+
+### Verdict
+**REJECT** — the diff is a speculative rewrite rather than a targeted fix. Its headline "cost" change (`k: 1000 → 8`) breaks the core requirement of the reported query (find *every* German driver), which is exactly the failure mode it claims to fix; the prompt-variable detection is a fragile, silent-failure hack; the forced model swap is unrequested and version-risky; and neither structural validation nor API verification supports the new code. A reasonable fix would keep full-document retrieval, restrict itself to providing an explicit `combine_prompt`/`question_prompt` using the documented `summaries` variable, and leave model selection and callback boundaries untouched.
+--------------------------------------------------------------------------------
+import os
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.document_loaders import CSVLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.vectorstores import Chroma
+
+warnings.filterwarnings("ignore")
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# ---------------------------------------------------------------------------
+# Fix 1 - the wrong/incomplete answers ("output does not match expectations")
+#
+# The prompts LangChain ships for chain_type="map_reduce" are *summarisation*
+# prompts, not QA prompts:
+#
+#   QUESTION_PROMPT : "The following is a set of documents {context} ... {question}"
+#   COMBINE_PROMPT  : "The following is a set of summaries: {doc_summaries}
+#                      Take these and distill it into a final, consolidated
+#                      summary of the main themes."
+#
+# Two things go wrong because of that:
+#   * the combine (reduce) prompt does not even contain the user question, so
+#     the final answer is a "summary of the main themes" instead of the answer
+#     to the question -> map_reduce "fails" where stuff works;
+#   * the map prompt happily answers with prose / "not enough information" and
+#     the reduce step then throws away the individual names, so a list of
+#     German drivers never makes it to the final answer.
+#
+# We therefore supply BOTH a question-aware map prompt (one CSV row -> short,
+# verbatim extraction) and a question-aware combine prompt (merge, de-duplicate,
+# keep every match, never invent values).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Fix 2 - the unexpectedly high API cost
+#
+# search_kwargs={"k": 1000} made the retriever return the *whole* CSV index and
+# map_reduce issues ONE LLM call per retrieved document (plus the reduce calls),
+# so a single question cost hundreds/thousands of completions.  A small,
+# relevant window is enough; raise RETRIEVER_K (or set it to the number of rows
+# in the file) only when you really need an exhaustive scan of a big file.
+#
+# The chain is also built once per file instead of once per question, and the
+# (much cheaper) instruct model is requested explicitly instead of the legacy
+# text-davinci-003 default.
+# ---------------------------------------------------------------------------
+RETRIEVER_K = int(os.getenv("RETRIEVER_K", "8"))
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-3.5-turbo-instruct")
+
+MAP_TEMPLATE = """You are given ONE row of a CSV file. Use only that row to answer the question.
+
+Row:
+{context}
+
+Question: {question}
+
+Rules:
+- Answer using only the row above.
+- If the row does not contain the requested information, reply exactly: No relevant information
+- Otherwise reply with the requested value(s) copied verbatim and nothing else.
+
+Answer:"""
+
+COMBINE_TEMPLATE = """You are given a question and a list of partial answers. Each partial answer was extracted from a different row of the same CSV file.
+
+Question: {question}
+
+Partial answers:
+{summaries}
+
+Rules:
+- Answer the question itself. Do NOT summarise the partial answers and do NOT describe "main themes".
+- Merge every distinct matching value from the partial answers so that the final answer is complete.
+- Drop the entries that say "No relevant information".
+- Never add a value that does not appear in the partial answers.
+- If the question asks for names, return one bullet point per name.
+
+Answer:"""
+
+
+def _summaries_input_name() -> str:
+    """Placeholder name this LangChain version uses for the reduce-step documents."""
+    try:
+        from langchain.chains.question_answering import COMBINE_PROMPT as _DEFAULT_COMBINE_PROMPT
+
+        for var in getattr(_DEFAULT_COMBINE_PROMPT, "input_variables", []):
+            if var not in ("question", "context"):
+                return var
+    except Exception:
+        pass
+    return "summaries"
+
+
+_SUMMARIES_VAR = _summaries_input_name()
+
+
+def build_map_reduce_chain(retriever, llm):
+    """map_reduce QA chain whose prompts actually answer the user question."""
+    question_prompt = PromptTemplate(
+        template=MAP_TEMPLATE,
+        input_variables=["context", "question"],
+    )
+    combine_prompt = PromptTemplate(
+        template=COMBINE_TEMPLATE.replace("{summaries}", "{" + _SUMMARIES_VAR + "}"),
+        input_variables=[_SUMMARIES_VAR, "question"],
+    )
+
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="map_reduce",
+        retriever=retriever,
+        return_source_documents=False,
+        verbose=True,
+        chain_type_kwargs={
+            "question_prompt": question_prompt,
+            "combine_prompt": combine_prompt,
+        },
+    )
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    llm = OpenAI(
+        temperature=0,
+        batch_size=20,
+        max_tokens=512,
+        model_name=LLM_MODEL,
+    )
+    embeddings = OpenAIEmbeddings()
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+
+        loader = CSVLoader(file_path=file, encoding='utf-8')
+        docs = loader.load()
+
+        # create the vectorstore to use as the index
+        db = Chroma.from_documents(docs, embeddings)
+
+        # expose this index in a retriever interface (bounded k -> bounded cost)
+        k = min(RETRIEVER_K, len(docs))
+        retriever = db.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": k},
+        )
+
+        with get_openai_callback() as cb:
+            qa_map_reduce = build_map_reduce_chain(retriever, llm)
+
+            for query in queries:
+                print(query)
+                result = qa_map_reduce.run(query)
+                results.append(result)
+
+                print(result)
+
+            print(cb)
+
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-05 18:39:27
+Duration: 891.16 seconds
+Verdict: ## Analysis
+
+**Bug context:** The original code used `chain_type="map_reduce"` with the *default* LangChain prompts (designed for summarizing long prose — they ask for "relevant text verbatim", "SOURCES" sections, and a "distilled consolidated summary"), combined with `search_kwargs={"k": 1000}`. For a table-enumeration question ("name every driver who is German") this produces (a) incomplete/dropped names after the collapse step and (b) ~one LLM call per retrieved row, i.e. an enormous bill.
+
+**What the fix does (diff review):**
+1. `_build_qa_chain` sizes the corpus with a rough token estimate; when the rows fit in the model's context it uses `chain_type="stuff"` (1 LLM call, full table, no collapse step → names no longer dropped).
+2. When the corpus is too large, it falls back to `map_reduce` but with `bundle_rows` (20 rows per map call) plus **custom** `MAP_PROMPT` (returns names, `NONE` when nothing matches) and `COMBINE_PROMPT` (merge, never drop names, no SOURCES) — directly addressing the "names silently disappear" behavior of the default prompts.
+3. `k` is sized to the actual index instead of the arbitrary 1000 → eliminates the ~1000× cost blow-up.
+4. The chain/index is built once per file rather than rebuilt inside the query loop.
+5. `OpenAI(text-davinci-003)` → `ChatOpenAI(..., max_tokens=None)`, removing the 256-token answer truncation that also truncated name lists.
+
+**Structural correctness (checked manually):**
+- `PromptTemplate` input variables match LangChain's expectations: `stuff` prompt needs `context`/`question`; `map_reduce` kwargs are `question_prompt`/`combine_prompt` (with the collapse step reusing `question_prompt`) — all valid keys.
+- `Document(page_content=..., metadata=...)` from `langchain.schema`, `Chroma.from_documents(docs, OpenAIEmbeddings())`, `db.as_retriever(search_type="similarity", search_kwargs={"k": ...})`, `RetrievalQA.from_chain_type(..., chain_type_kwargs=..., return_source_documents=False)` all match the LangChain 0.0.x API used by the original imports.
+- `get_openai_callback()` exposes `total_cost`, `total_tokens`, `successful_requests` — the attributes printed are valid.
+- Return contract is unchanged: `results` still gets one entry per (file, query) pair.
+
+**Minor caveats (not blockers):**
+- The nested `get_openai_callback` contexts mean the outer `file_cb` will mostly report embedding-only cost (contextvar is swapped); per-query cost, which is what the fix prints and cares about, is correct.
+- Hard-coding `gpt-3.5-turbo-16k` is a dated model choice; `MODEL_CONTEXT_TOKENS = 16000` mirrors it consistently.
+- The token estimate (`len//4`) is approximate, but the 1500-token reserve on top of a 16k window is a sane margin.
+
+`validate_fixed_code` returned "REJECT test code unavailable" only because this case has no tests — it is not an API/structure failure.
+
+None of the above break functionality; the changes directly target the two symptoms (dropped names, runaway LLM-call count) while preserving the public behavior of `run_agent`.
+
+**Verdict: ACCEPT** — the fix is API-correct, addresses the root cause (default map_reduce summarization prompts + oversized `k` + answer truncation) with appropriate `stuff`-first / bundled `map_reduce` fallback logic, and keeps the module's contract intact. The over-engineered comment block and hard-coded model name are stylistic/portability concerns rather than defects.
+--------------------------------------------------------------------------------
+import os
+import warnings
+
+from dotenv import load_dotenv, find_dotenv
+
+from langchain.callbacks import get_openai_callback
+from langchain.chains import RetrievalQA
+from langchain.chat_models import ChatOpenAI
+from langchain.document_loaders import CSVLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.prompts import PromptTemplate
+from langchain.schema import Document
+from langchain.vectorstores import Chroma
+
+warnings.filterwarnings('ignore')
+
+load_dotenv(find_dotenv())
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+
+# ---------------------------------------------------------------------------
+# Why the original code produced the "wrong" answer AND a huge bill
+# ---------------------------------------------------------------------------
+# 1) `chain_type="map_reduce"` does NOT reuse the `stuff` prompt. The default
+#    LangChain prompts are built for *summarising long prose*, not for
+#    enumerating rows of a table:
+#       question_prompt : "... see if any of the text is relevant to answer the
+#                          question. Return any relevant text verbatim."
+#       combine_prompt  : "Given the following extracted parts ... create a final
+#                          answer with references ('SOURCES') ... ALWAYS return a
+#                          'SOURCES' part ..."
+#       collapse_prompt : "distill it into a final, consolidated summary"
+#    So each retrieved row is mapped to snippet/"None", the partial answers are
+#    repeatedly *collapsed* into "final answers with SOURCES", and names get
+#    silently dropped between collapse rounds.  That is why the answer for a
+#    query such as "Tell me the name of every driver who is German" is
+#    incomplete (and littered with a SOURCES section) with map_reduce while the
+#    same query is fine with `stuff`, where every row is in a single prompt.
+# 2) `search_kwargs={"k": 1000}` => the map step performs ONE LLM call per
+#    retrieved row (plus the collapse/combine calls), i.e. ~1000+ requests and
+#    ~1000x the token spend of `stuff` for the very same corpus.  The legacy
+#    `OpenAI()` default model also truncates answers at max_tokens=256.
+#
+# Fix: use explicit, task-specific prompts (list *every* matching driver, merge
+# without dropping anything, no SOURCES), keep the whole table when it fits the
+# context (stuff = 1 call), and only fall back to map_reduce over *bundled rows*
+# with a cheaper long-context chat model when the table is really too large.
+# ---------------------------------------------------------------------------
+
+MODEL_NAME = "gpt-3.5-turbo-16k"     # much cheaper than text-davinci-003, 16k context
+MODEL_CONTEXT_TOKENS = 16000
+RESERVED_OUTPUT_TOKENS = 1500
+ROWS_PER_MAP_CHUNK = 20              # rows sent in a single map-step LLM call
+
+# Used when the whole CSV fits into one prompt (same behaviour that made
+# `stuff` work in the first place, but exhaustive and without truncation).
+STUFF_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are a data analyst answering questions about a drivers dataset.\n"
+        "Answer ONLY from the CSV rows below. Be exhaustive: if the question asks "
+        "for 'every' item, list EVERY matching row, one per line, using the exact "
+        "values found in the rows. Never invent a row. Do not output a SOURCES "
+        "section.\n\n"
+        "Rows:\n{context}\n\n"
+        "Question: {question}\n"
+        "Complete answer:"
+    ),
+)
+
+# Map step: applied to one bundle of rows. It must return names, not
+# "relevant text", and it must answer NONE instead of an empty string.
+MAP_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are given a batch of rows from a drivers dataset.\n"
+        "Return the full name of EVERY driver in these rows that matches the "
+        "question, one name per line, copied exactly as written in the row.\n"
+        "Rules: do not summarise, do not explain, do not add names that are not "
+        "in the rows, do not output SOURCES. If no row matches, output only: NONE\n\n"
+        "Rows:\n{context}\n\n"
+        "Question: {question}\n"
+        "Matching driver names:"
+    ),
+)
+
+# Combine/reduce step: replaces the default "distill into a consolidated
+# summary" prompt that used to drop names.
+COMBINE_PROMPT = PromptTemplate(
+    input_variables=["summaries", "question"],
+    template=(
+        "Below are partial answers extracted from different batches of a drivers "
+        "dataset.\n"
+        "Merge them into ONE final answer to the question.\n"
+        "Rules:\n"
+        "- Keep EVERY driver name that appears in ANY partial answer.\n"
+        "- Remove duplicates and remove the placeholder NONE.\n"
+        "- Never summarise, never truncate, never drop a name.\n"
+        "- Answer with a plain comma separated list of the names, no preamble, "
+        "no SOURCES section.\n"
+        "- If nothing matched at all, answer: I don't know.\n\n"
+        "Partial answers:\n{summaries}\n\n"
+        "Question: {question}\n"
+        "Final answer (complete list of names):"
+    ),
+)
+
+
+def _rough_tokens(text):
+    """Cheap token estimate (~4 chars per token)."""
+    return len(text) // 4 + 1
+
+
+def bundle_rows(docs, rows_per_chunk=ROWS_PER_MAP_CHUNK):
+    """Group CSV rows so that the map step costs 1 LLM call per bundle
+    instead of 1 LLM call per row (the main driver of the API bill)."""
+    bundles = []
+    for start in range(0, len(docs), rows_per_chunk):
+        group = docs[start:start + rows_per_chunk]
+        bundles.append(
+            Document(
+                page_content="\n".join(d.page_content for d in group),
+                metadata={"source": group[0].metadata.get("source", ""),
+                          "rows": "{}..{}".format(
+                              group[0].metadata.get("row", start),
+                              group[-1].metadata.get("row", start + len(group) - 1))},
+            )
+        )
+    return bundles
+
+
+def _build_qa_chain(docs, llm):
+    """Index the rows and return a RetrievalQA chain that actually answers
+    the user's questions. `k` is sized to the corpus (these questions need a
+    full table scan), not blindly set to 1000."""
+    corpus_tokens = sum(_rough_tokens(d.page_content) for d in docs)
+
+    if corpus_tokens + RESERVED_OUTPUT_TOKENS < MODEL_CONTEXT_TOKENS:
+        index_docs = docs
+        chain_type = "stuff"
+        chain_type_kwargs = {"prompt": STUFF_PROMPT}
+        print("[index] {} rows (~{} tokens) fit in one prompt -> chain_type='stuff' "
+              "(1 LLM call per query)".format(len(docs), corpus_tokens))
+    else:
+        index_docs = bundle_rows(docs)
+        chain_type = "map_reduce"
+        chain_type_kwargs = {"question_prompt": MAP_PROMPT,
+                             "combine_prompt": COMBINE_PROMPT}
+        print("[index] {} rows (~{} tokens) are too large for one prompt -> "
+              "chain_type='map_reduce' over {} row bundles of {} rows "
+              "({} LLM calls per query instead of {})".format(
+                  len(docs), corpus_tokens, len(index_docs), ROWS_PER_MAP_CHUNK,
+                  len(index_docs) + 1, len(docs) + 1))
+
+    db = Chroma.from_documents(index_docs, OpenAIEmbeddings())
+    retriever = db.as_retriever(search_type="similarity",
+                                search_kwargs={"k": len(index_docs)})
+
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type=chain_type,
+        retriever=retriever,
+        chain_type_kwargs=chain_type_kwargs,
+        return_source_documents=False,
+        verbose=True,
+    )
+
+
+def run_agent(queries):
+    results = []
+
+    files = ['drivers.csv', 'drivers_full.csv']
+
+    # Long-context chat model: ~10x cheaper per token than text-davinci-003 and
+    # no max_tokens=256 truncation of the list of names.
+    llm = ChatOpenAI(model_name=MODEL_NAME, temperature=0, max_tokens=None)
+
+    for file in files:
+        print("=====================================")
+        print(file)
+        print("=====================================")
+        with get_openai_callback() as file_cb:
+
+            loader = CSVLoader(file_path=file, encoding='utf-8')
+            docs = loader.load()
+
+            # Build the index / chain once per file, not once per query.
+            qa_chain = _build_qa_chain(docs, llm)
+
+            for query in queries:
+                with get_openai_callback() as cb:
+                    result = qa_chain.run(query)
+                results.append(result)
+
+                print(query)
+                print(result)
+                print("cost of this query: ${:.4f} ({} tokens, {} LLM calls)".format(
+                    cb.total_cost, cb.total_tokens, cb.successful_requests))
+
+            print(file_cb)
+    return results
+
+
+if __name__ == "__main__":
+    queries = [
+        "Tell me the name of every driver who is German"
+    ]
+    res = run_agent(queries)
+
+--------------------------------------------------------------------------------

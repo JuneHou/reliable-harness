@@ -1,0 +1,189 @@
+diff --git a/camel/utils/commons.py b/camel/utils/commons.py
+index 30c0b69..ecb10e5 100644
+--- a/camel/utils/commons.py
++++ b/camel/utils/commons.py
+@@ -12,6 +12,7 @@
+ # limitations under the License.
+ # =========== Copyright 2023 @ CAMEL-AI.org. All Rights Reserved. ===========
+ import importlib
++import inspect
+ import os
+ import platform
+ import re
+@@ -29,6 +30,7 @@ from typing import (
+     Mapping,
+     Optional,
+     Set,
++    Tuple,
+     Type,
+     TypeVar,
+     cast,
+@@ -232,12 +234,26 @@ def is_module_available(module_name: str) -> bool:
+         return False
+ 
+ 
+-def api_keys_required(*required_keys: str) -> Callable[[F], F]:
+-    r"""A decorator to check if the required API keys are
+-    presented in the environment variables or as an instance attribute.
++def api_keys_required(*required_keys: Any, **options: Any) -> Callable[[F], F]:
++    r"""A decorator to check if the required API keys are presented in the
++    environment variables, as an instance attribute or as an argument that is
++    passed directly to the decorated function (e.g. to a decorated
++    ``__init__`` method).
+ 
+     Args:
+-        required_keys (str): The required API keys to be checked.
++        required_keys: The required API keys to be checked. Every key can be
++            given either as:
++
++            * a string, i.e. the name of the environment variable that stores
++              the API key, or
++            * a tuple ``(environment variable name, attribute name)``, where
++              the attribute name is the name of the instance attribute (or of
++              the argument of the decorated function) that stores the API key.
++
++            A list or a tuple containing any combination of the above is also
++            accepted, e.g.
++            ``[('OPENAI_API_KEY', 'api_key'), ('ANTHROPIC_API_KEY',
++            'api_key')]``.
+ 
+     Returns:
+         Callable[[F], F]: The original function with the added check
+@@ -245,29 +261,126 @@ def api_keys_required(*required_keys: str) -> Callable[[F], F]:
+ 
+     Raises:
+         ValueError: If any of the required API keys are missing in the
+-            environment variables and the instance attribute.
++            environment variables, the instance attributes and the arguments
++            passed directly to the decorated function.
+ 
+     Example:
+         ::
+ 
+-            @api_keys_required('API_KEY_1', 'API_KEY_2')
+-            def some_api_function():
++            @api_keys_required([('OPENAI_API_KEY', 'api_key')])
++            def some_api_function(api_key=None):
+                 # Function implementation...
+     """
+ 
++    # Normalize the several accepted ways of specifying the required keys
++    # into a list of ``(environment variable, attribute name)`` tuples.
++    normalized_keys: List[Tuple[Optional[str], Optional[str]]] = []
++
++    def _flatten(item: Any) -> None:
++        if item is None:
++            return
++        if isinstance(item, str):
++            # Only an environment variable name was given.
++            normalized_keys.append((item, None))
++        elif (
++            isinstance(item, tuple)
++            and len(item) == 2
++            and all(
++                element is None or isinstance(element, str) for element in item
++            )
++        ):
++            env_var, attr_name = item
++            if env_var is not None or attr_name is not None:
++                normalized_keys.append((env_var, attr_name))
++        elif isinstance(item, (list, tuple, set, frozenset)):
++            for element in item:
++                _flatten(element)
++        else:
++            raise TypeError(
++                "The required API keys should be given as strings or as "
++                "(environment variable, attribute) tuples, "
++                f"got: {item!r}."
++            )
++
++    # Also support being called as ``api_keys_required(required_keys=...)``.
++    if 'required_keys' in options:
++        required_keys = required_keys + (options.pop('required_keys'),)
++    if options:
++        raise TypeError(
++            "api_keys_required() got unexpected keyword arguments: "
++            f"{', '.join(options)}."
++        )
++
++    for key in required_keys:
++        _flatten(key)
++
+     def decorator(func: F) -> F:
+         @wraps(func)
+         def wrapper(*args: Any, **kwargs: Any) -> Any:
+-            missing_environment_keys = [
+-                k for k in required_keys if k not in os.environ
+-            ]
+-            if (
+-                not (args and getattr(args[0], '_api_key', None))
+-                and missing_environment_keys
+-            ):
++            # Resolve the arguments that are passed to the decorated
++            # function, so that API keys given directly as positional or
++            # keyword arguments (e.g. ``SomeClass(api_key="...")``) are
++            # recognized as well.
++            call_arguments: Dict[str, Any] = {}
++            try:
++                signature = inspect.signature(func)
++            except (TypeError, ValueError):  # pragma: no cover
++                signature = None
++
++            bound: Optional[inspect.BoundArguments] = None
++            if signature is not None:
++                try:
++                    bound = signature.bind_partial(*args, **kwargs)
++                except TypeError:  # pragma: no cover
++                    bound = None
++
++            if bound is not None and signature is not None:
++                for name, value in bound.arguments.items():
++                    parameter = signature.parameters[name]
++                    if parameter.kind is inspect.Parameter.VAR_KEYWORD:
++                        call_arguments.update(value)
++                    elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
++                        continue
++                    else:
++                        call_arguments[name] = value
++            else:  # pragma: no cover
++                call_arguments.update(kwargs)
++
++            instance = args[0] if args else None
++
++            missing_keys: List[str] = []
++            for env_var, attr_name in normalized_keys:
++                # 1. Check the environment variables.
++                if env_var is not None and os.getenv(env_var):
++                    continue
++
++                # 2. Check the instance attributes and the arguments that
++                # were directly passed to the decorated function.
++                attribute_names: Tuple[str, ...] = (
++                    (attr_name,)
++                    if attr_name is not None
++                    else ('_api_key', 'api_key')
++                )
++
++                if instance is not None and any(
++                    getattr(instance, name, None) for name in attribute_names
++                ):
++                    continue
++
++                if any(
++                    call_arguments.get(name) for name in attribute_names
++                ):
++                    continue
++
++                missing_keys.append(
++                    env_var if env_var is not None else attribute_names[0]
++                )
++
++            if missing_keys:
+                 raise ValueError(
+-                    f"Missing API keys: {', '.join(missing_environment_keys)}"
++                    f"Missing API keys: {', '.join(missing_keys)}"
+                 )
++
+             return func(*args, **kwargs)
+ 
+         return cast(F, wrapper)

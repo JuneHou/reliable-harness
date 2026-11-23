@@ -1,0 +1,403 @@
+Case ID: 77178370
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 05:34:21
+End Time: 2026-11-05 05:59:51
+Total Duration: 1529.57 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+from typing import Any, List
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import ConversationalRetrievalChain, LLMChain
+from langchain.memory import ConversationBufferMemory
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.schema import BaseRetriever, Document
+
+# Load environment variables from .env file
+_ = load_dotenv(find_dotenv())
+
+# Prompt for the "gate" that decides whether a question needs the custom
+# knowledge base (YES) or can be answered from the model's own general
+# knowledge (NO).  The actual knowledge base topics are injected dynamically.
+RELEVANCE_PROMPT = PromptTemplate(
+    input_variables=["topics", "question"],
+    template=(
+        "You are a router placed in front of a private knowledge base.\n"
+        "The knowledge base only contains the following facts:\n"
+        "{topics}\n\n"
+        "Decide whether answering the user question requires looking up "
+        "information in that knowledge base.\n"
+        "Questions about the subjects covered by those facts require the "
+        "knowledge base.\n"
+        "Small talk and general knowledge questions (for example 'hello' or "
+        "\"what's 2+2?\") do NOT require it.\n"
+        "Reply with exactly one word: YES if the knowledge base is needed, "
+        "otherwise NO.\n\n"
+        "Question: {question}\n"
+        "Answer:"
+    ),
+)
+
+
+class KnowledgeBaseGatedRetriever(BaseRetriever):
+    """Retriever that returns source documents only when the answer really
+    comes from the custom knowledge base.
+
+    A plain vector store retriever always returns its top-k most similar
+    documents, even for a question like 'hello' that has nothing to do with
+    the knowledge base.  This wrapper first asks an LLM whether the question
+    actually needs the knowledge base:
+
+    * knowledge base question -> the real source documents are returned
+    * general question ('hello', 'what's 2+2?', ...) -> an empty list
+    """
+
+    base_retriever: Any    # underlying FAISS vector store retriever
+    relevance_chain: Any   # LLM chain that answers YES / NO
+    topics: str            # description of what the knowledge base contains
+
+    def _needs_knowledge_base(self, query: str) -> bool:
+        """Return True only when the question needs the knowledge base."""
+        try:
+            decision = self.relevance_chain.predict(
+                topics=self.topics, question=query
+            ).strip().upper()
+        except Exception:
+            # If the routing call fails, rather retrieve than lose documents.
+            return True
+        # Anything that is not an explicit "NO" is treated as "needs lookup".
+        return not decision.startswith("N")
+
+    def _get_relevant_documents(self, query: str, **kwargs: Any) -> List[Document]:
+        if not self._needs_knowledge_base(query):
+            # General question -> empty result, nothing from the knowledge base
+            return []
+        # Question about the knowledge base -> return the source documents
+        return self.base_retriever.get_relevant_documents(query, **kwargs)
+
+    async def _aget_relevant_documents(
+        self, query: str, **kwargs: Any
+    ) -> List[Document]:
+        return self._get_relevant_documents(query, **kwargs)
+
+    def get_relevant_documents(self, query: str, **kwargs: Any) -> List[Document]:
+        """Public entry point (same contract for every LangChain version)."""
+        return self._get_relevant_documents(query, **kwargs)
+
+
+def run_agent(user_input):
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+
+    if openai_api_key:
+        os.environ['OPENAI_API_KEY'] = openai_api_key
+
+    custom_template = """
+This is conversation with a human. Answer the questions you get based on the knowledge you have.
+If you don't know the answer, just say that you don't, don't try to make up an answer.
+Chat History:
+{chat_history}
+Follow Up Input: {question}
+"""
+    CUSTOM_QUESTION_PROMPT = PromptTemplate.from_template(custom_template)
+
+    llm = ChatOpenAI(
+        model_name="gpt-3.5-turbo",  # Name of the language model
+        temperature=0  # Parameter that controls the randomness of the generated responses
+    )
+
+    embeddings = OpenAIEmbeddings()
+
+    docs = [
+        "Buildings are made out of brick",
+        "Buildings are made out of wood",
+        "Buildings are made out of stone",
+        "Buildings are made out of atoms",
+        "Buildings are made out of building materials",
+        "Cars are made out of metal",
+        "Cars are made out of plastic",
+    ]
+    vectorstore = FAISS.from_texts(docs, embeddings)
+    base_retriever = vectorstore.as_retriever()
+
+    # LLM gate that decides whether a question needs the knowledge base
+    relevance_chain = LLMChain(llm=llm, prompt=RELEVANCE_PROMPT)
+
+    # Wrap the plain vector store retriever: `get_relevant_documents` now
+    # returns the source documents only when the answer really comes from the
+    # custom knowledge base, and an empty list for general questions such as
+    # "hello" or "what's 2+2?".
+    retriever = KnowledgeBaseGatedRetriever(
+        base_retriever=base_retriever,
+        relevance_chain=relevance_chain,
+        topics="\n".join(f"- {doc}" for doc in docs),
+    )
+
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+    qa = ConversationalRetrievalChain.from_llm(
+        llm,
+        retriever,
+        condense_question_prompt=CUSTOM_QUESTION_PROMPT,
+        memory=memory
+    )
+
+    # Answer the question the user actually asked (no hard coded query), and
+    # keep the chain answer instead of overwriting it with the documents.
+    chain_result = qa({"question": user_input})
+    print(f"Chatbot answer: {chain_result.get('answer', '')}")
+
+    # Source documents: populated only when the answer comes from the custom
+    # knowledge base, empty for general questions.
+    result = retriever.get_relevant_documents(user_input)
+
+    return result
+
+
+if __name__ == "__main__":
+    # 1) Question that needs the knowledge base -> source documents returned
+    user_input = "What are buildings made of?"
+    result = run_agent(user_input)
+    print("\n=== User Query Result ===")
+    print(f"Question: {user_input}")
+    print(f"Answer: {result}")
+
+    # 2) General questions -> empty result, no unrelated documents returned
+    for general_question in ["hello", "what's 2+2?"]:
+        result = run_agent(general_question)
+        print("\n=== General Query Result ===")
+        print(f"Question: {general_question}")
+        print(f"Answer: {result}")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 05:59:51
+Duration: 1529.57 seconds
+Verdict: # Evaluation of Case 77178370
+
+## Analysis
+
+**1. Diff Review:**
+
+The fixed code makes several changes:
+- Uses `user_input` instead of the hardcoded query ✓ (good)
+- Adds a `KnowledgeBaseGatedRetriever` wrapper that filters general questions
+- Guards the `os.environ` assignment against a `None` API key
+- **Critically**: still ends with `result = retriever.get_relevant_documents(user_input)` followed by `return result`
+
+**2. Return Contract Mismatch (Fatal Flaw):**
+
+The test explicitly requires:
+
+```python
+result = run_agent(query)
+self.assertIsInstance(result, dict)      # ← must be a dict
+self.assertIn('output', result)          # ← must contain 'output' key
+answer = result['output'].lower()        # ← answer text containing "brick"
+```
+
+However, the fixed code returns `retriever.get_relevant_documents(user_input)`, which per the verified LangChain API returns `List[Document]` (or `[]` for general questions via the gate). A list is **not** a dict, so `assertIsInstance(result, dict)` fails immediately with an `AssertionError`.
+
+**3. The Correct Answer Is Computed Then Discarded:**
+
+```python
+chain_result = qa({"question": user_input})
+print(f"Chatbot answer: {chain_result.get('answer', '')}")  # only printed!
+result = retriever.get_relevant_documents(user_input)        # wrong type returned
+return result
+```
+
+The LLM's answer (which would contain "brick" per the docs) is thrown away after printing. Moreover, even returning `chain_result` directly would fail, since `ConversationalRetrievalChain` returns an `'answer'` key, not `'output'` — the fix needed to wrap the answer, e.g. `{"output": chain_result["answer"]}`.
+
+**4. API Verification Results:**
+
+- `BaseRetriever.get_relevant_documents` → confirmed to return `List[Document]`, not a dict — confirming the type mismatch
+- `ConversationalRetrievalChain` / `LLMChain.predict` → usage is syntactically valid, so the APIs themselves aren't the problem; the return contract is
+
+**5. Minor Issues:**
+
+- The `KnowledgeBaseGatedRetriever` adds an extra LLM call per invocation and addresses a requirement ("hello"/"2+2" filtering) that the test never checks, while failing the one requirement the test does check
+- The `validate_fixed_code` ACCEPT appears to be a false positive — the code is structurally valid (imports, syntax), but it does not satisfy the test's functional return-format expectations
+
+## Verdict: **REJECT**
+
+**Reasoning:** The test requires `run_agent` to return a `dict` with an `'output'` key containing the answer text (which must include "brick"). The fixed code returns a `List[Document]` from the retriever, causing `self.assertIsInstance(result, dict)` to fail immediately. The actual conversational answer is computed but only printed to stdout rather than returned, and even if it were returned, it lives under the `'answer'` key rather than `'output'`. The fix preserves the exact bug pattern from the original code (overwriting the chain result with retrieved documents) and adds unrelated complexity (the gated retriever) instead of fixing the return format.
+--------------------------------------------------------------------------------
+import os
+from typing import Any, List
+
+from dotenv import load_dotenv, find_dotenv
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import ConversationalRetrievalChain, LLMChain
+from langchain.memory import ConversationBufferMemory
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.schema import BaseRetriever, Document
+
+# Load environment variables from .env file
+_ = load_dotenv(find_dotenv())
+
+# Prompt for the "gate" that decides whether a question needs the custom
+# knowledge base (YES) or can be answered from the model's own general
+# knowledge (NO).  The actual knowledge base topics are injected dynamically.
+RELEVANCE_PROMPT = PromptTemplate(
+    input_variables=["topics", "question"],
+    template=(
+        "You are a router placed in front of a private knowledge base.\n"
+        "The knowledge base only contains the following facts:\n"
+        "{topics}\n\n"
+        "Decide whether answering the user question requires looking up "
+        "information in that knowledge base.\n"
+        "Questions about the subjects covered by those facts require the "
+        "knowledge base.\n"
+        "Small talk and general knowledge questions (for example 'hello' or "
+        "\"what's 2+2?\") do NOT require it.\n"
+        "Reply with exactly one word: YES if the knowledge base is needed, "
+        "otherwise NO.\n\n"
+        "Question: {question}\n"
+        "Answer:"
+    ),
+)
+
+
+class KnowledgeBaseGatedRetriever(BaseRetriever):
+    """Retriever that returns source documents only when the answer really
+    comes from the custom knowledge base.
+
+    A plain vector store retriever always returns its top-k most similar
+    documents, even for a question like 'hello' that has nothing to do with
+    the knowledge base.  This wrapper first asks an LLM whether the question
+    actually needs the knowledge base:
+
+    * knowledge base question -> the real source documents are returned
+    * general question ('hello', 'what's 2+2?', ...) -> an empty list
+    """
+
+    base_retriever: Any    # underlying FAISS vector store retriever
+    relevance_chain: Any   # LLM chain that answers YES / NO
+    topics: str            # description of what the knowledge base contains
+
+    def _needs_knowledge_base(self, query: str) -> bool:
+        """Return True only when the question needs the knowledge base."""
+        try:
+            decision = self.relevance_chain.predict(
+                topics=self.topics, question=query
+            ).strip().upper()
+        except Exception:
+            # If the routing call fails, rather retrieve than lose documents.
+            return True
+        # Anything that is not an explicit "NO" is treated as "needs lookup".
+        return not decision.startswith("N")
+
+    def _get_relevant_documents(self, query: str, **kwargs: Any) -> List[Document]:
+        if not self._needs_knowledge_base(query):
+            # General question -> empty result, nothing from the knowledge base
+            return []
+        # Question about the knowledge base -> return the source documents
+        return self.base_retriever.get_relevant_documents(query, **kwargs)
+
+    async def _aget_relevant_documents(
+        self, query: str, **kwargs: Any
+    ) -> List[Document]:
+        return self._get_relevant_documents(query, **kwargs)
+
+    def get_relevant_documents(self, query: str, **kwargs: Any) -> List[Document]:
+        """Public entry point (same contract for every LangChain version)."""
+        return self._get_relevant_documents(query, **kwargs)
+
+
+def run_agent(user_input):
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+
+    if openai_api_key:
+        os.environ['OPENAI_API_KEY'] = openai_api_key
+
+    custom_template = """
+This is conversation with a human. Answer the questions you get based on the knowledge you have.
+If you don't know the answer, just say that you don't, don't try to make up an answer.
+Chat History:
+{chat_history}
+Follow Up Input: {question}
+"""
+    CUSTOM_QUESTION_PROMPT = PromptTemplate.from_template(custom_template)
+
+    llm = ChatOpenAI(
+        model_name="gpt-3.5-turbo",  # Name of the language model
+        temperature=0  # Parameter that controls the randomness of the generated responses
+    )
+
+    embeddings = OpenAIEmbeddings()
+
+    docs = [
+        "Buildings are made out of brick",
+        "Buildings are made out of wood",
+        "Buildings are made out of stone",
+        "Buildings are made out of atoms",
+        "Buildings are made out of building materials",
+        "Cars are made out of metal",
+        "Cars are made out of plastic",
+    ]
+    vectorstore = FAISS.from_texts(docs, embeddings)
+    base_retriever = vectorstore.as_retriever()
+
+    # LLM gate that decides whether a question needs the knowledge base
+    relevance_chain = LLMChain(llm=llm, prompt=RELEVANCE_PROMPT)
+
+    # Wrap the plain vector store retriever: `get_relevant_documents` now
+    # returns the source documents only when the answer really comes from the
+    # custom knowledge base, and an empty list for general questions such as
+    # "hello" or "what's 2+2?".
+    retriever = KnowledgeBaseGatedRetriever(
+        base_retriever=base_retriever,
+        relevance_chain=relevance_chain,
+        topics="\n".join(f"- {doc}" for doc in docs),
+    )
+
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+    qa = ConversationalRetrievalChain.from_llm(
+        llm,
+        retriever,
+        condense_question_prompt=CUSTOM_QUESTION_PROMPT,
+        memory=memory
+    )
+
+    # Answer the question the user actually asked (no hard coded query), and
+    # keep the chain answer instead of overwriting it with the documents.
+    chain_result = qa({"question": user_input})
+    print(f"Chatbot answer: {chain_result.get('answer', '')}")
+
+    # Source documents: populated only when the answer comes from the custom
+    # knowledge base, empty for general questions.
+    result = retriever.get_relevant_documents(user_input)
+
+    return result
+
+
+if __name__ == "__main__":
+    # 1) Question that needs the knowledge base -> source documents returned
+    user_input = "What are buildings made of?"
+    result = run_agent(user_input)
+    print("\n=== User Query Result ===")
+    print(f"Question: {user_input}")
+    print(f"Answer: {result}")
+
+    # 2) General questions -> empty result, no unrelated documents returned
+    for general_question in ["hello", "what's 2+2?"]:
+        result = run_agent(general_question)
+        print("\n=== General Query Result ===")
+        print(f"Question: {general_question}")
+        print(f"Answer: {result}")
+
+--------------------------------------------------------------------------------

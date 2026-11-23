@@ -1,0 +1,411 @@
+diff --git a/apps/browser/pages/api/proxy/embeddings.ts b/apps/browser/pages/api/proxy/embeddings.ts
+index 29affd6..afb18fb 100644
+--- a/apps/browser/pages/api/proxy/embeddings.ts
++++ b/apps/browser/pages/api/proxy/embeddings.ts
+@@ -11,7 +11,7 @@ export default async function handler(
+   req: NextApiRequest,
+   res: NextApiResponse
+ ): Promise<void> {
+-  if (!(req.method === "POST")) {
++  if (req.method !== "POST") {
+     return res.status(404).send({});
+   }
+   const goalId = req.body.goalId;
+@@ -37,24 +37,21 @@ export default async function handler(
+     return res.status(403).send({});
+   }
+ 
+-  const input: string[][] = req.body.input;
++  // The request body now contains a *single* batch of inputs (string[])
++  const input: string[] = req.body.input;
+   try {
+-    const embeddings = await Promise.all(
+-      input.map(async (inputs) => {
+-        const { data } = await openai.embeddings.create({
+-          model: req.body.model,
+-          input: inputs,
+-        });
++    const { data } = await openai.embeddings.create({
++      model: req.body.model,
++      input,
++    });
+ 
+-        return data.map((innerData) => {
+-          return {
+-            embedding: innerData.embedding,
+-            input: inputs[innerData.index],
+-          };
+-        });
+-      })
+-    );
+-    return res.status(200).json({ embeddings: embeddings.flat() });
++    const embeddings = data.map((innerData) => {
++      return {
++        embedding: innerData.embedding,
++        input: input[innerData.index],
++      };
++    });
++    return res.status(200).json({ embeddings });
+   } catch (e: any) {
+     // Rate limit error
+     if (e instanceof OpenAIApi.APIError && e.status === 429) {
+diff --git a/apps/browser/src/api/ProxyEmbeddingApi.ts b/apps/browser/src/api/ProxyEmbeddingApi.ts
+index 14a4f98..3d7452f 100644
+--- a/apps/browser/src/api/ProxyEmbeddingApi.ts
++++ b/apps/browser/src/api/ProxyEmbeddingApi.ts
+@@ -28,8 +28,8 @@ export class ProxyEmbeddingApi implements EmbeddingApi {
+     const config = DEFAULT_ADA_CONFIG;
+ 
+     const inputs = Array.isArray(input) ? input : [input];
+-    for (const input of inputs) {
+-      if (this._tokenizer.encode(input).length > config.maxTokensPerInput) {
++    for (const inp of inputs) {
++      if (this._tokenizer.encode(inp).length > config.maxTokensPerInput) {
+         throw new Error(
+           `Input exceeds max request tokens: ${config.maxTokensPerInput}`
+         );
+@@ -43,36 +43,53 @@ export class ProxyEmbeddingApi implements EmbeddingApi {
+       throw Error("GoalID is not set");
+     }
+ 
+-    const embeddingResponse = await fetch("/api/proxy/embeddings", {
+-      method: "POST",
+-      body: JSON.stringify({
+-        input: batchedInputs,
+-        model: config.model,
+-        goalId
+-      }),
+-      headers: {
+-        "Content-Type": "application/json",
+-      },
+-    });
++    const allEmbeddings: EmbeddingCreationResult[] = [];
+ 
+-    if (!embeddingResponse.ok) {
+-      const error = await embeddingResponse.json();
+-      if (embeddingResponse.status === 400) {
+-        throw Error("Error from OpenAI Embeddings: " + error.error);
+-      }
+-      if (embeddingResponse.status === 429) {
+-        await new Promise((resolve) => setTimeout(resolve, 15000));
+-        if (!tries || tries < MAX_RATE_LIMIT_RETRIES) {
+-          return this.createEmbeddings(input, tries == undefined ? 0 : ++tries);
++    // Helper to send a single batch with retry handling for rate limits.
++    const fetchBatch = async (
++      batch: string[],
++      batchTries?: number
++    ): Promise<EmbeddingCreationResult[]> => {
++      const response = await fetch("/api/proxy/embeddings", {
++        method: "POST",
++        body: JSON.stringify({
++          input: batch,
++          model: config.model,
++          goalId,
++        }),
++        headers: {
++          "Content-Type": "application/json",
++        },
++      });
++
++      if (!response.ok) {
++        const errorBody = await response.json();
++        if (response.status === 400) {
++          throw Error("Error from OpenAI Embeddings: " + errorBody.error);
+         }
++        if (response.status === 429) {
++          // Rate limit – wait and retry this batch.
++          await new Promise((resolve) => setTimeout(resolve, 15000));
++          if (!batchTries || batchTries < MAX_RATE_LIMIT_RETRIES) {
++            return fetchBatch(batch, batchTries === undefined ? 0 : ++batchTries);
++          }
++        }
++        if (response.status === 403) {
++          this._setCapReached();
++          throw Error(ERROR_SUBSIDY_MAX);
++        }
++        throw Error("Error trying to get response from embeddings proxy.");
+       }
+-      if (embeddingResponse.status === 403) {
+-        this._setCapReached();
+-        throw Error(ERROR_SUBSIDY_MAX);
+-      }
+-      throw Error("Error trying to get response from embeddings proxy.", error);
++
++      const { embeddings } = await response.json();
++      return embeddings as EmbeddingCreationResult[];
++    };
++
++    for (const batch of batchedInputs) {
++      const batchEmbeddings = await fetchBatch(batch);
++      allEmbeddings.push(...batchEmbeddings);
+     }
+-    const { embeddings } = await embeddingResponse.json();
+-    return embeddings;
++
++    return allEmbeddings;
+   }
+ }
+diff --git a/packages/agents/src/agent-core/chunking/TextChunker.ts b/packages/agents/src/agent-core/chunking/TextChunker.ts
+index 278dde3..a38eeef 100644
+--- a/packages/agents/src/agent-core/chunking/TextChunker.ts
++++ b/packages/agents/src/agent-core/chunking/TextChunker.ts
+@@ -1,8 +1,8 @@
+ import { cleanWhitespace } from "./cleanWhitespace";
+ 
+ export class TextChunker {
+-  static fixedCharacterLength(text: string, opts: { chunkLength: number, overlap: number }): string[] {
+-    const { chunkLength, overlap } = opts
++  static fixedCharacterLength(text: string, opts: { chunkLength: number; overlap: number }): string[] {
++    const { chunkLength, overlap } = opts;
+ 
+     if (chunkLength <= overlap) {
+       throw new Error("Chunk length must be greater than overlap length.");
+@@ -24,37 +24,39 @@ export class TextChunker {
+   }
+ 
+   static parentDocRetrieval(text: string, opts: {
+-    parentChunker: (text: string) => string[],
+-    childChunker: (parentText: string) => string[],
++    parentChunker: (text: string) => string[];
++    childChunker: (parentText: string) => string[];
+   }): {
+     doc: string;
+     metadata: {
+       parent: string;
+-    }
++    };
+   }[] {
+-    const { parentChunker, childChunker } = opts
+-
+-    const parentChunks = parentChunker(text)
+-    const parentAndChildDocs = parentChunks.map(parentChunk => {
+-      return {
+-        parent: parentChunk,
+-        children: childChunker(parentChunk)
+-      }
+-    }).map(parentAndChildDoc => {
+-      return {
+-        metadatas: parentAndChildDoc.children.map(() => ({ parent: parentAndChildDoc.parent })),
+-        documents: parentAndChildDoc.children
+-      }
+-    })
+-
+-    const docs = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.documents)
+-    const metadatas = parentAndChildDocs.flatMap(parentAndChildDoc => parentAndChildDoc.metadatas)
++    const { parentChunker, childChunker } = opts;
++
++    const parentChunks = parentChunker(text);
++    const parentAndChildDocs = parentChunks
++      .map((parentChunk) => {
++        return {
++          parent: parentChunk,
++          children: childChunker(parentChunk),
++        };
++      })
++      .map((parentAndChildDoc) => {
++        return {
++          metadatas: parentAndChildDoc.children.map(() => ({ parent: parentAndChildDoc.parent })),
++          documents: parentAndChildDoc.children,
++        };
++      });
++
++    const docs = parentAndChildDocs.flatMap((parentAndChildDoc) => parentAndChildDoc.documents);
++    const metadatas = parentAndChildDocs.flatMap((parentAndChildDoc) => parentAndChildDoc.metadatas);
+ 
+     const chunks = docs.map((doc, index) => {
+       return {
+         doc,
+-        metadata: metadatas[index]
+-      }
++        metadata: metadatas[index],
++      };
+     });
+ 
+     return chunks;
+@@ -70,31 +72,31 @@ export class TextChunker {
+     const digits = "([0-9])";
+     const multipleDots = /\\.{2,}/g;
+ 
+-      text = " " + text + "  ";
+-      text = text.replaceAll("\n", " ");
+-      text = text.replaceAll(new RegExp(prefixes, 'g'), "$1<prd>");
+-      text = text.replaceAll(new RegExp(websites, 'g'), "<prd>$1");
+-      text = text.replaceAll(new RegExp(digits + "[.]" + digits, 'g'), "$1<prd>$2");
+-      text = text.replaceAll(multipleDots, match => "<prd>".repeat(match.length) + "<stop>");
+-      if (text.includes("Ph.D")) text = text.replaceAll("Ph.D.", "Ph<prd>D<prd>");
+-      text = text.replaceAll(new RegExp("\\s" + alphabets + "[.] ", 'g'), " $1<prd> ");
+-      text = text.replaceAll(new RegExp(acronyms + " " + starters, 'g'), "$1<stop> $2");
+-      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>$3<prd>");
+-      text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]", 'g'), "$1<prd>$2<prd>");
+-      text = text.replaceAll(new RegExp(" " + suffixes + "[.] " + starters, 'g'), " $1<stop> $2");
+-      text = text.replaceAll(new RegExp(" " + suffixes + "[.]", 'g'), " $1<prd>");
+-      text = text.replaceAll(new RegExp(" " + alphabets + "[.]", 'g'), " $1<prd>");
+-      if (text.includes("”")) text = text.replaceAll(".”", "”.");
+-      if (text.includes("\"")) text = text.replaceAll(".\"", "\".");
+-      if (text.includes("!")) text = text.replaceAll("!\"", "\"!");
+-      if (text.includes("?")) text = text.replaceAll("?\"", "\"?");
+-      text = text.replaceAll(".", ".<stop>");
+-      text = text.replaceAll("?", "?<stop>");
+-      text = text.replaceAll("!", "!<stop>");
+-      text = text.replaceAll("<prd>", ".");
+-      const sentences = text.split("<stop>").map(s => s.trim());
+-      if (sentences && !sentences[sentences.length - 1]) sentences.pop();
+-      return sentences;
++    text = " " + text + "  ";
++    text = text.replaceAll("\n", " ");
++    text = text.replaceAll(new RegExp(prefixes, "g"), "$1<prd>");
++    text = text.replaceAll(new RegExp(websites, "g"), "<prd>$1");
++    text = text.replaceAll(new RegExp(digits + "[.]" + digits, "g"), "$1<prd>$2");
++    text = text.replaceAll(multipleDots, (match) => "<prd>".repeat(match.length) + "<stop>");
++    if (text.includes("Ph.D")) text = text.replaceAll("Ph.D.", "Ph<prd>D<prd>");
++    text = text.replaceAll(new RegExp("\\s" + alphabets + "[.] ", "g"), " $1<prd> ");
++    text = text.replaceAll(new RegExp(acronyms + " " + starters, "g"), "$1<stop> $2");
++    text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]", "g"), "$1<prd>$2<prd>$3<prd>");
++    text = text.replaceAll(new RegExp(alphabets + "[.]" + alphabets + "[.]", "g"), "$1<prd>$2<prd>");
++    text = text.replaceAll(new RegExp(" " + suffixes + "[.] " + starters, "g"), " $1<stop> $2");
++    text = text.replaceAll(new RegExp(" " + suffixes + "[.]", "g"), " $1<prd>");
++    text = text.replaceAll(new RegExp(" " + alphabets + "[.]", "g"), " $1<prd>");
++    if (text.includes("”")) text = text.replaceAll(".”", "”.");
++    if (text.includes("\"")) text = text.replaceAll(".", "\".");
++    if (text.includes("!")) text = text.replaceAll("!\"", "\"!");
++    if (text.includes("?")) text = text.replaceAll("?\"", "\"?");
++    text = text.replaceAll(".", ".<stop>");
++    text = text.replaceAll("?", "?<stop>");
++    text = text.replaceAll("!", "!<stop>");
++    text = text.replaceAll("<prd>", ".");
++    const sentences = text.split("<stop>").map((s) => s.trim());
++    if (sentences && !sentences[sentences.length - 1]) sentences.pop();
++    return sentences;
+   }
+ 
+   static singleLine(content: string): string[] {
+@@ -122,6 +124,7 @@ export class TextChunker {
+       }
+       currentChunk += char;
+     }
++    if (currentChunk) chunks.push(currentChunk);
+     return chunks;
+   }
+ 
+@@ -134,9 +137,9 @@ export class TextChunker {
+         chunks.push(currentChunk);
+         currentChunk = "";
+       }
+-      currentChunk += word;
++      currentChunk += (currentChunk ? " " : "") + word;
+     }
+-    // TODO: temp fix. Do more general solution
+-    return chunks.filter(x => x.length > 0);
++    if (currentChunk) chunks.push(currentChunk);
++    return chunks.filter((x) => x.length > 0);
+   }
+ }
+diff --git a/packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts b/packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
+index 5293579..709fd18 100644
+--- a/packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
++++ b/packages/agents/src/agent-core/embeddings/OpenAIEmbeddingApi.ts
+@@ -9,50 +9,58 @@ import { ILogger } from "@evo-ninja/agent-utils";
+ export const DEFAULT_ADA_CONFIG = {
+   model: "text-embedding-ada-002",
+   maxTokensPerInput: 8191,
+-  maxInputsPerRequest: 2048
+-}
++  maxInputsPerRequest: 2048,
++};
+ 
+ export class OpenAIEmbeddingAPI implements EmbeddingApi {
+   private api: OpenAIApi;
+-  
++
+   constructor(
+     private apiKey: string,
+     private logger: ILogger,
+     private tokenizer: Tokenizer,
+     private modelConfig: {
+-      model: string,
+-      maxTokensPerInput: number,
+-      maxInputsPerRequest: number
++      model: string;
++      maxTokensPerInput: number;
++      maxInputsPerRequest: number;
+     } = DEFAULT_ADA_CONFIG,
+     private _maxRateLimitRetries: number = 5
+   ) {
+     this.api = new OpenAIApi({
+       apiKey: this.apiKey,
+-      dangerouslyAllowBrowser: true
++      dangerouslyAllowBrowser: true,
+     });
+   }
+ 
+-  async createEmbeddings(input: string | string[], tries?: number): Promise<EmbeddingCreationResult[]> {
++  async createEmbeddings(
++    input: string | string[],
++    tries?: number
++  ): Promise<EmbeddingCreationResult[]> {
+     try {
+       const inputs = Array.isArray(input) ? input : [input];
+       this.validateInput(inputs);
+ 
+-      const batchedInputs = splitArray(inputs, this.modelConfig.maxInputsPerRequest);
++      const batchedInputs = splitArray(
++        inputs,
++        this.modelConfig.maxInputsPerRequest
++      );
++
++      const results = await Promise.all(
++        batchedInputs.map(async (batch) => {
++          const { data } = await this.api.embeddings.create({
++            model: this.modelConfig.model,
++            input: batch,
++          });
+ 
+-      const results = await Promise.all(batchedInputs.map(async (inputs) => {
+-        const { data } = await this.api.embeddings.create({
+-          model: this.modelConfig.model,
+-          input: inputs,
++          return data.map((innerData) => {
++            return {
++              embedding: innerData.embedding,
++              input: batch[innerData.index],
++            };
++          });
+         })
++      );
+ 
+-        return data.map((innerData) => {
+-          return {
+-            embedding: innerData.embedding,
+-            input: inputs[innerData.index]
+-          }
+-        });
+-      }))
+-  
+       return results.flat();
+     } catch (err) {
+       const error = cleanOpenAIError(err);
+@@ -61,7 +69,9 @@ export class OpenAIEmbeddingAPI implements EmbeddingApi {
+         const maybeOpenAiError = error as Partial<OpenAIError>;
+ 
+         if (maybeOpenAiError.status === 429) {
+-          this.logger.warning("Warning: OpenAI rate limit exceeded, sleeping for 15 seconds.");
++          this.logger.warning(
++            "Warning: OpenAI rate limit exceeded, sleeping for 15 seconds."
++          );
+ 
+           await new Promise((resolve) => setTimeout(resolve, 15000));
+ 
+@@ -81,8 +91,10 @@ export class OpenAIEmbeddingAPI implements EmbeddingApi {
+   validateInput(inputs: string[]) {
+     for (const input of inputs) {
+       if (this.tokenizer.encode(input).length > this.modelConfig.maxTokensPerInput) {
+-        throw new Error(`Input exceeds max request tokens: ${this.modelConfig.maxTokensPerInput}`);
++        throw new Error(
++          `Input exceeds max request tokens: ${this.modelConfig.maxTokensPerInput}`
++        );
+       }
+     }
+   }
+-}
+\ No newline at end of file
++}

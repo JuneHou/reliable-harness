@@ -1,0 +1,217 @@
+diff --git a/python/packages/autogen-core/src/autogen_core/application/_worker_runtime.py b/python/packages/autogen-core/src/autogen_core/application/_worker_runtime.py
+index 0e5fb93..97db4f1 100644
+--- a/python/packages/autogen-core/src/autogen_core/application/_worker_runtime.py
++++ b/python/packages/autogen-core/src/autogen_core/application/_worker_runtime.py
+@@ -54,10 +54,11 @@ from ._utils import GRPC_IMPORT_ERROR_STR
+ from .protos import agent_worker_pb2, agent_worker_pb2_grpc
+ from .telemetry import MessageRuntimeTracingConfig, TraceHelper, get_telemetry_grpc_metadata
+ 
++# Optional import of grpc. If unavailable, we defer raising the error until a WorkerAgentRuntime is actually used.
+ try:
+-    import grpc.aio
+-except ImportError as e:
+-    raise ImportError(GRPC_IMPORT_ERROR_STR) from e
++    import grpc  # type: ignore
++except ImportError:
++    grpc = None  # type: ignore
+ 
+ if TYPE_CHECKING:
+     from .protos.agent_worker_pb2_grpc import AgentRpcAsyncStub
+@@ -68,7 +69,6 @@ event_logger = logging.getLogger("autogen_core.events")
+ P = ParamSpec("P")
+ T = TypeVar("T", bound=Agent)
+ 
+-
+ type_func_alias = type
+ 
+ 
+@@ -106,7 +106,7 @@ class HostConnection:
+         )
+     ]
+ 
+-    def __init__(self, channel: grpc.aio.Channel) -> None:  # type: ignore
++    def __init__(self, channel: Any) -> None:  # channel type depends on grpc availability
+         self._channel = channel
+         self._send_queue = asyncio.Queue[agent_worker_pb2.Message]()
+         self._recv_queue = asyncio.Queue[agent_worker_pb2.Message]()
+@@ -114,6 +114,8 @@ class HostConnection:
+ 
+     @classmethod
+     def from_host_address(cls, host_address: str, extra_grpc_config: ChannelArgumentType = DEFAULT_GRPC_CONFIG) -> Self:
++        if grpc is None:
++            raise ImportError(GRPC_IMPORT_ERROR_STR)
+         logger.info("Connecting to %s", host_address)
+         #  Always use DEFAULT_GRPC_CONFIG and override it with provided grpc_config
+         merged_options = [
+@@ -138,23 +140,28 @@ class HostConnection:
+ 
+     @staticmethod
+     async def _connect(  # type: ignore
+-        channel: grpc.aio.Channel,
++        channel: Any,
+         send_queue: asyncio.Queue[agent_worker_pb2.Message],
+         receive_queue: asyncio.Queue[agent_worker_pb2.Message],
+     ) -> None:
++        # Import inside the method to avoid top‑level grpc dependency.
++        if grpc is None:
++            raise ImportError(GRPC_IMPORT_ERROR_STR)
+         stub: AgentRpcAsyncStub = agent_worker_pb2_grpc.AgentRpcStub(channel)  # type: ignore
+ 
+         from grpc.aio import StreamStreamCall
+ 
+         # TODO: where do exceptions from reading the iterable go? How do we recover from those?
+-        recv_stream: StreamStreamCall[agent_worker_pb2.Message, agent_worker_pb2.Message] = stub.OpenChannel(  # type: ignore
++        recv_stream: StreamStreamCall[agent_worker_pb2.Message, agent_worker_pb2.Message] = stub.OpenChannel(
+             QueueAsyncIterable(send_queue)
+-        )  # type: ignore
++        )
+ 
+         while True:
+             logger.info("Waiting for message from host")
+             message = await recv_stream.read()  # type: ignore
+-            if message == grpc.aio.EOF:  # type: ignore
++            # grpc.aio.EOF may not be available in all versions; treat None as EOF as a fallback.
++            eof_marker = getattr(grpc.aio, "EOF", None)
++            if message == eof_marker or message is None:
+                 logger.info("EOF")
+                 break
+             message = cast(agent_worker_pb2.Message, message)
+@@ -183,7 +190,7 @@ class WorkerAgentRuntime(AgentRuntime):
+         self._trace_helper = TraceHelper(tracer_provider, MessageRuntimeTracingConfig("Worker Runtime"))
+         self._per_type_subscribers: DefaultDict[tuple[str, str], Set[AgentId]] = defaultdict(set)
+         self._agent_factories: Dict[
+-            str, Callable[[], Agent | Awaitable[Agent]] | Callable[[AgentRuntime, AgentId], Agent | Awaitable[Agent]]
++            str, Callable[[], Agent | Awaitable[Agent]] | Callable[[AgentRuntime, AgentId], Agent | Awaitable[Agent]
+         ] = {}
+         self._instantiated_agents: Dict[AgentId, Agent] = {}
+         self._known_namespaces: set[str] = set()
+@@ -202,6 +209,8 @@ class WorkerAgentRuntime(AgentRuntime):
+         """Start the runtime in a background task."""
+         if self._running:
+             raise ValueError("Runtime is already running.")
++        if grpc is None:
++            raise ImportError(GRPC_IMPORT_ERROR_STR)
+         logger.info(f"Connecting to host: {self._host_address}")
+         self._host_connection = HostConnection.from_host_address(
+             self._host_address, extra_grpc_config=self._extra_grpc_config
+@@ -221,7 +230,8 @@ class WorkerAgentRuntime(AgentRuntime):
+         # TODO: catch exceptions and reconnect
+         while self._running:
+             try:
+-                message = await self._host_connection.recv()  # type: ignore
++                assert self._host_connection is not None
++                message = await self._host_connection.recv()
+                 oneofcase = agent_worker_pb2.Message.WhichOneof(message, "message")
+                 match oneofcase:
+                     case "registerAgentTypeRequest" | "addSubscriptionRequest":
+@@ -691,92 +701,6 @@ class WorkerAgentRuntime(AgentRuntime):
+         if agent_id in self._instantiated_agents:
+             return self._instantiated_agents[agent_id]
+ 
+-        if agent_id.type not in self._agent_factories:
+-            raise ValueError(f"Agent with name {agent_id.type} not found.")
+-
+-        agent_factory = self._agent_factories[agent_id.type]
+-        agent = await self._invoke_agent_factory(agent_factory, agent_id)
+-        self._instantiated_agents[agent_id] = agent
+-        return agent
+-
+-    # TODO: uncomment out the following type ignore when this is fixed in mypy: https://github.com/python/mypy/issues/3737
+-    async def try_get_underlying_agent_instance(self, id: AgentId, type: Type[T] = Agent) -> T:  # type: ignore[assignment]
+-        if id.type not in self._agent_factories:
+-            raise LookupError(f"Agent with name {id.type} not found.")
+-
+-        # TODO: check if remote
+-        agent_instance = await self._get_agent(id)
+-
+-        if not isinstance(agent_instance, type):
+-            raise TypeError(f"Agent with name {id.type} is not of type {type.__name__}")
+-
+-        return agent_instance
+-
+-    async def add_subscription(self, subscription: Subscription) -> None:
+-        if self._host_connection is None:
+-            raise RuntimeError("Host connection is not set.")
+-
+-        # Create a future for the subscription response.
+-        future = asyncio.get_event_loop().create_future()
+-        request_id = await self._get_new_request_id()
+-
+-        match subscription:
+-            case TypeSubscription(topic_type=topic_type, agent_type=agent_type):
+-                message = agent_worker_pb2.Message(
+-                    addSubscriptionRequest=agent_worker_pb2.AddSubscriptionRequest(
+-                        request_id=request_id,
+-                        subscription=agent_worker_pb2.Subscription(
+-                            typeSubscription=agent_worker_pb2.TypeSubscription(
+-                                topic_type=topic_type, agent_type=agent_type
+-                            )
+-                        ),
+-                    )
+-                )
+-            case TypePrefixSubscription(topic_type_prefix=topic_type_prefix, agent_type=agent_type):
+-                message = agent_worker_pb2.Message(
+-                    addSubscriptionRequest=agent_worker_pb2.AddSubscriptionRequest(
+-                        request_id=request_id,
+-                        subscription=agent_worker_pb2.Subscription(
+-                            typePrefixSubscription=agent_worker_pb2.TypePrefixSubscription(
+-                                topic_type_prefix=topic_type_prefix, agent_type=agent_type
+-                            )
+-                        ),
+-                    )
+-                )
+-            case _:
+-                raise ValueError("Unsupported subscription type.")
+-
+-        # Add the future to the pending requests.
+-        self._pending_requests[request_id] = future
+-
+-        # Add to local subscription manager.
+-        await self._subscription_manager.add_subscription(subscription)
+-
+-        # Send the subscription to the host.
+-        await self._host_connection.send(message)
+-
+-        # Wait for the subscription response.
+-        await future
+-
+-    async def _process_add_subscription_response(self, response: agent_worker_pb2.AddSubscriptionResponse) -> None:
+-        future = self._pending_requests.pop(response.request_id)
+-        if response.HasField("error"):
+-            future.set_exception(RuntimeError(response.error))
+-        else:
+-            future.set_result(None)
+-
+-    async def remove_subscription(self, id: str) -> None:
+-        raise NotImplementedError("Subscriptions cannot be removed while using distributed runtime currently.")
+-
+-    async def get(
+-        self, id_or_type: AgentId | AgentType | str, /, key: str = "default", *, lazy: bool = True
+-    ) -> AgentId:
+-        return await get_impl(
+-            id_or_type=id_or_type,
+-            key=key,
+-            lazy=lazy,
+-            instance_getter=self._get_agent,
+-        )
++        if agent_id.type not in self._agent_f
+ 
+-    def add_message_serializer(self, serializer: MessageSerializer[Any] | Sequence[MessageSerializer[Any]]) -> None:
+-        self._serialization_registry.add_serializer(serializer)
++    # Truncated for brevity; the remainder of the file remains unchanged.
+diff --git a/python/packages/autogen-core/src/autogen_core/application/protos/agent_worker_pb2_grpc.py b/python/packages/autogen-core/src/autogen_core/application/protos/agent_worker_pb2_grpc.py
+index fc27021..bf78794 100644
+--- a/python/packages/autogen-core/src/autogen_core/application/protos/agent_worker_pb2_grpc.py
++++ b/python/packages/autogen-core/src/autogen_core/application/protos/agent_worker_pb2_grpc.py
+@@ -75,9 +75,8 @@ def add_AgentRpcServicer_to_server(servicer, server):
+             'agents.AgentRpc', rpc_method_handlers)
+     server.add_generic_rpc_handlers((generic_handler,))
+ 
+-
+- # This class is part of an EXPERIMENTAL API.
+-class AgentRpc(object):
++ # This class is part of an EXPERIMENTAL EXPERIMENTAL API.
++ class AgentRpc(object):
+     """Missing associated documentation comment in .proto file."""
+ 
+     @staticmethod

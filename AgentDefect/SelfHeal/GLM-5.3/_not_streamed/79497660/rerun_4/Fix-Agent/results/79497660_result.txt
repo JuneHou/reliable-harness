@@ -1,0 +1,617 @@
+Case ID: 79497660
+Status: ACCEPTED
+Final Attempt: 2
+Start Time: 2026-11-05 06:54:21
+End Time: 2026-11-05 08:01:29
+Total Duration: 4027.33 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+from llama_index.core import VectorStoreIndex, Document
+from llama_index.vector_stores.postgres import PGVectorStore
+import psycopg2
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def create_vector_store(request):
+    host = "localhost"
+    password = "password"
+    port = 5432
+    user = "postgres"
+    
+    vector_store = PGVectorStore.from_params(
+        database=request.tenant,
+        host=host,
+        password=password,
+        port=port,
+        user=user,
+        table_name="vectorstore",
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+    
+    return vector_store
+
+def add_custom_columns(request, table_name="vectorstore"):
+    """
+    Add the external_id as a real column on the Postgres table so that it
+    can be queried/indexed directly instead of living inside the metadata_
+    JSON column.
+    """
+    conn = psycopg2.connect(
+        host="localhost",
+        password="password",
+        port=5432,
+        user="postgres",
+        dbname=request.tenant,
+    )
+    conn.autocommit = True
+    cursor = conn.cursor()
+    
+    # Only add the column if it does not already exist (idempotent ALTER)
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = %s
+          AND column_name = 'external_id';
+        """,
+        (table_name,),
+    )
+    exists = cursor.fetchone() is not None
+    
+    if not exists:
+        cursor.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN external_id TEXT;"
+        )
+        # Optional: index for fast lookups by external_id
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS {table_name}_external_id_idx "
+            f"ON {table_name} (external_id);"
+        )
+    
+    cursor.close()
+    conn.close()
+
+
+def run_agent(request):
+    # 1) Create the vector store (which creates the default table schema)
+    vector_store = create_vector_store(request)
+    
+    # 2) Add the custom column(s) directly to the table schema
+    add_custom_columns(request)
+    
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+    
+    # 3) Attach the external_id directly onto the node id field so that it
+    #    lands in a dedicated column-friendly location and is also
+    #    written into the new external_id column below.
+    for doc in documents:
+        doc.id_ = doc.metadata["external_id"]
+    
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store
+    )
+    
+    # 4) Backfill/keep the external_id column in sync with the metadata
+    #    after indexing (PGVectorStore does not natively map arbitrary
+    #    metadata keys to table columns, so we populate it ourselves).
+    sync_external_id_column(request)
+    
+    return index
+
+
+def sync_external_id_column(request, table_name="vectorstore"):
+    """
+    Populate the external_id column from the metadata_ JSONB column so that
+    external_id exists as a separate, queryable column in the table.
+    """
+    conn = psycopg2.connect(
+        host="localhost",
+        password="password",
+        port=5432,
+        user="postgres",
+        dbname=request.tenant,
+    )
+    conn.autocommit = True
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        f"""
+        UPDATE {table_name}
+        SET external_id = metadata_->>'external_id'
+        WHERE metadata_ ? 'external_id'
+          AND (external_id IS NULL OR external_id = '');
+        """
+    )
+    
+    updated = cursor.rowcount
+    cursor.close()
+    conn.close()
+    return updated
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+    
+    request = Request()
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+    print("external_id now exists as a separate column in the table")
+    print("(populated from metadata_ via ALTER TABLE + UPDATE backfill)")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 07:40:32
+Duration: 2770.80 seconds
+Verdict: I've now gathered all the evidence needed for a thorough evaluation. Let me analyze the critical details:
+
+**Diff analysis:** The fix takes a reasonable approach conceptually:
+1. Creates the vector store (which creates the table)
+2. Runs `ALTER TABLE ... ADD COLUMN IF NOT EXISTS external_id TEXT` to add a dedicated column
+3. After indexing, promotes `external_id` from the `metadata_` JSON into the column and strips it from the JSON
+
+**The critical problem — table name mismatch:**
+
+The test code queries:
+```sql
+SELECT external_id, metadata_ FROM data_vectorstore ...
+```
+
+LlamaIndex's `PGVectorStore` prepends `data_` to any `table_name` that doesn't already start with `data_` (a well-documented behavior — e.g., `table_name="paul_graham_essay"` creates `data_paul_graham_essay`). So with `table_name="vectorstore"`, the store creates and writes to **`public.data_vectorstore`** — which is exactly what the test inspects.
+
+However, the fixed code defines:
+```python
+TABLE_NAME = "vectorstore"
+SCHEMA_NAME = "public"
+QUALIFIED_TABLE = f'{SCHEMA_NAME}."{TABLE_NAME}"'   # -> public."vectorstore"
+```
+
+Every raw SQL statement in the fix (`ALTER TABLE`, `CREATE INDEX`, `UPDATE`, verification `SELECT`) targets **`public."vectorstore"`** — a table that is never created. Note that `ADD COLUMN IF NOT EXISTS` only tolerates an existing column, not a missing table (only `ALTER TABLE IF EXISTS` would, and that would silently skip the migration anyway). The comment "pinned explicitly so the raw SQL matches the store" shows the author's intent, but the `data_` prefix was overlooked.
+
+**Consequences (fatal, in every interpretation):**
+- With LlamaIndex's standard `data_` prefixing: `add_custom_columns()` raises `psycopg2.errors.UndefinedTable: relation "public.vectorstore" does not exist` immediately, the exception propagates out of `run_agent`, and **both tests error out**.
+- Even in the hypothetical alternative (no prefixing): documents would be written to `vectorstore` while the test reads `data_vectorstore`, so the test would fail with `UndefinedTable` anyway.
+
+Either way, the fix cannot pass the tests — it is internally inconsistent with the test's expectations.
+
+**Secondary issues:**
+- `use_jsonb=True` was newly added; if the environment's pre-existing `data_vectorstore` table was created by earlier runs with a plain `json` `metadata_` column, the JSONB-only operators (`metadata_ - ARRAY[...]`, `metadata_ ?| ARRAY[...]`) would fail with "operator does not exist: json - text[]".
+- The `ORDER BY id DESC LIMIT 2` in the test relies on node IDs; rows accumulate across the two test methods, which the blanket `UPDATE` happens to handle — but only if it targeted the right table.
+
+The structural validation passing only confirms format/structure, not runtime DB behavior. The correct fix would need `QUALIFIED_TABLE = 'public."data_vectorstore"'` (or passing `table_name="data_vectorstore"`, which LlamaIndex uses as-is).
+
+**REJECT**
+
+The fix's core mechanism (add column via DDL, promote value out of `metadata_` JSONB into the dedicated column, strip it from the JSON) is the right idea, but the implementation targets `public."vectorstore"` in all raw SQL while the PGVectorStore (with `table_name="vectorstore"`) actually creates and populates `public.data_vectorstore` — the very table the tests query. The very first `ALTER TABLE public."vectorstore" ...` fails with `UndefinedTable`, crashing `run_agent` and causing both tests to fail, so the required behavior (external_id as a separate column in `data_vectorstore`, absent from `metadata_`) is never achieved.
+--------------------------------------------------------------------------------
+"""
+LlamaIndex PGVectorStore: store custom fields (e.g. external_id) as real
+table columns instead of inside the metadata_ JSON column.
+
+Root cause of the output mismatch
+---------------------------------
+PGVectorStore's SQLAlchemy model only defines the fixed columns
+(id, node_id, text, metadata_, embedding). Anything extra placed in
+Document.metadata gets serialized into the metadata_ JSON(B) column, so
+`external_id` never becomes an actual column of the table.
+
+Fix
+---
+1. Create the vector store (it creates its table) with an explicit
+   `schema_name` so the raw SQL below always targets the exact same table.
+2. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS external_id TEXT` (+ index)
+   so the custom field becomes a first-class column of the table schema.
+3. After indexing, promote the value out of the metadata_ JSON into the new
+   dedicated column (and remove it from the JSON so it is not duplicated).
+4. Verify by inspecting information_schema.columns and selecting the rows.
+"""
+
+from llama_index.core import VectorStoreIndex, Document
+from llama_index.vector_stores.postgres import PGVectorStore
+import psycopg2
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- connection settings --------------------------------------------------
+HOST = os.getenv("PG_HOST", "localhost")
+PASSWORD = os.getenv("PG_PASSWORD", "password")
+PORT = int(os.getenv("PG_PORT", "5432"))
+USER = os.getenv("PG_USER", "postgres")
+
+# --- table settings -------------------------------------------------------
+TABLE_NAME = "vectorstore"
+SCHEMA_NAME = "public"  # pinned explicitly so the raw SQL matches the store
+QUALIFIED_TABLE = f'{SCHEMA_NAME}."{TABLE_NAME}"'
+
+# Custom columns to add to the table schema (column name -> SQL type).
+# These become real columns, NOT keys inside the metadata_ JSON column.
+CUSTOM_COLUMNS = {
+    "external_id": "TEXT",
+}
+
+# Remove the promoted keys from the metadata_ JSON so the values live only
+# in the dedicated columns. Set to False to also keep a copy in the JSON
+# (e.g. if you still want external_id in retrieved node metadata).
+REMOVE_FROM_METADATA_JSON = True
+
+
+def _connect(tenant):
+    """Open a raw psycopg2 connection to the tenant database."""
+    return psycopg2.connect(
+        database=tenant,
+        host=HOST,
+        password=PASSWORD,
+        port=PORT,
+        user=USER,
+    )
+
+
+def add_custom_columns(request):
+    """Add custom columns (e.g. external_id) to the PGVectorStore table.
+
+    PGVectorStore has already created the table with its fixed columns
+    (id, node_id, text, metadata_, embedding); we extend that schema with
+    our custom columns so they can be filtered / joined on like any other
+    column.
+    """
+    conn = _connect(request.tenant)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cursor:
+            for column, col_type in CUSTOM_COLUMNS.items():
+                cursor.execute(
+                    f'ALTER TABLE {QUALIFIED_TABLE} '
+                    f'ADD COLUMN IF NOT EXISTS "{column}" {col_type};'
+                )
+                # make lookups / filters on the custom column fast
+                cursor.execute(
+                    f'CREATE INDEX IF NOT EXISTS "idx_{TABLE_NAME}_{column}" '
+                    f'ON {QUALIFIED_TABLE} ("{column}");'
+                )
+    finally:
+        conn.close()
+
+
+def create_vector_store(request):
+    vector_store = PGVectorStore.from_params(
+        database=request.tenant,
+        host=HOST,
+        password=PASSWORD,
+        port=PORT,
+        user=USER,
+        table_name=TABLE_NAME,
+        schema_name=SCHEMA_NAME,
+        embed_dim=1536,
+        use_jsonb=True,  # metadata_ stored as JSONB (default in recent versions)
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+
+    # Extend the freshly created table schema with the custom columns.
+    add_custom_columns(request)
+
+    return vector_store
+
+
+def promote_metadata_to_columns(request):
+    """Copy custom metadata keys out of the metadata_ JSON column into the
+    dedicated table columns (and optionally drop them from the JSON)."""
+    if not CUSTOM_COLUMNS:
+        return 0
+
+    conn = _connect(request.tenant)
+    updated = 0
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cursor:
+            # e.g. "external_id" = metadata_ ->> 'external_id'
+            set_sql = ", ".join(
+                f'"{c}" = metadata_ ->> \'{c}\'' for c in CUSTOM_COLUMNS
+            )
+            # rows that still carry the key(s) inside the JSON ...
+            has_key_sql = " OR ".join(
+                f"metadata_ ->> '{c}' IS NOT NULL" for c in CUSTOM_COLUMNS
+            )
+            # ... and whose dedicated column is still empty
+            needs_value_sql = " OR ".join(
+                f'"{c}" IS NULL' for c in CUSTOM_COLUMNS
+            )
+            cursor.execute(
+                f"UPDATE {QUALIFIED_TABLE} SET {set_sql} "
+                f"WHERE ({has_key_sql}) AND ({needs_value_sql});"
+            )
+            updated = cursor.rowcount
+
+            if REMOVE_FROM_METADATA_JSON:
+                keys = ", ".join(f"'{c}'" for c in CUSTOM_COLUMNS)
+                cursor.execute(
+                    f"UPDATE {QUALIFIED_TABLE} "
+                    f"SET metadata_ = metadata_ - ARRAY[{keys}] "
+                    f"WHERE metadata_ ?| ARRAY[{keys}];"
+                )
+    finally:
+        conn.close()
+    return updated
+
+
+def verify_table(request):
+    """Print the resulting table schema and rows to prove that external_id
+    is now a dedicated column of the table."""
+    conn = _connect(request.tenant)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s "
+                "ORDER BY ordinal_position;",
+                (SCHEMA_NAME, TABLE_NAME),
+            )
+            print(f"Schema of {SCHEMA_NAME}.{TABLE_NAME}:")
+            for column, data_type in cursor.fetchall():
+                print(f"  {column}: {data_type}")
+
+            cursor.execute(
+                f'SELECT "external_id", substring("text", 1, 30) '
+                f'FROM {QUALIFIED_TABLE} ORDER BY "external_id";'
+            )
+            print("\nRows (external_id stored as its own column):")
+            for external_id, text in cursor.fetchall():
+                print(f"  external_id={external_id} | text={text!r}")
+    finally:
+        conn.close()
+
+
+def run_agent(request):
+    vector_store = create_vector_store(request)
+
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store,
+    )
+
+    # PGVectorStore can only persist (node_id, text, metadata_, embedding),
+    # so the custom values arrive inside metadata_. Promote them into the
+    # dedicated external_id column that we added to the table schema.
+    promoted = promote_metadata_to_columns(request)
+    print(f"Promoted {promoted} row(s) of custom metadata into table columns")
+
+    verify_table(request)
+    return index
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+
+    request = Request()
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+    print("external_id is now a separate column in the table")
+
+--------------------------------------------------------------------------------
+
+Attempt 2:
+Timestamp: 2026-11-05 08:01:29
+Duration: 1256.53 seconds
+Verdict: ## Evaluation Result: REJECT
+
+I've completed all three verification steps. Here is my detailed analysis:
+
+### Step 1: Diff Review
+The fix adds: (1) `add_custom_columns()` — an `ALTER TABLE` to add an `external_id TEXT` column plus an index, (2) `sync_external_id_column()` — an `UPDATE ... SET external_id = metadata_->>'external_id'` backfill, (3) `doc.id_ = doc.metadata["external_id"]` assignment, and (4) wiring both into `run_agent()`.
+
+### Step 2: Structural Validation
+`validate_fixed_code` returned ACCEPT for structure/format — the code is syntactically valid and well-formed. However, this only confirms the shape, not behavioral correctness against the tests.
+
+### Step 3: API Verification
+The API lookups (against `PGVectorStore.from_params`, `Document.id_`, `use_jsonb`/`metadata_` behavior) mostly surfaced LangChain's `PGVectorStore` (a different library), so they couldn't confirm llama_index specifics. I therefore evaluated against the test file, which is the authoritative behavioral oracle — and it contradicts the fix on multiple fatal points.
+
+### Critical Defects
+
+**1. Wrong table name in raw SQL (fatal).** The tests query `data_vectorstore`:
+```sql
+SELECT external_id, metadata_ FROM data_vectorstore ...
+```
+but both new functions hard-code `table_name="vectorstore"`:
+```python
+def add_custom_columns(request, table_name="vectorstore"):
+def sync_external_id_column(request, table_name="vectorstore"):
+```
+This fails under **every** plausible environment interpretation:
+- If the environment's `PGVectorStore` stores rows in `data_vectorstore`, then `ALTER TABLE vectorstore` raises `UndefinedTable` inside `run_agent` → both tests error out.
+- If rows land in `vectorstore`, the fix's SQL succeeds but the test's `SELECT ... FROM data_vectorstore` then raises `UndefinedTable` → both tests fail.
+
+Either way, the tests cannot pass. The table names are also hard-coded independently of the `table_name` passed to `from_params`, which is fragile design even if the name were correct.
+
+**2. `external_id` remains in the metadata JSON (fatal).** The test explicitly requires:
+```python
+self.assertNotIn("external_id", metadata)
+```
+The fix only *copies* the value into the new column (`metadata_->>'external_id'`) but never removes the key — the `Document`s are still constructed with `metadata={"external_id": "ext_001"}`, and `PGVectorStore` persists node metadata into `metadata_` as-is. So `metadata_` will contain the `external_id` key and this assertion fails.
+
+**3. JSONB-only operator on a likely JSON column.** `metadata_ ? 'external_id'` requires a JSONB column. `PGVectorStore` defaults `use_jsonb=False` (plain JSON) unless overridden, and the fix never passes `use_jsonb=True`. On a JSON column, `?` raises `operator does not exist: json ? unknown`, crashing `sync_external_id_column()`.
+
+**4. `doc.id_ = doc.metadata["external_id"]` is dead/harmful logic.** Setting a document id to a non-UUID string doesn't map to any column — `PGVectorStore`'s `id` column is a UUID type, and the nodes actually inserted by `VectorStoreIndex.from_documents` (via the default text splitter) get freshly generated UUID node ids. This assignment accomplishes nothing toward populating `external_id` (that's done by the backfill), and if a document were inserted directly it would fail with `invalid input syntax for type uuid`. The code comment ("lands in a dedicated column-friendly location") is factually wrong — no such column mapping occurs in `PGVectorStore`.
+
+**5. Minor issues:** the index creation is skipped whenever the column already exists; the `information_schema` check is not schema-qualified; table names are interpolated into f-strings (injection-prone pattern, though internal here).
+
+### Conclusion
+
+**REJECT.** The fix passes structural validation but fails the behavioral tests on multiple independent, fatal grounds: it targets the wrong physical table (`vectorstore` vs. the `data_vectorstore` the tests read), it leaves `external_id` in the `metadata_` JSON that the test explicitly asserts must not contain it, it uses a JSONB-only operator that will error on the default JSON column, and its `doc.id_` manipulation is ineffective for the stated goal. A correct fix must add/remove the column on the table the tests actually read, strip `external_id` from the stored metadata (e.g., `metadata_ - 'external_id'` or by popping it from document metadata before indexing), and ensure the metadata column is JSONB if JSONB operators are used.
+--------------------------------------------------------------------------------
+from llama_index.core import VectorStoreIndex, Document
+from llama_index.vector_stores.postgres import PGVectorStore
+import psycopg2
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def create_vector_store(request):
+    host = "localhost"
+    password = "password"
+    port = 5432
+    user = "postgres"
+    
+    vector_store = PGVectorStore.from_params(
+        database=request.tenant,
+        host=host,
+        password=password,
+        port=port,
+        user=user,
+        table_name="vectorstore",
+        embed_dim=1536,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+    
+    return vector_store
+
+def add_custom_columns(request, table_name="vectorstore"):
+    """
+    Add the external_id as a real column on the Postgres table so that it
+    can be queried/indexed directly instead of living inside the metadata_
+    JSON column.
+    """
+    conn = psycopg2.connect(
+        host="localhost",
+        password="password",
+        port=5432,
+        user="postgres",
+        dbname=request.tenant,
+    )
+    conn.autocommit = True
+    cursor = conn.cursor()
+    
+    # Only add the column if it does not already exist (idempotent ALTER)
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = %s
+          AND column_name = 'external_id';
+        """,
+        (table_name,),
+    )
+    exists = cursor.fetchone() is not None
+    
+    if not exists:
+        cursor.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN external_id TEXT;"
+        )
+        # Optional: index for fast lookups by external_id
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS {table_name}_external_id_idx "
+            f"ON {table_name} (external_id);"
+        )
+    
+    cursor.close()
+    conn.close()
+
+
+def run_agent(request):
+    # 1) Create the vector store (which creates the default table schema)
+    vector_store = create_vector_store(request)
+    
+    # 2) Add the custom column(s) directly to the table schema
+    add_custom_columns(request)
+    
+    documents = [
+        Document(text="Sample document 1", metadata={"external_id": "ext_001"}),
+        Document(text="Sample document 2", metadata={"external_id": "ext_002"}),
+    ]
+    
+    # 3) Attach the external_id directly onto the node id field so that it
+    #    lands in a dedicated column-friendly location and is also
+    #    written into the new external_id column below.
+    for doc in documents:
+        doc.id_ = doc.metadata["external_id"]
+    
+    index = VectorStoreIndex.from_documents(
+        documents,
+        vector_store=vector_store
+    )
+    
+    # 4) Backfill/keep the external_id column in sync with the metadata
+    #    after indexing (PGVectorStore does not natively map arbitrary
+    #    metadata keys to table columns, so we populate it ourselves).
+    sync_external_id_column(request)
+    
+    return index
+
+
+def sync_external_id_column(request, table_name="vectorstore"):
+    """
+    Populate the external_id column from the metadata_ JSONB column so that
+    external_id exists as a separate, queryable column in the table.
+    """
+    conn = psycopg2.connect(
+        host="localhost",
+        password="password",
+        port=5432,
+        user="postgres",
+        dbname=request.tenant,
+    )
+    conn.autocommit = True
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        f"""
+        UPDATE {table_name}
+        SET external_id = metadata_->>'external_id'
+        WHERE metadata_ ? 'external_id'
+          AND (external_id IS NULL OR external_id = '');
+        """
+    )
+    
+    updated = cursor.rowcount
+    cursor.close()
+    conn.close()
+    return updated
+
+
+if __name__ == "__main__":
+    class Request:
+        tenant = "test_db"
+    
+    request = Request()
+    index = run_agent(request)
+    print("Vector store created and documents indexed")
+    print("external_id now exists as a separate column in the table")
+    print("(populated from metadata_ via ALTER TABLE + UPDATE backfill)")
+
+--------------------------------------------------------------------------------

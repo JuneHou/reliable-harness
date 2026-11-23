@@ -1,0 +1,518 @@
+Case ID: 78383658
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-09 06:52:36
+End Time: 2026-11-09 06:59:25
+Total Duration: 408.97 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+
+from langchain.document_loaders import CSVLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONTROL_FILE = "control.csv"
+
+# A pair is a DUPLICATE pair if its similarity score >= DUPLICATE_THRESHOLD,
+# and a SIMILAR pair if SIMILARITY_THRESHOLD <= score < DUPLICATE_THRESHOLD.
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.85"))
+DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.95"))
+
+# Cap on the number of pairs handed to the LLM so the prompt stays inside the
+# model's context window (the complete list is printed deterministically too).
+MAX_PAIRS_PER_SECTION = 100
+
+# FIX (input data): a control must never be fragmented.  CSVLoader already
+# yields one document per CSV row (i.e. one control), so the splitter is now
+# configured to keep every control whole instead of cutting controls into
+# arbitrary 500-character pieces, which made similarity scores meaningless.
+text_splitter = CharacterTextSplitter(
+    chunk_size=2000,
+    chunk_overlap=0,
+    separator="\n\n",
+)
+
+
+# ---------------------------------------------------------------------------
+# Data loading / indexing
+# ---------------------------------------------------------------------------
+def load_controls(file_path=CONTROL_FILE):
+    """Load the control dataset so that each control is exactly one document."""
+    loader = CSVLoader(file_path=file_path)
+    data = loader.load()
+    controls = text_splitter.split_documents(data)
+    if not controls:
+        raise ValueError(f"No controls were loaded from '{file_path}'.")
+    return controls
+
+
+def embed_controls(controls, embeddings):
+    """Embed every control exactly once (batched; works for 3500+ rows)."""
+    texts = [doc.page_content for doc in controls]
+    vectors = np.asarray(embeddings.embed_documents(texts), dtype=np.float32)
+    return vectors
+
+
+def build_vectorstore(controls, vectors, embeddings):
+    """Index the controls in Chroma, reusing the embeddings already computed."""
+    texts = [doc.page_content for doc in controls]
+    metadatas = [doc.metadata for doc in controls]
+    try:
+        return Chroma.from_embeddings(
+            text_embeddings=list(zip(texts, vectors)),
+            embedding=embeddings,
+            metadatas=metadatas,
+            collection_name="controls",
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+    except (AttributeError, TypeError):
+        # Fallback for LangChain versions without Chroma.from_embeddings.
+        return Chroma.from_documents(
+            documents=controls,
+            embedding=embeddings,
+            collection_name="controls",
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Similarity / duplicate detection
+# ---------------------------------------------------------------------------
+def find_similar_pairs(controls, vectors,
+                       similarity_threshold=SIMILARITY_THRESHOLD,
+                       duplicate_threshold=DUPLICATE_THRESHOLD):
+    """
+    Compute the pairwise cosine similarity between all controls and return
+    (similar_pairs, duplicate_pairs).  Each pair is (index_a, index_b, score).
+
+    FIX (operations): a single top-k retrieval for one query can never
+    enumerate all similar pairs in a 3500+ control dataset, so the full
+    pairwise similarity is computed instead, and only pairs whose score
+    exceeds the configured thresholds are kept.
+    """
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    unit = vectors / np.clip(norms, 1e-12, None)
+    sim_matrix = unit @ unit.T  # cosine similarity in [-1, 1]
+
+    n = len(controls)
+    similar_pairs, duplicate_pairs = [], []
+    for i in range(n):
+        row = sim_matrix[i, i + 1:]  # upper triangle only -> no self-pairs
+        if row.size == 0:
+            continue
+        for offset in np.nonzero(row >= similarity_threshold)[0]:
+            j = i + 1 + int(offset)
+            score = float(row[offset])
+            if score >= duplicate_threshold:
+                duplicate_pairs.append((i, j, score))
+            else:
+                similar_pairs.append((i, j, score))
+
+    similar_pairs.sort(key=lambda p: p[2], reverse=True)
+    duplicate_pairs.sort(key=lambda p: p[2], reverse=True)
+    return similar_pairs, duplicate_pairs
+
+
+def control_label(controls, idx):
+    """Short, stable label for a control (uses the CSV row when available)."""
+    row = controls[idx].metadata.get("row", idx)
+    return f"Control #{row + 1}"
+
+
+def format_pairs(pairs, controls, limit=None):
+    """Render control pairs together with their similarity scores."""
+    if not pairs:
+        return "No pairs found above the threshold."
+    if limit is not None:
+        pairs = pairs[:limit]
+    lines = []
+    for i, j, score in pairs:
+        text_a = " ".join(controls[i].page_content.split())
+        text_b = " ".join(controls[j].page_content.split())
+        lines.append(
+            f"- {control_label(controls, i)}: {text_a} | "
+            f"{control_label(controls, j)}: {text_b} | "
+            f"Similarity score: {score:.4f}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Prompt (FIX: the prompt now requests exactly the expected output)
+# ---------------------------------------------------------------------------
+def build_prompt_template():
+    template = f"""You are an assistant that audits a dataset of controls and reports
+similar and duplicate control pairs.
+
+The retrieved context below already contains every control pair whose
+similarity score exceeds the configured thresholds; the scores were computed
+directly from the control embeddings.
+
+Classification rules:
+- A pair is a DUPLICATE pair if its similarity score is >= {DUPLICATE_THRESHOLD}.
+- A pair is a SIMILAR pair if its similarity score is >= {SIMILARITY_THRESHOLD} and < {DUPLICATE_THRESHOLD}.
+
+Rules for your answer:
+- List every pair that appears in the context. Do not invent, merge, rename or drop pairs.
+- Report each similarity score exactly as given in the context.
+- Do not answer in prose and do not say that you do not know: produce the listing described below.
+- Output two sections titled "DUPLICATE CONTROL PAIRS" and "SIMILAR CONTROL PAIRS".
+- Inside each section, list one pair per line in this exact format:
+  <Control A label>: <control text> | <Control B label>: <control text> | Similarity score: <score>
+- If a section contains no pairs, write "No pairs found above the threshold."
+
+Question: {{question}}
+
+Context:
+{{context}}
+
+Answer:
+"""
+    return ChatPromptTemplate.from_template(template)
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+def run_agent(query):
+    # 1. Load the controls (one document per control, never fragmented).
+    controls = load_controls()
+
+    # 2. Embed every control once and index them for retrieval.
+    embeddings = OpenAIEmbeddings()
+    vectors = embed_controls(controls, embeddings)
+    vectorstore = build_vectorstore(controls, vectors, embeddings)  # RAG index
+
+    # 3. Score all control pairs and keep those above the thresholds.
+    similar_pairs, duplicate_pairs = find_similar_pairs(controls, vectors)
+
+    # 4. Deterministic listing (never truncated by the LLM context window).
+    print("=" * 78)
+    print(f"DUPLICATE CONTROL PAIRS (similarity score >= {DUPLICATE_THRESHOLD}): "
+          f"{len(duplicate_pairs)} found")
+    print(format_pairs(duplicate_pairs, controls))
+    print("-" * 78)
+    print(f"SIMILAR CONTROL PAIRS (similarity score >= {SIMILARITY_THRESHOLD}): "
+          f"{len(similar_pairs)} found")
+    print(format_pairs(similar_pairs, controls))
+    print("=" * 78)
+
+    # 5. Build the LLM context, capped so it fits the model context window.
+    context = (
+        f"DUPLICATE CONTROL PAIRS (similarity score >= {DUPLICATE_THRESHOLD}):\n"
+        f"{format_pairs(duplicate_pairs, controls, MAX_PAIRS_PER_SECTION)}\n\n"
+        f"SIMILAR CONTROL PAIRS (similarity score >= {SIMILARITY_THRESHOLD}):\n"
+        f"{format_pairs(similar_pairs, controls, MAX_PAIRS_PER_SECTION)}"
+    )
+
+    # 6. RAG chain with a prompt that actually asks for the pair listing
+    #    (with similarity scores) instead of a generic three-sentence answer.
+    prompt = build_prompt_template()
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+    rag_chain = prompt | llm | StrOutputParser()
+
+    return rag_chain.invoke({"context": context, "question": query})
+
+
+if __name__ == "__main__":
+    # FIX (input data): the query now matches the actual task instead of the
+    # leftover "find movies for family" demo query.
+    query = (
+        "List all similar and duplicate control pairs in the dataset, "
+        "including their similarity scores."
+    )
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-09 06:59:25
+Duration: 408.97 seconds
+Verdict: I now have the diff and validation results. The API verification results were generic (LangChain marketing/docs pages), so let me complete my analysis based on tracing the actual code behavior against the test's requirements.
+
+## Analysis
+
+**Test requirements (the ground truth):**
+```python
+result = run_agent("Find movies for family. Return only the title, genre and budget.")
+self.assertIsInstance(result, dict)          # result must be a dict
+self.assertIn("results", result)             # must contain "results" key
+self.assertIsInstance(result["results"], list)  # must be a list of dicts
+```
+
+**What the fixed code actually returns:**
+```python
+rag_chain = prompt | llm | StrOutputParser()
+return rag_chain.invoke({"context": context, "question": query})
+```
+
+The chain terminates in `StrOutputParser()`, which **always returns a plain Python `str`** — regardless of what the LLM outputs (even valid JSON text would remain an unparsed string). The very first assertion `self.assertIsInstance(result, dict)` will fail. This is confirmed by the API verification: StrOutputParser is a plain string parser with no structured-output capability.
+
+**Verdict: REJECT**
+
+## Detailed Reasoning
+
+1. **Return type is fundamentally wrong (decisive failure).** The test class is literally named `TestRunAgentStructuredOutput` and requires a `dict` with a `"results"` key containing a `list` of `dict`s. The fixed code returns a `str` from `StrOutputParser`. No part of the code constructs `{"results": [...]}` — there is no `with_structured_output()`, no `JsonOutputParser`, no `PydanticOutputParser`, and no manual dict construction. The correct fix would be something like `llm.with_structured_output(MovieResults)` with a Pydantic schema containing `results: List[Movie]` (with `title`, `genre`, `budget` fields).
+
+2. **Task semantics completely mismatched with the test.** The test query asks for movies with title, genre, and budget. The fixed code rewrote the entire agent around a different task — pairwise cosine-similarity duplicate/similar control detection — with a prompt that instructs the LLM to output prose listings of "DUPLICATE CONTROL PAIRS" and "SIMILAR CONTROL PAIRS" sections. Even if the type were correct, the content would never contain movie titles, genres, or budgets, and the query string is effectively ignored (only passed through as `{question}` into an unrelated prompt).
+
+3. **The validator's ACCEPT result is contradicted by deterministic code behavior.** The `validate_fixed_code` tool reported the structure matched, but the unit test is unambiguous: a string return value cannot pass `isinstance(result, dict)`. Tracing `run_agent` end-to-end confirms the output is a `str`, so the test fails at the first assertion.
+
+4. **Secondary concerns (not the deciding factor, but worth noting):**
+   - The `vectorstore` built in `run_agent` is never actually used for retrieval — it's dead weight that re-indexes the entire dataset on every call.
+   - The O(n²) pairwise similarity over 3,500+ controls (~12M pairs) plus embedding every document on each `run_agent` invocation makes the test extremely slow and costly, though that alone wouldn't cause a test failure.
+   - The `try/except (AttributeError, TypeError)` fallback around `Chroma.from_embeddings` re-embeds everything via `from_documents`, duplicating work.
+
+**Conclusion: REJECT.** The fixed code solves a different problem (control-pair similarity auditing) rather than the tested problem (returning structured movie data), and it returns a `str` instead of the required `dict` containing a `"results"` list, so the unit test `test_output_is_structured` will fail at its first assertion.
+--------------------------------------------------------------------------------
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+
+from langchain.document_loaders import CSVLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONTROL_FILE = "control.csv"
+
+# A pair is a DUPLICATE pair if its similarity score >= DUPLICATE_THRESHOLD,
+# and a SIMILAR pair if SIMILARITY_THRESHOLD <= score < DUPLICATE_THRESHOLD.
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.85"))
+DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.95"))
+
+# Cap on the number of pairs handed to the LLM so the prompt stays inside the
+# model's context window (the complete list is printed deterministically too).
+MAX_PAIRS_PER_SECTION = 100
+
+# FIX (input data): a control must never be fragmented.  CSVLoader already
+# yields one document per CSV row (i.e. one control), so the splitter is now
+# configured to keep every control whole instead of cutting controls into
+# arbitrary 500-character pieces, which made similarity scores meaningless.
+text_splitter = CharacterTextSplitter(
+    chunk_size=2000,
+    chunk_overlap=0,
+    separator="\n\n",
+)
+
+
+# ---------------------------------------------------------------------------
+# Data loading / indexing
+# ---------------------------------------------------------------------------
+def load_controls(file_path=CONTROL_FILE):
+    """Load the control dataset so that each control is exactly one document."""
+    loader = CSVLoader(file_path=file_path)
+    data = loader.load()
+    controls = text_splitter.split_documents(data)
+    if not controls:
+        raise ValueError(f"No controls were loaded from '{file_path}'.")
+    return controls
+
+
+def embed_controls(controls, embeddings):
+    """Embed every control exactly once (batched; works for 3500+ rows)."""
+    texts = [doc.page_content for doc in controls]
+    vectors = np.asarray(embeddings.embed_documents(texts), dtype=np.float32)
+    return vectors
+
+
+def build_vectorstore(controls, vectors, embeddings):
+    """Index the controls in Chroma, reusing the embeddings already computed."""
+    texts = [doc.page_content for doc in controls]
+    metadatas = [doc.metadata for doc in controls]
+    try:
+        return Chroma.from_embeddings(
+            text_embeddings=list(zip(texts, vectors)),
+            embedding=embeddings,
+            metadatas=metadatas,
+            collection_name="controls",
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+    except (AttributeError, TypeError):
+        # Fallback for LangChain versions without Chroma.from_embeddings.
+        return Chroma.from_documents(
+            documents=controls,
+            embedding=embeddings,
+            collection_name="controls",
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Similarity / duplicate detection
+# ---------------------------------------------------------------------------
+def find_similar_pairs(controls, vectors,
+                       similarity_threshold=SIMILARITY_THRESHOLD,
+                       duplicate_threshold=DUPLICATE_THRESHOLD):
+    """
+    Compute the pairwise cosine similarity between all controls and return
+    (similar_pairs, duplicate_pairs).  Each pair is (index_a, index_b, score).
+
+    FIX (operations): a single top-k retrieval for one query can never
+    enumerate all similar pairs in a 3500+ control dataset, so the full
+    pairwise similarity is computed instead, and only pairs whose score
+    exceeds the configured thresholds are kept.
+    """
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    unit = vectors / np.clip(norms, 1e-12, None)
+    sim_matrix = unit @ unit.T  # cosine similarity in [-1, 1]
+
+    n = len(controls)
+    similar_pairs, duplicate_pairs = [], []
+    for i in range(n):
+        row = sim_matrix[i, i + 1:]  # upper triangle only -> no self-pairs
+        if row.size == 0:
+            continue
+        for offset in np.nonzero(row >= similarity_threshold)[0]:
+            j = i + 1 + int(offset)
+            score = float(row[offset])
+            if score >= duplicate_threshold:
+                duplicate_pairs.append((i, j, score))
+            else:
+                similar_pairs.append((i, j, score))
+
+    similar_pairs.sort(key=lambda p: p[2], reverse=True)
+    duplicate_pairs.sort(key=lambda p: p[2], reverse=True)
+    return similar_pairs, duplicate_pairs
+
+
+def control_label(controls, idx):
+    """Short, stable label for a control (uses the CSV row when available)."""
+    row = controls[idx].metadata.get("row", idx)
+    return f"Control #{row + 1}"
+
+
+def format_pairs(pairs, controls, limit=None):
+    """Render control pairs together with their similarity scores."""
+    if not pairs:
+        return "No pairs found above the threshold."
+    if limit is not None:
+        pairs = pairs[:limit]
+    lines = []
+    for i, j, score in pairs:
+        text_a = " ".join(controls[i].page_content.split())
+        text_b = " ".join(controls[j].page_content.split())
+        lines.append(
+            f"- {control_label(controls, i)}: {text_a} | "
+            f"{control_label(controls, j)}: {text_b} | "
+            f"Similarity score: {score:.4f}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Prompt (FIX: the prompt now requests exactly the expected output)
+# ---------------------------------------------------------------------------
+def build_prompt_template():
+    template = f"""You are an assistant that audits a dataset of controls and reports
+similar and duplicate control pairs.
+
+The retrieved context below already contains every control pair whose
+similarity score exceeds the configured thresholds; the scores were computed
+directly from the control embeddings.
+
+Classification rules:
+- A pair is a DUPLICATE pair if its similarity score is >= {DUPLICATE_THRESHOLD}.
+- A pair is a SIMILAR pair if its similarity score is >= {SIMILARITY_THRESHOLD} and < {DUPLICATE_THRESHOLD}.
+
+Rules for your answer:
+- List every pair that appears in the context. Do not invent, merge, rename or drop pairs.
+- Report each similarity score exactly as given in the context.
+- Do not answer in prose and do not say that you do not know: produce the listing described below.
+- Output two sections titled "DUPLICATE CONTROL PAIRS" and "SIMILAR CONTROL PAIRS".
+- Inside each section, list one pair per line in this exact format:
+  <Control A label>: <control text> | <Control B label>: <control text> | Similarity score: <score>
+- If a section contains no pairs, write "No pairs found above the threshold."
+
+Question: {{question}}
+
+Context:
+{{context}}
+
+Answer:
+"""
+    return ChatPromptTemplate.from_template(template)
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+def run_agent(query):
+    # 1. Load the controls (one document per control, never fragmented).
+    controls = load_controls()
+
+    # 2. Embed every control once and index them for retrieval.
+    embeddings = OpenAIEmbeddings()
+    vectors = embed_controls(controls, embeddings)
+    vectorstore = build_vectorstore(controls, vectors, embeddings)  # RAG index
+
+    # 3. Score all control pairs and keep those above the thresholds.
+    similar_pairs, duplicate_pairs = find_similar_pairs(controls, vectors)
+
+    # 4. Deterministic listing (never truncated by the LLM context window).
+    print("=" * 78)
+    print(f"DUPLICATE CONTROL PAIRS (similarity score >= {DUPLICATE_THRESHOLD}): "
+          f"{len(duplicate_pairs)} found")
+    print(format_pairs(duplicate_pairs, controls))
+    print("-" * 78)
+    print(f"SIMILAR CONTROL PAIRS (similarity score >= {SIMILARITY_THRESHOLD}): "
+          f"{len(similar_pairs)} found")
+    print(format_pairs(similar_pairs, controls))
+    print("=" * 78)
+
+    # 5. Build the LLM context, capped so it fits the model context window.
+    context = (
+        f"DUPLICATE CONTROL PAIRS (similarity score >= {DUPLICATE_THRESHOLD}):\n"
+        f"{format_pairs(duplicate_pairs, controls, MAX_PAIRS_PER_SECTION)}\n\n"
+        f"SIMILAR CONTROL PAIRS (similarity score >= {SIMILARITY_THRESHOLD}):\n"
+        f"{format_pairs(similar_pairs, controls, MAX_PAIRS_PER_SECTION)}"
+    )
+
+    # 6. RAG chain with a prompt that actually asks for the pair listing
+    #    (with similarity scores) instead of a generic three-sentence answer.
+    prompt = build_prompt_template()
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+    rag_chain = prompt | llm | StrOutputParser()
+
+    return rag_chain.invoke({"context": context, "question": query})
+
+
+if __name__ == "__main__":
+    # FIX (input data): the query now matches the actual task instead of the
+    # leftover "find movies for family" demo query.
+    query = (
+        "List all similar and duplicate control pairs in the dataset, "
+        "including their similarity scores."
+    )
+    result = run_agent(query)
+    print(result)
+
+--------------------------------------------------------------------------------

@@ -1,0 +1,382 @@
+Case ID: hf-26
+Status: ACCEPTED
+Final Attempt: 1
+Start Time: 2026-11-05 18:12:08
+End Time: 2026-11-05 18:16:10
+Total Duration: 241.92 seconds
+================================================================================
+
+FINAL CODE:
+--------------------------------------------------------------------------------
+# https://discuss.huggingface.co/t/getting-additional-response-from-my-rag-using-huggingfaceendpoint-inference/145964
+#
+# Why the extra text showed up:
+#  * `HuggingFaceEndpoint(task="text-generation")` is a *raw text completion*
+#    model, not a chat model. `create_stuff_documents_chain` therefore flattens
+#    whatever prompt it receives into ONE plain string and the model simply
+#    *continues* that string.
+#  * The prompt used (`hub.pull("langchain-ai/retrieval-qa-chat")`) plus the
+#    default chat template of `zephyr-7b-alpha` leaves the model in "repeat the
+#    conversation" mode: it re-prints the instructions / context / question that
+#    it was given and only *then* writes "Assistant: <real answer>".
+#  * So `result["answer"]` contained the echoed prompt + "Assistant:" before the
+#    actual answer.
+#
+# The fix:
+#  1. Use an explicit `ChatPromptTemplate` with clear roles and an explicit
+#     instruction to answer only with the final answer (no preamble, no
+#     restating the question/context, no role labels).
+#  2. End the prompt with a single, unambiguous answer cue.
+#  3. Defensively sanitize the raw completion, so that even if the endpoint
+#     echoes the prompt (or the model still emits "Assistant:"), only the final
+#     answer is returned.
+
+import os
+import re
+
+from dotenv import load_dotenv
+
+from langchain_huggingface import HuggingFaceEndpoint
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains.retrieval import create_retrieval_chain
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+load_dotenv()
+
+api_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+if not api_token:
+    raise ValueError("HUGGINGFACEHUB_API_TOKEN not found in .env file")
+os.environ["HUGGINGFACEHUB_API_TOKEN"] = api_token
+
+
+# ---------------------------------------------------------------------------
+# Output sanitizing helpers
+# ---------------------------------------------------------------------------
+# Role / turn markers a text-generation model may echo or re-emit.
+_TURN_MARKERS = (
+    "<|assistant|>",
+    "<|system|>",
+    "<|user|>",
+    "assistant:",
+    "answer:",
+)
+
+_LEADING_ROLE_RE = re.compile(
+    r"^\s*(?:<\|assistant\|>|assistant\s*:|a\s*:)\s*", re.IGNORECASE
+)
+
+
+def _looks_like_echoed_prompt(text: str, question: str) -> bool:
+    """True when the model re-printed the prompt it was given."""
+    lowered = text.lower()
+    if question and question.strip().lower() in lowered:
+        return True
+    return any(marker in lowered for marker in ("<|system|>", "<|user|>", "context:", "human:"))
+
+
+def clean_answer(raw_answer: str, question: str = "") -> str:
+    """Return only the final answer produced by the model.
+
+    Strips an echoed prompt and any leading role label ("Assistant:") so that
+    the caller sees just the answer text.
+    """
+    if not raw_answer:
+        return raw_answer
+
+    text = raw_answer.strip()
+
+    # 1. If the prompt was echoed back, drop everything up to and including the
+    #    last turn marker that belongs to the echoed prompt.
+    if _looks_like_echoed_prompt(text, question):
+        lowered = text.lower()
+        cut_at = -1
+        marker_len = 0
+        for marker in _TURN_MARKERS:
+            idx = lowered.rfind(marker)
+            if idx > cut_at:
+                cut_at = idx
+                marker_len = len(marker)
+        if cut_at != -1:
+            candidate = text[cut_at + marker_len:].strip()
+            if candidate:
+                text = candidate
+
+    # 2. Drop any residual leading role label, e.g. "Assistant: foo".
+    previous = None
+    while previous != text:
+        previous = text
+        text = _LEADING_ROLE_RE.sub("", text).strip()
+
+    return text
+
+
+def run_agent(question: str) -> str:
+    documents = [
+        Document(
+            page_content="Transformers.js uses ONNX Runtime to run models in the browser.",
+            metadata={"source": "docs"},
+        ),
+        Document(
+            page_content="ONNX Runtime is a cross-platform inference engine.",
+            metadata={"source": "docs"},
+        ),
+        Document(
+            page_content="Transformers.js enables running transformer models client-side.",
+            metadata={"source": "docs"},
+        ),
+    ]
+
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vectorstore = FAISS.from_documents(documents, embeddings)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+
+    llm = HuggingFaceEndpoint(
+        repo_id="huggingfaceh4/zephyr-7b-alpha",
+        task="text-generation",
+        temperature=0.1,
+        max_new_tokens=1024,
+    )
+
+    # Explicit, well-scoped prompt: a single human turn with everything the
+    # model needs and an instruction to output the answer only.
+    retrieval_qa_chat_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "human",
+                "You are a helpful assistant for question-answering tasks.\n"
+                "Use ONLY the pieces of retrieved context below to answer the question. "
+                "If you don't know the answer, say that you don't know.\n"
+                "Reply with the final answer only: do not repeat the question, "
+                "do not repeat the context, do not add any preamble, and do not "
+                "include role labels such as 'Assistant:'.\n\n"
+                "Context:\n{context}\n\n"
+                "Question: {input}\n\n"
+                "Answer:",
+            )
+        ]
+    )
+
+    combine_docs_chain = create_stuff_documents_chain(llm, retrieval_qa_chat_prompt)
+    rag_chain = create_retrieval_chain(retriever, combine_docs_chain)
+
+    result = rag_chain.invoke({"input": question})
+    return clean_answer(result["answer"], question)
+
+
+if __name__ == "__main__":
+    query = "Which runtime does Transformers.js uses?"
+    response = run_agent(query)
+    print(f"Input: {query}")
+    print(f"answer: {response}")
+
+--------------------------------------------------------------------------------
+
+ALL ATTEMPTS:
+================================================================================
+
+Attempt 1:
+Timestamp: 2026-11-05 18:16:10
+Duration: 241.92 seconds
+Verdict: ## Evaluation for case hf-26
+
+### 1) What the diff does
+
+The diff replaces the opaque `hub.pull("langchain-ai/retrieval-qa-chat")` prompt with an explicit `ChatPromptTemplate`, drops the unused `ChatHuggingFace`/`hub` imports, adds `import re`, lowers `temperature` 0.5 → 0.1, adds a `clean_answer()` sanitizer plus `_looks_like_echoed_prompt()` helper, annotates `run_agent` as `-> str`, and returns the sanitized completion.
+
+The root-cause narrative in the comments is accurate: `HuggingFaceEndpoint(task="text-generation")` is a **plain LLM** (`BaseLLM`), not a chat model. When a `ChatPromptTemplate` is piped into a plain LLM, LangChain coerces it via `PromptValue.to_string()` (`BaseLLM.generate_prompt` → `p.to_string()`), so the whole chat-style prompt (with role scaffolding from the retrieved hub prompt + Zephyr's chat template) is flattened into one raw string and the model *continues* it — echoing instructions/context and only then emitting `Assistant: <answer>`. That is exactly the reported "additional response" symptom.
+
+### 2) Structural validation
+
+`validate_fixed_code` → **ACCEPT** — fixed code matches expected structure and output format. The `if __name__ == "__main__"` block and printing are preserved, the entry point is intact, and `run_fixed.run_agent` remains importable for the test.
+
+### 3) API-usage checks
+
+- `create_stuff_documents_chain(llm, prompt)` — signature is `(llm: Runnable, prompt: BasePromptTemplate, *, document_prompt=None, output_parser=None, document_separator="\n\n", document_variable_name="context")`. The new prompt defines both `{context}` and `{input}`, which are exactly the keys `create_retrieval_chain` supplies (`{"input": question}` + assigned `context` from the retriever). Variable naming is therefore correct, and an LLM (non-chat) as first arg is supported — no type error.
+- `create_retrieval_chain(retriever, combine_docs_chain)` — unchanged and used correctly; fills `context` from the FAISS retriever and `answer` from the stuff chain, so `result["answer"]` is a `str`. ✔
+- `ChatPromptTemplate.from_messages([("human", "...")])` — valid tuple form; template variables `{context}`/`{input}` are correctly declared. ✔
+- `HuggingFaceEndpoint(repo_id=..., task="text-generation", temperature=0.1, max_new_tokens=1024)` — all valid params for the text-generation endpoint; still a completion model, which the fix explicitly accounts for. ✔
+- `import re` is used (`_LEADING_ROLE_RE`, `re.IGNORECASE`); `hub`/`ChatHuggingFace` removals are safe (previously unused / no longer needed). No dead or missing imports.
+
+(The verification tool returned only generic LangChain encyclopedia results, not per-API parameter docs; I verified the above against the actual call signatures/behaviour of these APIs.)
+
+### 4) Test-expectation check
+
+The test only requires `run_agent(prompt)` to be a non-empty `str`. The fixed path guarantees a `str`:
+- `result["answer"]` is a string from the stuff chain; `clean_answer` returns `raw_answer` unchanged if falsy, otherwise a stripped `str` — it never returns `None` or a non-str.
+- Sanitizer safety: the `while previous != text` loop strictly shrinks-or-preserves the string and exits when unchanged → no infinite loop. If cutting after the last turn marker yields an empty candidate, the code falls back to the un-cut text, so the result cannot become empty from that branch.
+- Sanitization only triggers when the question text or echo markers (`context:`, `human:`, `<|user|>`, `<|system|>`) are present, so ordinary answers are untouched; residual role labels (`Assistant:`, `A:`) are then stripped.
+
+Minor residual risks (not blocking): the "cut at last marker" heuristic could, in a pathological case, truncate an answer that itself contains `answer:` *and* an echoed prompt; and a model that echoes the prompt but produces no answer would return the echoed text (still non-empty, test-safe). Both are heuristic rather than correctness-breaking, and step 3 of the fix (explicit "Reply with the final answer only" instruction + `Answer:` cue + low temperature) substantially reduces echo probability at the source.
+
+### Verdict
+
+The fix is structurally sound, uses every API correctly, removes the unused/fragile hub-prompt dependency, correctly diagnoses the completion-vs-chat model confusion, and returns a guaranteed non-empty `str`. **ACCEPT**.
+--------------------------------------------------------------------------------
+# https://discuss.huggingface.co/t/getting-additional-response-from-my-rag-using-huggingfaceendpoint-inference/145964
+#
+# Why the extra text showed up:
+#  * `HuggingFaceEndpoint(task="text-generation")` is a *raw text completion*
+#    model, not a chat model. `create_stuff_documents_chain` therefore flattens
+#    whatever prompt it receives into ONE plain string and the model simply
+#    *continues* that string.
+#  * The prompt used (`hub.pull("langchain-ai/retrieval-qa-chat")`) plus the
+#    default chat template of `zephyr-7b-alpha` leaves the model in "repeat the
+#    conversation" mode: it re-prints the instructions / context / question that
+#    it was given and only *then* writes "Assistant: <real answer>".
+#  * So `result["answer"]` contained the echoed prompt + "Assistant:" before the
+#    actual answer.
+#
+# The fix:
+#  1. Use an explicit `ChatPromptTemplate` with clear roles and an explicit
+#     instruction to answer only with the final answer (no preamble, no
+#     restating the question/context, no role labels).
+#  2. End the prompt with a single, unambiguous answer cue.
+#  3. Defensively sanitize the raw completion, so that even if the endpoint
+#     echoes the prompt (or the model still emits "Assistant:"), only the final
+#     answer is returned.
+
+import os
+import re
+
+from dotenv import load_dotenv
+
+from langchain_huggingface import HuggingFaceEndpoint
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains.retrieval import create_retrieval_chain
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+load_dotenv()
+
+api_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+if not api_token:
+    raise ValueError("HUGGINGFACEHUB_API_TOKEN not found in .env file")
+os.environ["HUGGINGFACEHUB_API_TOKEN"] = api_token
+
+
+# ---------------------------------------------------------------------------
+# Output sanitizing helpers
+# ---------------------------------------------------------------------------
+# Role / turn markers a text-generation model may echo or re-emit.
+_TURN_MARKERS = (
+    "<|assistant|>",
+    "<|system|>",
+    "<|user|>",
+    "assistant:",
+    "answer:",
+)
+
+_LEADING_ROLE_RE = re.compile(
+    r"^\s*(?:<\|assistant\|>|assistant\s*:|a\s*:)\s*", re.IGNORECASE
+)
+
+
+def _looks_like_echoed_prompt(text: str, question: str) -> bool:
+    """True when the model re-printed the prompt it was given."""
+    lowered = text.lower()
+    if question and question.strip().lower() in lowered:
+        return True
+    return any(marker in lowered for marker in ("<|system|>", "<|user|>", "context:", "human:"))
+
+
+def clean_answer(raw_answer: str, question: str = "") -> str:
+    """Return only the final answer produced by the model.
+
+    Strips an echoed prompt and any leading role label ("Assistant:") so that
+    the caller sees just the answer text.
+    """
+    if not raw_answer:
+        return raw_answer
+
+    text = raw_answer.strip()
+
+    # 1. If the prompt was echoed back, drop everything up to and including the
+    #    last turn marker that belongs to the echoed prompt.
+    if _looks_like_echoed_prompt(text, question):
+        lowered = text.lower()
+        cut_at = -1
+        marker_len = 0
+        for marker in _TURN_MARKERS:
+            idx = lowered.rfind(marker)
+            if idx > cut_at:
+                cut_at = idx
+                marker_len = len(marker)
+        if cut_at != -1:
+            candidate = text[cut_at + marker_len:].strip()
+            if candidate:
+                text = candidate
+
+    # 2. Drop any residual leading role label, e.g. "Assistant: foo".
+    previous = None
+    while previous != text:
+        previous = text
+        text = _LEADING_ROLE_RE.sub("", text).strip()
+
+    return text
+
+
+def run_agent(question: str) -> str:
+    documents = [
+        Document(
+            page_content="Transformers.js uses ONNX Runtime to run models in the browser.",
+            metadata={"source": "docs"},
+        ),
+        Document(
+            page_content="ONNX Runtime is a cross-platform inference engine.",
+            metadata={"source": "docs"},
+        ),
+        Document(
+            page_content="Transformers.js enables running transformer models client-side.",
+            metadata={"source": "docs"},
+        ),
+    ]
+
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vectorstore = FAISS.from_documents(documents, embeddings)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+
+    llm = HuggingFaceEndpoint(
+        repo_id="huggingfaceh4/zephyr-7b-alpha",
+        task="text-generation",
+        temperature=0.1,
+        max_new_tokens=1024,
+    )
+
+    # Explicit, well-scoped prompt: a single human turn with everything the
+    # model needs and an instruction to output the answer only.
+    retrieval_qa_chat_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "human",
+                "You are a helpful assistant for question-answering tasks.\n"
+                "Use ONLY the pieces of retrieved context below to answer the question. "
+                "If you don't know the answer, say that you don't know.\n"
+                "Reply with the final answer only: do not repeat the question, "
+                "do not repeat the context, do not add any preamble, and do not "
+                "include role labels such as 'Assistant:'.\n\n"
+                "Context:\n{context}\n\n"
+                "Question: {input}\n\n"
+                "Answer:",
+            )
+        ]
+    )
+
+    combine_docs_chain = create_stuff_documents_chain(llm, retrieval_qa_chat_prompt)
+    rag_chain = create_retrieval_chain(retriever, combine_docs_chain)
+
+    result = rag_chain.invoke({"input": question})
+    return clean_answer(result["answer"], question)
+
+
+if __name__ == "__main__":
+    query = "Which runtime does Transformers.js uses?"
+    response = run_agent(query)
+    print(f"Input: {query}")
+    print(f"answer: {response}")
+
+--------------------------------------------------------------------------------
